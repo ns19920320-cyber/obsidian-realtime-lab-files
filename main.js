@@ -10381,6 +10381,47 @@ var VaultClientV3 = class extends VaultClient {
     this.binaryBusy = false;
     this.binaryAbort = new AbortController();
   }
+  // iOS can retain an OPEN WebSocket after its network connection is gone.
+  // Keep the Y.Doc, verified identity and pending blobs; replace only transport.
+  resume() {
+    if (this.stopped || this.transportBlocked) return false;
+    clearTimeout(this.timer);
+    this.timer = void 0;
+    const old = this.ws;
+    this.ws = void 0;
+    this.ready = false;
+    this.metadataVerified = false;
+    for (const r2 of this.requests.values()) {
+      clearTimeout(r2.timer);
+      r2.reject(Error("Foreground reconnect; local edits retained"));
+    }
+    this.requests.clear();
+    if (old) {
+      old.onopen = null;
+      old.onmessage = null;
+      old.onerror = null;
+      old.onclose = null;
+      try {
+        old.close();
+      } catch {
+      }
+    }
+    this.connect();
+    return true;
+  }
+  async checkConnection() {
+    if (!this.ready || this.stopped || this.transportBlocked || this.checkingConnection) return;
+    this.checkingConnection = true;
+    const ws = this.ws;
+    try {
+      await this.request("barrier");
+      this.lastConfirmedAt = Date.now();
+    } catch {
+      if (this.ws === ws && !this.stopped && !this.transportBlocked) this.resume();
+    } finally {
+      this.checkingConnection = false;
+    }
+  }
   async batchFiles(fn) {
     if (this.metadataBatch) throw Error("Metadata batch already active");
     const vector = encodeStateVector(this.doc);
@@ -10482,6 +10523,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   dirtyFiles = /* @__PURE__ */ new Map();
   fileUploads = coalescedTask((fn) => this.enqueue(fn), () => this.flushLocalFiles(), () => !!this.client && !this.stopping);
   reflection = coalescedTask((fn) => this.enqueue(fn), () => this.reflect(), () => !!this.client?.ready && !this.stopping);
+  connectionStatus = "\u672A\u8FDE\u63A5";
+  statusDetail;
+  setConnectionStatus(s) {
+    this.connectionStatus = s;
+    this.status?.setText("Realtime Lab V3\uFF1A" + s);
+    this.statusDetail?.setText(s);
+  }
   cache;
   legacyConfig = null;
   fingerprints = /* @__PURE__ */ new Map();
@@ -10499,7 +10547,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     else this.settings = { ...this.settings, ...loaded };
     this.cache = new ObsidianBlobCache(this.app.vault.adapter);
     this.status = this.addStatusBarItem();
-    this.status.setText("Realtime Lab V3\uFF1A\u672A\u8FDE\u63A5");
+    this.setConnectionStatus("\u672A\u8FDE\u63A5");
     this.addSettingTab(new Settings(this.app, this));
     this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u72EC\u7ACB\u6D4B\u8BD5\u5E93", callback: () => void this.start() });
     this.addCommand({ id: "history", name: "\u67E5\u770B\u4E0E\u6062\u590D\u5386\u53F2\u7248\u672C", callback: () => void this.history() });
@@ -10559,8 +10607,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       if (this.client?.ready) this.reflection.request();
     }));
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (!document.hidden) this.client?.connect();
+      if (!document.hidden) this.client?.resume();
     });
+    this.registerInterval(window.setInterval(() => {
+      if (!document.hidden) void this.client?.checkConnection();
+    }, 1e4));
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.enabled) void this.start();
     });
@@ -10734,7 +10785,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.settings.mode = "join";
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
-    }, state: this.settings.state || void 0, onStatus: (s) => this.status.setText("Realtime Lab V3\uFF1A" + ((s === "\u5DF2\u8FDE\u63A5" || s === "\u5DF2\u540C\u6B65") && (!this.syncedOnce || this.initializing) ? "\u5DF2\u9274\u6743\uFF0C\u6B63\u5728\u51C6\u5907\u6D4B\u8BD5\u6587\u4EF6" : s)), persistDelayMs: 200, onPersist: async (s) => {
+    }, state: this.settings.state || void 0, onStatus: (s) => this.setConnectionStatus((s === "\u5DF2\u8FDE\u63A5" || s === "\u5DF2\u540C\u6B65") && (!this.syncedOnce || this.initializing) ? "\u5DF2\u9274\u6743\uFF0C\u6B63\u5728\u51C6\u5907\u6D4B\u8BD5\u6587\u4EF6" : s), persistDelayMs: 200, onPersist: async (s) => {
       this.settings.state = s;
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
@@ -10763,8 +10814,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.syncedOnce = true;
           await this.reflect();
           this.refresh();
-          this.status.setText("Realtime Lab V3\uFF1A\u6587\u4EF6\u5DF2\u5C31\u7EEA");
-          new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
+          if (c.ready && !this.stopping) {
+            this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
+            new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
+          }
         } finally {
           this.initializing = false;
         }
@@ -11044,7 +11097,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       b.undo.destroy();
     }
     this.bindings.clear();
-    this.status?.setText("Realtime Lab V3\uFF1A\u5DF2\u65AD\u5F00");
+    this.setConnectionStatus("\u5DF2\u65AD\u5F00");
     return saved;
   }
   onunload() {
@@ -11060,6 +11113,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     const e = this.containerEl;
     e.empty();
     e.createEl("h2", { text: "Realtime Lab V3 \xB7 \u6574\u5E93\u6D4B\u8BD5" });
+    this.p.statusDetail = e.createEl("p", { text: this.p.connectionStatus });
     new import_obsidian.Setting(e).setName("\u8BEF\u7F6E\u65E7\u534F\u8BAE\u8BBE\u7F6E").addButton((b) => b.setButtonText("\u5907\u4EFD\u5E76\u6E05\u7A7A\u65E7\u72B6\u6001").onClick(() => void this.p.backupRejectedState()));
     e.createEl("p", { text: "\u4EC5 Realtime-Lab-V3-Files- \u72EC\u7ACB\u6D4B\u8BD5\u5E93\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u548C PDF\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u6D3B\u52A8\u5185\u5BB9\u2264128 MiB\u3001\u6700\u591A3000\u6D3B\u52A8\u8DEF\u5F84/4096\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264256 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
     new import_obsidian.Setting(e).setName("\u521B\u5EFA\u6216\u52A0\u5165\u5411\u5BFC").addButton((b) => b.setButtonText("\u914D\u7F6E\u8FDE\u63A5").onClick(() => void this.p.setupConnection()));

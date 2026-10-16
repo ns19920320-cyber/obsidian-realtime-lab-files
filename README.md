@@ -1,30 +1,28 @@
-# Realtime Lab Files — 0.5.0-alpha.3
+# Realtime Lab Files 0.5.0-alpha.4
 
-Experimental Obsidian sync plugin, for isolated test vaults only.
+Experimental sync for isolated `Realtime-Lab-V3-Files-` test vaults only. Do not use on production notes or alongside another sync plugin.
 
-## BRAT installation
+## Install with BRAT
 
-Add `ns19920320-cyber/obsidian-realtime-lab-files` in BRAT and select `0.5.0-alpha.3`. This public repository needs no GitHub access token.
+Repository: `ns19920320-cyber/obsidian-realtime-lab-files`. Choose `0.5.0-alpha.4`, or follow the latest version including pre-releases. No GitHub token needed.
 
-Use a new vault whose name starts with `Realtime-Lab-V3-Files`. Initialize it in this plugin before connecting. Do not enable another synchronization tool in this vault. Enter your server URL and access token privately in plugin settings. Neither is bundled here.
+Existing alpha.2/alpha.3 test users: update in place. Keep your files, settings, offline snapshot, server URL and token. Do not initialize again, reset state or retype pending edits. After loading the update, saved inline edits are reconciled before upload; a local recovery copy is retained when disk differs from its snapshot.
 
-## Included files
+## Fixes
 
-- `main.js` / `manifest.json`: alpha.3 plugin build; automated verification passed, native validation pending.
-- `plugin.zip`: installable plugin files only.
-- `source.zip`: complete frozen source snapshot at commit `f43ccd60ab1b5fa396f9b57ea8880f3b8cbdf5cf`, with source, tests, dependency lockfile and build scripts. Extract into a separate directory; run `npm ci` then `npm run build:v3-files`. Output: `work/v3-files-plugin/`. The root manifest in that historical source snapshot belongs to V2; the Files build explicitly uses `manifest.v3-files.json`.
-- `SHA256SUMS`: integrity checks.
+- On foreground resume replace stale WebSockets even when the old socket still reports OPEN. Keep the same live Y.Doc, verified identity, local snapshot and pending blobs.
+- Check authenticated application round trips every 10 seconds while visible; a failed 15-second request replaces the transport. Explicit stop and capacity/security pauses are respected.
+- Show live connection status on the mobile settings page; do not announce file readiness after a connection has dropped.
+- Retain alpha.3 public editor-change fallback.
 
-## Scope and verification
+150 automated tests passed, including stale OPEN sockets, foreground recovery without retyping, disk-only unsent text on update and watchdog recovery. Type checking passed. Physical iPhone validation of alpha.4 is pending; the reproduced code defects have not conclusively established the cause of the user's earlier phone failure.
 
-Markdown, image and PDF sync, whole-file version history and restore. Protocol 3 with mandatory `versioned-files-v1` capability; incompatible with the old Realtime Lab plugin/server. Existing production notes are outside its allowed vault scope.
+## Files and source
 
-146 automated tests passed. On the previous alpha.2 build, separate resource probes and Mac native tests covered text, images, PDF, rename/delete, conflict history restoration, reconnect and persistence. Physical iPhone and Windows acceptance remains pending. This is an alpha test release, not a production replacement for LiveSync.
+`main.js` and `manifest.json` are the plugin; `plugin.zip` contains only those two files. `source.zip` contains source, synthetic tests, dependency lockfile and build scripts. Extract it in a separate directory; run `npm ci`, `npm run typecheck`, `npm test`, `npm run build:v3-files`. Build output is `work/v3-files-plugin`. The historical source root manifest belongs to V2; this build explicitly uses `manifest.v3-files.json`.
 
-New small `实时协作测试.md` uses live text collaboration. Other Markdown files use versioned whole-file sync. Limits include 16 MiB Markdown, 5 MiB image/PDF, 3,000 active paths and 128 MiB active payloads. See `V3-FILES.md` inside the source archive for details and limitations.
+Markdown, image/PDF and version history use protocol 3 with `versioned-files-v1`. Existing server data/identity/protocol are unchanged. New small `实时协作测试.md` uses inline collaboration; other Markdown uses whole-file versioning. Limits: 16 MiB Markdown, 5 MiB image/PDF, 3,000 active paths, 128 MiB active payloads. Full details in source `V3-FILES.md`.
 
-No vault notes, device settings, runtime databases, server URLs or real credentials are distributed. Test fixtures in the source are synthetic. This repository is separate from `ns19920320-cyber/obsidian-realtime-lab`.
+No real notes, runtime settings, server connection details or credentials are distributed. The original `obsidian-realtime-lab` repository is unchanged.
 
-## alpha.3 changes
-
-Adds a public Obsidian editor-change fallback for inline text uploads when the private CodeMirror view is unavailable or not yet bound. Keeps initial file preparation distinct from connected/ready status. A regression test verifies mobile-style editing while initial reflection is blocked. The earlier iPhone delivery succeeded on alpha.2 before this fix was installed; this change is preventive hardening, not proof of its original delay cause. No server/protocol changes. Existing test state and identity remain compatible. Physical iPhone validation of this new build is pending.
+Source commit: 35635a21f36bef9f20535d25120d255abf7f43b6

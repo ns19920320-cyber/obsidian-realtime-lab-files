@@ -9919,25 +9919,21 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     icon = "check";
     label = "\u5DF2\u786E\u8BA4";
   }
-  const counts = tone === "confirmed" ? known + "\u9879" : uploads || downloads || unknown ? "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads : "";
-  return { tone, icon, label, busy, counts, description: label + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
+  const counts = "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads;
+  const display = "Sync: " + (tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
+  return { tone, icon, label, display, busy, counts, description: label + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
 var badgeCSS = `
-.view-header .rl-sync-badge{display:inline-flex!important;align-items:center;gap:5px;width:auto;height:auto;flex-shrink:0;max-width:190px;min-height:28px;margin-inline-end:5px;padding:4px 9px;border:1px solid var(--background-modifier-border);border-radius:999px;background:var(--background-secondary);color:var(--text-muted);font-size:11px;font-weight:550;line-height:1.2;white-space:nowrap;cursor:pointer;box-shadow:0 1px 2px rgb(0 0 0 / 3%);transition:background .15s,border-color .15s}
-.rl-sync-badge .rl-sync-icon{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
-.rl-sync-badge .rl-sync-icon svg{width:14px;height:14px;stroke-width:1.8}
-.rl-sync-badge .rl-sync-label{overflow:hidden;text-overflow:ellipsis}
-.rl-sync-badge .rl-sync-counts{padding-inline-start:5px;border-inline-start:1px solid var(--background-modifier-border);color:var(--text-muted);font-size:10px;font-variant-numeric:tabular-nums;letter-spacing:.2px}
-.view-header .rl-sync-badge[data-tone=confirmed]{color:var(--color-green,#38966d);background:color-mix(in srgb,var(--color-green,#38966d) 7%,var(--background-primary))}
-.view-header .rl-sync-badge[data-tone=busy]{color:var(--interactive-accent);background:color-mix(in srgb,var(--interactive-accent) 7%,var(--background-primary))}
-.view-header .rl-sync-badge[data-tone=error]{color:var(--text-error);background:color-mix(in srgb,var(--text-error) 7%,var(--background-primary))}
-.view-header .rl-sync-badge:hover{border-color:var(--interactive-accent);background:var(--background-modifier-hover)}
-.view-header .rl-sync-badge:focus-visible{outline:2px solid var(--interactive-accent);outline-offset:2px}
-.rl-sync-badge[data-busy=true] .rl-sync-icon svg{animation:rl-sync-spin 1.5s linear infinite}
-body.is-mobile .view-header .rl-sync-badge{min-height:32px;padding:5px 8px;gap:4px;margin-inline-end:3px;max-width:170px}
+.rl-sync-row{display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
+.rl-sync-row .rl-sync-badge{display:inline-flex;align-items:center;gap:7px;width:max-content;max-width:100%;min-height:24px;padding:0;border:0;border-radius:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:400;line-height:24px;white-space:nowrap;cursor:pointer;box-shadow:none;font-variant-numeric:tabular-nums}
+.rl-sync-badge .rl-sync-icon{display:none}
+.rl-sync-badge .rl-sync-label,.rl-sync-badge .rl-sync-counts{white-space:nowrap}
+.rl-sync-badge[data-tone=error]{color:var(--text-error)}
+.rl-sync-badge:hover{color:var(--text-normal)}
+.rl-sync-badge:focus-visible{outline:2px solid var(--interactive-accent);outline-offset:3px}
+body.is-mobile .rl-sync-row{padding:0 20px 2px;min-height:28px}
+body.is-mobile .rl-sync-row .rl-sync-badge{font-size:12px;min-height:28px;line-height:28px}
 .rl-sync-details-note{color:var(--text-muted);font-size:var(--font-ui-small);line-height:1.6}
-@keyframes rl-sync-spin{to{transform:rotate(360deg)}}
-@media(prefers-reduced-motion:reduce){.rl-sync-badge .rl-sync-icon svg{animation:none!important}.view-header .rl-sync-badge{transition:none}}
 `;
 
 var SnapshotScheduler = class {
@@ -10755,13 +10751,17 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       seen.add(view);
       let badge = this.badges.get(view);
       if (badge && !badge.el.isConnected) {
-        badge.el.remove();
+        badge.el.parentElement?.remove();
         this.badges.delete(view);
         badge = void 0;
       }
       if (!badge) {
-        const el = view.addAction("refresh-cw", "\u540C\u6B65\u72B6\u6001", () => this.openSyncDetails());
-        el.empty();
+        const row = document.createElement("div");
+        row.className = "rl-sync-row";
+        const el = document.createElement("div");
+        row.appendChild(el);
+        view.contentEl.before(row);
+        el.addEventListener("click", () => this.openSyncDetails());
         el.addClass("rl-sync-badge");
         el.setAttribute("role", "button");
         el.tabIndex = 0;
@@ -10776,7 +10776,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
       if (badge.signature !== signature) {
         (0, import_obsidian.setIcon)(badge.icon, model.icon);
-        badge.label.setText(model.label);
+        badge.label.setText(model.display);
         badge.counts.setText(model.counts);
         badge.counts.hidden = !model.counts;
         badge.el.dataset.tone = model.tone;
@@ -10787,7 +10787,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
     }
     for (const [view, badge] of this.badges) if (!seen.has(view)) {
-      badge.el.remove();
+      badge.el.parentElement?.remove();
       this.badges.delete(view);
     }
   }
@@ -10797,7 +10797,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const panel = m.contentEl.createDiv();
     this.detailPanels.add(panel);
     this.detailModals.add(m);
-    m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u2191 \u5F85\u4E0A\u4F20\u6216\u7B49\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF1B\u2193 \u5F53\u524D\u63A5\u6536\u4E2D\u7684\u8DEF\u5F84\u6570\u3002\u201C\u5DF2\u786E\u8BA4 N\u9879\u201D\u8868\u793A\u5F53\u524D\u5E93\u4E2D\u670D\u52A1\u5668\u5DF2\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF0C\u4E0D\u662F\u6240\u6709\u8BBE\u5907\u7684\u56DE\u6267\uFF1B\u4E0D\u663E\u793A\u4F30\u7B97\u767E\u5206\u6BD4\u3002" });
+    m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u2191 \u5F85\u4E0A\u4F20\u6216\u7B49\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF1B\u2193 \u5F53\u524D\u63A5\u6536\u4E2D\u7684\u8DEF\u5F84\u6570\u3002\u26A1 \u8868\u793A\u8FDE\u63A5\u4E14\u5DF2\u83B7\u670D\u52A1\u5668\u786E\u8BA4\uFF1B\u65F6\u949F\u8868\u793A\u7B49\u5F85\u786E\u8BA4\uFF1B\u79BB\u7EBF\u4E0E\u5F02\u5E38\u4F1A\u76F4\u63A5\u6807\u660E\u3002\u786E\u8BA4\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
     new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
     m.onClose = () => {
       this.detailPanels.delete(panel);
@@ -11420,7 +11420,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     window.clearTimeout(this.progressTimer);
     this.syncPanel = void 0;
     for (const m of [...this.detailModals]) m.close();
-    for (const b of this.badges.values()) b.el.remove();
+    for (const b of this.badges.values()) b.el.parentElement?.remove();
     this.badges.clear();
     this.badgeStyle?.remove();
   }

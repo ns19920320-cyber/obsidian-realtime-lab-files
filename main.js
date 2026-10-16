@@ -9912,6 +9912,114 @@ function textDifference(a, b) {
   return { removed: removed.slice(0, 100).map((s) => "\u2212 " + s).join("\n"), added: added.slice(0, 100).map((s) => "+ " + s).join("\n"), truncated: a.length > 2e4 || b.length > 2e4 || removed.length > 100 || added.length > 100, equal: a === b };
 }
 
+function supported2(p) {
+  return supported(p) || typeof p === "string" && /\.pdf$/i.test(p) && supported(p.slice(0, -4) + ".png");
+}
+var markdown = (p) => /\.md$/i.test(p);
+function content(doc2, p) {
+  const m = doc2.getMap("files").get(p);
+  if (!m || m.deleted || doc2.getMap("deleted").has(p)) return null;
+  return m.kind === "text" ? { kind: "text", data: doc2.getText("text:" + p).toString() } : { kind: m.kind, hash: m.hash, size: m.size, version: m.version };
+}
+function entries(doc2) {
+  const out = {};
+  for (const p of doc2.getMap("files").keys()) {
+    const c = content(doc2, p);
+    if (c) out[p] = c;
+  }
+  return out;
+}
+function put(doc2, p, c, origin) {
+  if (!supported2(p)) throw Error("Unsupported path");
+  if (c.kind !== "text" && c.version && doc2.getMap("blobVersions").has(c.version)) {
+    const v = doc2.getMap("blobVersions").get(c.version);
+    if (v.path !== p) c = { ...c, version: crypto.randomUUID() };
+    else {
+      if (v.hash !== c.hash || v.size !== c.size) throw Error("Immutable version mismatch");
+      return;
+    }
+  }
+  doc2.transact(() => {
+    const files = doc2.getMap("files");
+    doc2.getMap("deleted").delete(p);
+    if (c.kind === "text") {
+      if (!markdown(p)) throw Error("Inline text requires Markdown");
+      if (files.get(p)?.kind === "file" && origin !== "explicit-history-restore") throw Error("Whole-file Markdown cannot silently switch to inline CRDT");
+      patchText(doc2, p, c.data, origin);
+      const prior = files.get(p);
+      if (!prior || prior.deleted || prior.kind !== "text") files.set(p, { kind: "text", deleted: false });
+    } else {
+      const version = c.version || crypto.randomUUID(), v = { path: p, hash: c.hash, size: c.size };
+      validateRef(v);
+      const kind = c.kind === "image" ? "image" : "file";
+      if (markdown(p) && kind !== "file" || !markdown(p) && !/\.pdf$/i.test(p) && kind !== "image" || /\.pdf$/i.test(p) && kind !== "file") throw Error("File kind/path mismatch");
+      doc2.getMap("blobVersions").set(version, v);
+      files.set(p, { kind, hash: c.hash, size: c.size, version, deleted: false });
+      if (markdown(p)) {
+        const text2 = doc2.getText("text:" + p);
+        if (text2.length) text2.delete(0, text2.length);
+      }
+    }
+  }, origin);
+}
+function remove(doc2, p, origin) {
+  if (!supported2(p)) throw Error("Unsupported path");
+  doc2.transact(() => {
+    doc2.getMap("deleted").set(p, true);
+    doc2.getMap("files").set(p, { kind: doc2.getMap("files").get(p)?.kind || (markdown(p) ? "text" : /\.pdf$/i.test(p) ? "file" : "image"), deleted: true });
+  }, origin);
+}
+function validateRef(v) {
+  if (!v || !supported2(v.path) || !/^[a-f0-9]{64}$/.test(v.hash) || !Number.isSafeInteger(v.size) || v.size < 0 || v.size > (markdown(v.path) ? MAX_FILE_TEXT : MAX_BINARY) || Object.keys(v).some((k) => !["path", "hash", "size"].includes(k))) throw Error("Invalid blob reference or per-file size limit");
+}
+function validate(doc2, hasBlob) {
+  let total = 0, count = 0, active = 0, inline = 0;
+  const names = /* @__PURE__ */ new Set();
+  for (const name of doc2.share.keys()) {
+    if (!["files", "deleted", "blobVersions"].includes(name) && !(name.startsWith("text:") && supported2(name.slice(5)) && markdown(name))) throw Error("Invalid V3 document root");
+    if (name.startsWith("text:")) {
+      const n = new TextEncoder().encode(doc2.getText(name).toString()).length;
+      if (n > MAX_INLINE_NOTE) throw Error("Inline note exceeds 16 KiB; explicit whole-file mode required");
+      inline += n;
+    }
+  }
+  if (inline > MAX_INLINE_TOTAL) throw Error("Inline CRDT budget exceeds 128 KiB; explicit whole-file mode required");
+  for (const [id2, v] of doc2.getMap("blobVersions")) {
+    if (!/^[a-f0-9-]{36}$/.test(id2)) throw Error("Invalid version id");
+    validateRef(v);
+    if (hasBlob && !hasBlob(v.hash, v.size)) throw Error("Referenced blob is not durably uploaded");
+  }
+  if (doc2.getMap("deleted").size > MAX_PATHS) throw Error("Tombstone limit 4096");
+  for (const [p, v] of doc2.getMap("deleted")) if (!supported2(p) || v !== true) throw Error("Invalid tombstone");
+  for (const [p, m] of doc2.getMap("files")) {
+    if (!supported2(p) || !m || !["text", "image", "file"].includes(m.kind) || typeof m.deleted !== "boolean" || m.kind === "text" && !markdown(p) || m.kind === "image" && (markdown(p) || /\.pdf$/i.test(p)) || m.kind === "file" && !markdown(p) && !/\.pdf$/i.test(p) || Object.keys(m).some((k) => !["kind", "deleted", "hash", "size", "version"].includes(k))) throw Error("Invalid V3 file metadata");
+    const canonical = p.toLowerCase();
+    if (names.has(canonical)) throw Error("Case-insensitive path collision");
+    names.add(canonical);
+    if (++count > MAX_PATHS) throw Error("Tracked path limit 4096 including tombstones");
+    if (m.deleted || doc2.getMap("deleted").has(p)) continue;
+    if (++active > MAX_ACTIVE_PATHS) throw Error("Active path limit 3000");
+    if (m.kind === "text") total += new TextEncoder().encode(doc2.getText("text:" + p).toString()).length;
+    else {
+      validateRef({ path: p, hash: m.hash, size: m.size });
+      const v = doc2.getMap("blobVersions").get(m.version);
+      if (!v || v.path !== p || v.hash !== m.hash || v.size !== m.size) throw Error("Missing immutable blob version");
+      total += m.size;
+    }
+    if (total > MAX_LIVE_BYTES) throw Error("Active logical content exceeds 128 MiB; server/cache disk also capped");
+  }
+  if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata/text state exceeds 2 MiB");
+  return total;
+}
+
+var DIAGNOSTICS_CAPABILITY = "device-diagnostics-v1";
+function documentDigest(doc2) {
+  const active = entries(doc2), deleted = new Set(doc2.getMap("deleted").keys());
+  for (const [path, m] of doc2.getMap("files")) if (m.deleted) deleted.add(path);
+  const state = ["content-v1", Object.keys(active).sort().map((path) => [path, active[path]]), [...deleted].sort()];
+  return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
+}
+
 function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0 }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
@@ -10358,106 +10466,6 @@ var BlobTransfer = class {
   }
 };
 
-function supported2(p) {
-  return supported(p) || typeof p === "string" && /\.pdf$/i.test(p) && supported(p.slice(0, -4) + ".png");
-}
-var markdown = (p) => /\.md$/i.test(p);
-function content(doc2, p) {
-  const m = doc2.getMap("files").get(p);
-  if (!m || m.deleted || doc2.getMap("deleted").has(p)) return null;
-  return m.kind === "text" ? { kind: "text", data: doc2.getText("text:" + p).toString() } : { kind: m.kind, hash: m.hash, size: m.size, version: m.version };
-}
-function entries(doc2) {
-  const out = {};
-  for (const p of doc2.getMap("files").keys()) {
-    const c = content(doc2, p);
-    if (c) out[p] = c;
-  }
-  return out;
-}
-function put(doc2, p, c, origin) {
-  if (!supported2(p)) throw Error("Unsupported path");
-  if (c.kind !== "text" && c.version && doc2.getMap("blobVersions").has(c.version)) {
-    const v = doc2.getMap("blobVersions").get(c.version);
-    if (v.path !== p) c = { ...c, version: crypto.randomUUID() };
-    else {
-      if (v.hash !== c.hash || v.size !== c.size) throw Error("Immutable version mismatch");
-      return;
-    }
-  }
-  doc2.transact(() => {
-    const files = doc2.getMap("files");
-    doc2.getMap("deleted").delete(p);
-    if (c.kind === "text") {
-      if (!markdown(p)) throw Error("Inline text requires Markdown");
-      if (files.get(p)?.kind === "file" && origin !== "explicit-history-restore") throw Error("Whole-file Markdown cannot silently switch to inline CRDT");
-      patchText(doc2, p, c.data, origin);
-      const prior = files.get(p);
-      if (!prior || prior.deleted || prior.kind !== "text") files.set(p, { kind: "text", deleted: false });
-    } else {
-      const version = c.version || crypto.randomUUID(), v = { path: p, hash: c.hash, size: c.size };
-      validateRef(v);
-      const kind = c.kind === "image" ? "image" : "file";
-      if (markdown(p) && kind !== "file" || !markdown(p) && !/\.pdf$/i.test(p) && kind !== "image" || /\.pdf$/i.test(p) && kind !== "file") throw Error("File kind/path mismatch");
-      doc2.getMap("blobVersions").set(version, v);
-      files.set(p, { kind, hash: c.hash, size: c.size, version, deleted: false });
-      if (markdown(p)) {
-        const text2 = doc2.getText("text:" + p);
-        if (text2.length) text2.delete(0, text2.length);
-      }
-    }
-  }, origin);
-}
-function remove(doc2, p, origin) {
-  if (!supported2(p)) throw Error("Unsupported path");
-  doc2.transact(() => {
-    doc2.getMap("deleted").set(p, true);
-    doc2.getMap("files").set(p, { kind: doc2.getMap("files").get(p)?.kind || (markdown(p) ? "text" : /\.pdf$/i.test(p) ? "file" : "image"), deleted: true });
-  }, origin);
-}
-function validateRef(v) {
-  if (!v || !supported2(v.path) || !/^[a-f0-9]{64}$/.test(v.hash) || !Number.isSafeInteger(v.size) || v.size < 0 || v.size > (markdown(v.path) ? MAX_FILE_TEXT : MAX_BINARY) || Object.keys(v).some((k) => !["path", "hash", "size"].includes(k))) throw Error("Invalid blob reference or per-file size limit");
-}
-function validate(doc2, hasBlob) {
-  let total = 0, count = 0, active = 0, inline = 0;
-  const names = /* @__PURE__ */ new Set();
-  for (const name of doc2.share.keys()) {
-    if (!["files", "deleted", "blobVersions"].includes(name) && !(name.startsWith("text:") && supported2(name.slice(5)) && markdown(name))) throw Error("Invalid V3 document root");
-    if (name.startsWith("text:")) {
-      const n = new TextEncoder().encode(doc2.getText(name).toString()).length;
-      if (n > MAX_INLINE_NOTE) throw Error("Inline note exceeds 16 KiB; explicit whole-file mode required");
-      inline += n;
-    }
-  }
-  if (inline > MAX_INLINE_TOTAL) throw Error("Inline CRDT budget exceeds 128 KiB; explicit whole-file mode required");
-  for (const [id2, v] of doc2.getMap("blobVersions")) {
-    if (!/^[a-f0-9-]{36}$/.test(id2)) throw Error("Invalid version id");
-    validateRef(v);
-    if (hasBlob && !hasBlob(v.hash, v.size)) throw Error("Referenced blob is not durably uploaded");
-  }
-  if (doc2.getMap("deleted").size > MAX_PATHS) throw Error("Tombstone limit 4096");
-  for (const [p, v] of doc2.getMap("deleted")) if (!supported2(p) || v !== true) throw Error("Invalid tombstone");
-  for (const [p, m] of doc2.getMap("files")) {
-    if (!supported2(p) || !m || !["text", "image", "file"].includes(m.kind) || typeof m.deleted !== "boolean" || m.kind === "text" && !markdown(p) || m.kind === "image" && (markdown(p) || /\.pdf$/i.test(p)) || m.kind === "file" && !markdown(p) && !/\.pdf$/i.test(p) || Object.keys(m).some((k) => !["kind", "deleted", "hash", "size", "version"].includes(k))) throw Error("Invalid V3 file metadata");
-    const canonical = p.toLowerCase();
-    if (names.has(canonical)) throw Error("Case-insensitive path collision");
-    names.add(canonical);
-    if (++count > MAX_PATHS) throw Error("Tracked path limit 4096 including tombstones");
-    if (m.deleted || doc2.getMap("deleted").has(p)) continue;
-    if (++active > MAX_ACTIVE_PATHS) throw Error("Active path limit 3000");
-    if (m.kind === "text") total += new TextEncoder().encode(doc2.getText("text:" + p).toString()).length;
-    else {
-      validateRef({ path: p, hash: m.hash, size: m.size });
-      const v = doc2.getMap("blobVersions").get(m.version);
-      if (!v || v.path !== p || v.hash !== m.hash || v.size !== m.size) throw Error("Missing immutable blob version");
-      total += m.size;
-    }
-    if (total > MAX_LIVE_BYTES) throw Error("Active logical content exceeds 128 MiB; server/cache disk also capped");
-  }
-  if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata/text state exceeds 2 MiB");
-  return total;
-}
-
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
     super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY], beforeUpload: async () => {
@@ -10703,6 +10711,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   recoveryBusy = false;
   recoveryAttempts = 0;
   retryAfter = 0;
+  localOperations = 0;
+  diagnosticBusy = false;
+  diagnosticLastSent = 0;
+  diagnosticTimer;
+  diagnosticError = "";
   uiUnloaded = false;
   connectionStatus = "\u672A\u8FDE\u63A5";
   operationError = "";
@@ -10755,6 +10768,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const headline = this.summaryStatus();
     this.status?.setText("Realtime Lab V3\uFF1A" + headline);
     this.syncBadges();
+    this.scheduleDiagnostic();
     for (const e of [...this.syncPanel ? [this.syncPanel] : [], ...this.detailPanels]) this.renderPanel(e, headline);
   }
   renderPanel(e, headline) {
@@ -10894,13 +10908,60 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.detailPanels.add(panel);
     this.detailModals.add(m);
     m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u2191 \u5F85\u4E0A\u4F20\u6216\u7B49\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF1B\u2193 \u5F53\u524D\u63A5\u6536\u4E2D\u7684\u8DEF\u5F84\u6570\u3002\u26A1 \u8868\u793A\u8FDE\u63A5\u4E14\u5DF2\u83B7\u670D\u52A1\u5668\u786E\u8BA4\uFF1B\u65F6\u949F\u8868\u793A\u7B49\u5F85\u786E\u8BA4\uFF1B\u79BB\u7EBF\u4E0E\u5F02\u5E38\u4F1A\u76F4\u63A5\u6807\u660E\u3002\u786E\u8BA4\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
-    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u67E5\u770B\u540C\u6B65\u51B2\u7A81").onClick(() => void this.openConflicts())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u8BBE\u5907\u8FDC\u7A0B\u8BCA\u65AD").onClick(() => void this.openDeviceDiagnostics())).addButton((b) => b.setButtonText("\u67E5\u770B\u540C\u6B65\u51B2\u7A81").onClick(() => void this.openConflicts())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
     m.onClose = () => {
       this.detailPanels.delete(panel);
       this.detailModals.delete(m);
     };
     m.open();
     this.renderProgress();
+  }
+  scheduleDiagnostic() {
+    if (!this.client?.ready || this.uiUnloaded || this.diagnosticTimer !== void 0 || Date.now() - this.diagnosticLastSent < 2e3) return;
+    this.diagnosticTimer = window.setTimeout(() => {
+      this.diagnosticTimer = void 0;
+      void this.reportDiagnostic();
+    }, 300);
+  }
+  async reportDiagnostic() {
+    const c = this.client;
+    if (this.uiUnloaded || this.diagnosticBusy || !c?.ready || !this.settings.deviceId || !c.serverCapabilities?.includes(DIAGNOSTICS_CAPABILITY)) return;
+    this.diagnosticBusy = true;
+    try {
+      const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.14", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: documentDigest(c.doc) } });
+      this.diagnosticError = "";
+    } catch {
+      this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
+    } finally {
+      this.diagnosticLastSent = Date.now();
+      this.diagnosticBusy = false;
+    }
+  }
+  async openDeviceDiagnostics() {
+    const m = new import_obsidian.Modal(this.app);
+    m.titleEl.setText("\u8BBE\u5907\u8FDC\u7A0B\u540C\u6B65\u8BCA\u65AD");
+    const panel = m.contentEl.createDiv();
+    this.detailModals.add(m);
+    m.onClose = () => this.detailModals.delete(m);
+    const refresh = async () => {
+      panel.empty();
+      try {
+        const c = this.client;
+        if (!c?.ready || !c.serverCapabilities?.includes(DIAGNOSTICS_CAPABILITY)) throw Error("\u8BF7\u8FDE\u63A5\u652F\u6301\u8BBE\u5907\u8BCA\u65AD\u7684\u65B0\u7248\u6D4B\u8BD5\u670D\u52A1\u5668");
+        await this.reportDiagnostic();
+        const result = await c.request("device-diagnostics");
+        panel.createEl("p", { text: "\u4EC5\u663E\u793A\u6700\u8FD1\u4E00\u6B21\u8BBE\u5907\u81EA\u62A5\u72B6\u6001\uFF1B\u8D85\u8FC730\u79D2\u3001\u540E\u53F0\u6216\u79BB\u7EBF\u5747\u4E0D\u5224\u4E3A\u540C\u6B65\u5B8C\u6210\u3002\u670D\u52A1\u5668\u91CD\u542F\u6E05\u7A7A\u8BCA\u65AD\uFF0C\u4E0D\u5F71\u54CD\u7B14\u8BB0\u3002" });
+        for (const d of result.devices) panel.createEl("p", { text: d.platform + " \xB7 " + d.deviceId.slice(0, 8) + " \xB7 " + d.version + "\uFF1A" + (d.completeAtReport ? "\u6700\u8FD1\u4E0A\u62A5\u5DF2\u540C\u6B65" : !d.connected ? "\u5DF2\u79BB\u7EBF" : !d.fresh ? "\u4E0A\u62A5\u5DF2\u8FC7\u671F" : !d.foreground ? "\u540E\u53F0\uFF0C\u72B6\u6001\u5F85\u786E\u8BA4" : "\u5C1A\u672A\u786E\u8BA4\u5B8C\u6210") + "\uFF1B\u5F85\u5904\u7406 " + d.queued + "\uFF0C\u63A5\u6536 " + d.receiving + "\uFF0C\u5931\u8D25 " + d.failed + "\uFF0C\u51B2\u7A81 " + d.conflicts + "\uFF1B" + Math.floor(d.ageMs / 1e3) + "\u79D2\u524D\u4E0A\u62A5" });
+        if (result.unreportedConnections) panel.createEl("p", { text: result.unreportedConnections + "\u4E2A\u8FDE\u63A5\u672A\u4E0A\u62A5\uFF0C\u53EF\u80FD\u662F\u65E7\u7248\u6216\u8F6F\u4EF6\u68C0\u67E5\u7AEF\uFF0C\u4E0D\u80FD\u636E\u6B64\u5224\u5B9A\u5176\u961F\u5217\u3002" });
+        if (this.diagnosticError) panel.createEl("p", { text: this.diagnosticError });
+      } catch (e) {
+        panel.createEl("p", { text: this.safeError(e) });
+      }
+    };
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5237\u65B0\u8BCA\u65AD").onClick(() => void refresh())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    m.open();
+    await refresh();
   }
   async persistConfig() {
     if (this.legacyConfig) throw Error("\u65E7\u8BBE\u7F6E\u5C1A\u672A\u5907\u4EFD\uFF1B\u62D2\u7EDD\u8986\u76D6");
@@ -10918,11 +10979,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const loaded = await this.loadData();
     if (loaded && (loaded.protocol !== 3 || loaded.capability !== FILE_REFS_CAPABILITY)) this.legacyConfig = loaded;
     else this.settings = { ...this.settings, ...loaded };
+    if (!this.legacyConfig && !this.settings.deviceId) {
+      this.settings.deviceId = crypto.randomUUID();
+      await this.persistConfig();
+    }
     this.cache = new ObsidianBlobCache(this.app.vault.adapter);
     this.status = this.addStatusBarItem();
     this.setConnectionStatus("\u672A\u8FDE\u63A5");
     this.addSettingTab(new Settings(this.app, this));
     this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u72EC\u7ACB\u6D4B\u8BD5\u5E93", callback: () => void this.start() });
+    this.addCommand({ id: "device-diagnostics", name: "\u67E5\u770B\u8BBE\u5907\u8FDC\u7A0B\u540C\u6B65\u8BCA\u65AD", callback: () => void this.openDeviceDiagnostics() });
     this.addCommand({ id: "conflicts", name: "\u67E5\u770B\u4E0E\u5904\u7406\u540C\u6B65\u51B2\u7A81", callback: () => void this.openConflicts() });
     this.addCommand({ id: "history", name: "\u67E5\u770B\u4E0E\u6062\u590D\u5386\u53F2\u7248\u672C", callback: () => void this.history() });
     this.addCommand({ id: "stop", name: "\u65AD\u5F00\u6D4B\u8BD5\u5E93\u540C\u6B65", callback: () => this.stop() });
@@ -11031,12 +11097,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     });
     this.registerDomEvent(document, "visibilitychange", () => {
       if (!document.hidden) this.client?.resume();
+      void this.reportDiagnostic();
     });
     this.registerInterval(window.setInterval(() => {
       if (!document.hidden) {
         void this.client?.checkConnection();
         void this.recoverQueue();
         void this.refreshConflicts();
+        void this.reportDiagnostic();
       }
     }, 1e4));
     this.app.workspace.onLayoutReady(() => {
@@ -11045,7 +11113,15 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     });
   }
   enqueue(fn) {
-    this.queue = this.queue.then(fn).catch((e) => {
+    this.queue = this.queue.then(async () => {
+      this.localOperations++;
+      try {
+        await fn();
+      } finally {
+        this.localOperations--;
+        this.updateProgress();
+      }
+    }).catch((e) => {
       new import_obsidian.Notice("\u6D4B\u8BD5\u5E93\u540C\u6B65\uFF1A" + String(e.message || e));
       this.operationError = this.safeError(e.message || e);
       this.setConnectionStatus("\u64CD\u4F5C\u5931\u8D25\uFF1A" + this.operationError);
@@ -11795,6 +11871,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   onunload() {
     this.uiUnloaded = true;
+    window.clearTimeout(this.diagnosticTimer);
     this.badgeObserver?.disconnect();
     this.stop();
     window.clearTimeout(this.progressTimer);
@@ -11841,6 +11918,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
       if (v && !this.p.client) await this.p.start();
     }));
     new import_obsidian.Setting(e).setName("\u8FDE\u63A5\u6574\u4E2A\u6D4B\u8BD5\u5E93").addButton((b) => b.setButtonText("\u8FDE\u63A5").onClick(() => void this.p.start()));
+    new import_obsidian.Setting(e).setName("\u8BBE\u5907\u8FDC\u7A0B\u8BCA\u65AD").addButton((b) => b.setButtonText("\u67E5\u770B\u8BBE\u5907\u72B6\u6001").onClick(() => void this.p.openDeviceDiagnostics()));
     new import_obsidian.Setting(e).setName("\u540C\u6B65\u51B2\u7A81").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => void this.p.openConflicts()));
     new import_obsidian.Setting(e).setName("\u5386\u53F2\u7248\u672C\uFF08\u542B\u5DF2\u5220\u9664\u6587\u4EF6\uFF09").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u6062\u590D").onClick(() => void this.p.history()));
     new import_obsidian.Setting(e).setName("\u65AD\u5F00").addButton((b) => b.setButtonText("\u65AD\u5F00").onClick(() => this.p.stop()));

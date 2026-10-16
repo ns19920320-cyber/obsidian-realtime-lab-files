@@ -9940,6 +9940,10 @@ var badgeCSS = `
 body.is-mobile .rl-sync-row{padding:0 20px 2px;min-height:28px;z-index:5;background:transparent;pointer-events:none}
 body.is-mobile .rl-sync-row .rl-sync-badge{pointer-events:auto}
 body.is-mobile .rl-sync-row .rl-sync-badge{font-size:12px;min-height:28px;line-height:28px}
+.rl-history-modal .setting-item-control{flex-wrap:wrap;gap:8px}
+.rl-history-modal .modal-title{overflow-wrap:anywhere}
+.rl-history-preview{white-space:pre-wrap;overflow-wrap:anywhere;max-height:45vh;overflow:auto;padding:12px;background:var(--background-secondary);font-size:var(--font-smaller)}
+.rl-history-image{display:block;max-width:100%;max-height:45vh;object-fit:contain;margin:12px auto}
 .rl-sync-details-note{color:var(--text-muted);font-size:var(--font-ui-small);line-height:1.6}
 `;
 
@@ -10875,6 +10879,21 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.addCommand({ id: "stop", name: "\u65AD\u5F00\u6D4B\u8BD5\u5E93\u540C\u6B65", callback: () => this.stop() });
     for (const event of ["create", "modify", "delete"]) this.registerEvent(this.app.vault.on(event, (f) => {
       if (f instanceof import_obsidian.TFile) this.fingerprints.delete(f.path);
+      if (event === "delete" && !(f instanceof import_obsidian.TFile) && this.client && this.syncedOnce && !this.initializing) {
+        const paths = [...this.client.doc.getMap("files").keys()].filter((p) => p.startsWith(f.path + "/") && supported2(p));
+        for (const p of paths) {
+          this.dirtyFiles.delete(p);
+          this.fileFailures.delete(p);
+          this.fingerprints.delete(p);
+        }
+        this.enqueue(async () => {
+          const c = this.client;
+          if (c) await c.batchFiles(async () => {
+            for (const p of paths) remove(c.doc, p, "folder-delete");
+          });
+        });
+        return;
+      }
       if (!(f instanceof import_obsidian.TFile) || !supported2(f.path) || this.writing.has(f.path) || !this.client || !this.syncedOnce || this.initializing) return;
       if (event === "delete") {
         this.dirtyFiles.delete(f.path);
@@ -10892,15 +10911,37 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.fileUploads.request();
     }));
     this.registerEvent(this.app.vault.on("rename", (f, old) => {
-      if (f instanceof import_obsidian.TFile) {
-        this.fingerprints.delete(old);
-        this.fingerprints.delete(f.path);
+      if (!this.client || !this.syncedOnce || this.initializing) return;
+      const moved = f instanceof import_obsidian.TFile ? [{ file: f, from: old }] : this.app.vault.getFiles().filter((x) => x.path.startsWith(f.path + "/")).map((file) => ({ file, from: old + file.path.slice(f.path.length) }));
+      for (const { file, from: from2 } of moved) {
+        this.fingerprints.delete(from2);
+        this.fingerprints.delete(file.path);
+        this.dirtyFiles.delete(from2);
+        this.fileFailures.delete(from2);
+        if (supported2(file.path)) this.dirtyFiles.set(file.path, file);
       }
-      if (!(f instanceof import_obsidian.TFile) || !this.client || !this.syncedOnce || this.initializing) return;
       this.enqueue(async () => {
-        if (!this.client) return;
-        if (supported2(old)) remove(this.client.doc, old, "disk");
-        if (supported2(f.path)) await this.upload(f);
+        const c = this.client;
+        if (!c) return;
+        await c.batchFiles(async () => {
+          for (const { file, from: from2 } of moved) {
+            const prior = supported2(from2) ? content(c.doc, from2) : null;
+            if (prior && supported2(file.path)) {
+              const trial = new Doc();
+              try {
+                applyUpdate(trial, encodeStateAsUpdate(c.doc));
+                put(trial, file.path, prior, "rename");
+                remove(trial, from2, "rename");
+                validate(trial);
+              } finally {
+                trial.destroy();
+              }
+              put(c.doc, file.path, prior, "rename");
+            }
+            if (supported2(from2)) remove(c.doc, from2, "rename");
+          }
+        });
+        await this.flushLocalFiles();
         this.refresh();
       });
     }));
@@ -11216,80 +11257,86 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const files = c.doc.getMap("files");
     for (const [p, m] of files) {
       if (this.stopping || this.client !== c) return;
-      if (!supported2(p)) continue;
-      const f = this.app.vault.getAbstractFileByPath(p);
-      if (m.deleted || c.doc.getMap("deleted").has(p)) {
-        if (f instanceof import_obsidian.TFile) {
-          const saved = await this.read(f);
-          if (/\.md$/i.test(p)) {
-            const merged = c.doc.getText("text:" + p).toString();
-            if (merged) saved.data = merged;
-          }
-          await this.backup(p, saved);
-          this.writing.add(p);
-          try {
-            await this.app.vault.trash(f, false);
-          } finally {
-            this.writing.delete(p);
-          }
-        }
-        continue;
-      }
-      const item = content(c.doc, p);
-      if (!item) continue;
-      if (item.kind !== "text") {
-        for (const [cm, b] of this.bindings) if (b.path === p) {
-          cm.dispatch({ effects: b.c.reconfigure([]) });
-          b.undo.destroy();
-          this.bindings.delete(cm);
-        }
-      }
-      const bound = [...this.bindings.values()].some((b) => b.path === p);
-      if (bound && item.kind === "text") continue;
-      if (f instanceof import_obsidian.TFile) {
-        const old = await this.read(f);
-        if (equal(old, item)) continue;
-        await this.backup(p, old);
-      }
-      await this.parents(p);
-      this.writing.add(p);
+      if (!supported2(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
       try {
-        if (item.kind === "text") {
-          if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, item.data);
-          else await this.app.vault.create(p, item.data);
-        } else {
-          if (!await this.cache.has(item)) {
-            this.downloadPaths.add(p);
-            this.updateProgress();
+        const f = this.app.vault.getAbstractFileByPath(p);
+        if (m.deleted || c.doc.getMap("deleted").has(p)) {
+          if (f instanceof import_obsidian.TFile) {
+            const saved = await this.read(f);
+            if (/\.md$/i.test(p)) {
+              const merged = c.doc.getText("text:" + p).toString();
+              if (merged) saved.data = merged;
+            }
+            await this.backup(p, saved);
+            this.writing.add(p);
             try {
-              await c.blobs.download(item, this.cache.sink(item));
-              this.fileFailures.delete(p);
-            } catch (e) {
-              this.fileFailures.set(p, this.safeError(e));
-              throw e;
+              await this.app.vault.trash(f, false);
             } finally {
-              this.downloadPaths.delete(p);
-              this.updateProgress();
+              this.writing.delete(p);
             }
           }
-          if (content(c.doc, p)?.hash !== item.hash) {
-            this.reflection.request();
-            continue;
-          }
-          const bytes = await this.cache.materialize(item);
-          if (/\.md$/i.test(p)) {
-            const text2 = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-            if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, text2);
-            else await this.app.vault.create(p, text2);
-          } else if (f instanceof import_obsidian.TFile) await this.app.vault.modifyBinary(f, bytes);
-          else await this.app.vault.createBinary(p, bytes);
+          continue;
         }
-      } finally {
-        this.writing.delete(p);
-      }
-      if (item.kind !== "text") {
-        const written = this.app.vault.getAbstractFileByPath(p);
-        if (written instanceof import_obsidian.TFile) this.fingerprints.set(p, { key: written.stat.size + ":" + written.stat.mtime, item });
+        const item = content(c.doc, p);
+        if (!item) continue;
+        if (item.kind !== "text") {
+          for (const [cm, b] of this.bindings) if (b.path === p) {
+            cm.dispatch({ effects: b.c.reconfigure([]) });
+            b.undo.destroy();
+            this.bindings.delete(cm);
+          }
+        }
+        const bound = [...this.bindings.values()].some((b) => b.path === p);
+        if (bound && item.kind === "text") continue;
+        if (f instanceof import_obsidian.TFile) {
+          const old = await this.read(f);
+          if (equal(old, item)) continue;
+          await this.backup(p, old);
+        }
+        await this.parents(p);
+        this.writing.add(p);
+        try {
+          if (item.kind === "text") {
+            if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, item.data);
+            else await this.app.vault.create(p, item.data);
+          } else {
+            if (!await this.cache.has(item)) {
+              this.downloadPaths.add(p);
+              this.updateProgress();
+              try {
+                await c.blobs.download(item, this.cache.sink(item));
+                this.fileFailures.delete(p);
+              } catch (e) {
+                this.fileFailures.set(p, this.safeError(e));
+                throw e;
+              } finally {
+                this.downloadPaths.delete(p);
+                this.updateProgress();
+              }
+            }
+            if (content(c.doc, p)?.hash !== item.hash) {
+              this.reflection.request();
+              continue;
+            }
+            const bytes = await this.cache.materialize(item);
+            if (/\.md$/i.test(p)) {
+              const text2 = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+              if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, text2);
+              else await this.app.vault.create(p, text2);
+            } else if (f instanceof import_obsidian.TFile) await this.app.vault.modifyBinary(f, bytes);
+            else await this.app.vault.createBinary(p, bytes);
+          }
+        } finally {
+          this.writing.delete(p);
+        }
+        if (item.kind !== "text") {
+          const written = this.app.vault.getAbstractFileByPath(p);
+          if (written instanceof import_obsidian.TFile) this.fingerprints.set(p, { key: written.stat.size + ":" + written.stat.mtime, item });
+        }
+        this.fileFailures.delete(p);
+      } catch (e) {
+        this.fileFailures.set(p, this.safeError(e));
+        this.updateProgress();
       }
     }
     this.refresh();
@@ -11390,6 +11437,103 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       m.contentEl.createEl("p", { text: String(e) });
     }
   }
+  async restoreVersion(path, version, target, expected) {
+    const c = this.client;
+    if (!c?.ready) throw Error("\u8BF7\u5148\u8FDE\u63A5\u6D4B\u8BD5\u5E93");
+    const task = this.queue.then(async () => {
+      if (this.client !== c || !c.ready) throw Error("\u8FDE\u63A5\u5DF2\u6539\u53D8\uFF0C\u8BF7\u91CD\u65B0\u9884\u89C8");
+      if (this.dirtyFiles.has(target) || c.pending.some((p) => p.path === target) || c.pendingPaths.includes(target) || c.pendingPaths.includes("*")) throw Error("\u5F53\u524D\u6587\u4EF6\u4ECD\u6709\u5F85\u4F20\u5185\u5BB9\uFF0C\u8BF7\u5148\u5B8C\u6210\u540C\u6B65");
+      const f = this.app.vault.getAbstractFileByPath(target);
+      if (target !== path && f) throw Error("\u526F\u672C\u8DEF\u5F84\u5DF2\u5B58\u5728");
+      if (target === path) {
+        if (JSON.stringify(content(c.doc, path)) !== JSON.stringify(expected)) throw Error("\u6587\u4EF6\u5728\u9884\u89C8\u540E\u5DF2\u6539\u53D8\uFF0C\u8BF7\u91CD\u65B0\u9884\u89C8");
+        if (f instanceof import_obsidian.TFile) {
+          const local = await this.read(f);
+          if (!equal(local, expected)) throw Error("\u78C1\u76D8\u5185\u5BB9\u4E0E\u9884\u89C8\u65F6\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u5148\u5B8C\u6210\u540C\u6B65");
+          await this.backup(path, local);
+        }
+      }
+      if (this.dirtyFiles.has(target) || JSON.stringify(content(c.doc, target)) !== JSON.stringify(expected)) throw Error("\u6587\u4EF6\u5728\u9884\u89C8\u540E\u5DF2\u6539\u53D8\uFF0C\u8BF7\u91CD\u65B0\u9884\u89C8");
+      await c.request("restore", { path, version, target, expected });
+      await this.reflect();
+      await c.confirmUploads();
+      this.updateProgress();
+    });
+    this.queue = task.catch(() => {
+    });
+    return task;
+  }
+  async previewVersion(path, id2) {
+    const c = this.client;
+    if (!c?.ready) return;
+    const m = new import_obsidian.Modal(this.app);
+    m.titleEl.setText("\u7248\u672C\u9884\u89C8 \xB7 " + path);
+    m.modalEl.addClass("rl-history-modal");
+    m.contentEl.createEl("p", { text: "\u6B63\u5728\u8BFB\u53D6\u5386\u53F2\u7248\u672C\u2026" });
+    let imageURL, closed = false;
+    m.onClose = () => {
+      closed = true;
+      if (imageURL) URL.revokeObjectURL(imageURL);
+    };
+    m.open();
+    try {
+      const expected = content(c.doc, path), v = await c.request("history-preview", { path, version: id2 });
+      if (closed) return;
+      m.contentEl.empty();
+      m.contentEl.createEl("p", { text: new Date(v.time).toLocaleString() + (v.conflict ? " \xB7 \u5E76\u53D1\u4FDD\u7559\u7248\u672C" : "") });
+      if (v.deleted) m.contentEl.createEl("p", { text: "\u6B64\u7248\u672C\u8868\u793A\u6587\u4EF6\u5DF2\u5220\u9664\u3002\u66FF\u6362\u64CD\u4F5C\u4F1A\u540C\u6B65\u5220\u9664\uFF0C\u5F53\u524D\u6587\u4EF6\u5148\u5907\u4EFD\u3002" });
+      else if (v.kind === "text") m.contentEl.createEl("pre", { cls: "rl-history-preview", text: v.data });
+      else {
+        m.contentEl.createEl("p", { text: "\u6587\u4EF6\u5927\u5C0F\uFF1A" + v.size + " \u5B57\u8282" });
+        if (/\.md$|\.(png|jpe?g|gif|webp)$/i.test(path)) {
+          if (!await this.cache.has(v)) await c.blobs.download(v, this.cache.sink(v));
+          if (closed) return;
+          const bytes = await this.cache.materialize(v);
+          if (/\.md$/i.test(path)) {
+            const text2 = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            m.contentEl.createEl("pre", { cls: "rl-history-preview", text: text2.slice(0, 2e4) });
+            if (text2.length > 2e4) m.contentEl.createEl("p", { text: "\u9884\u89C8\u4EC5\u663E\u793A\u524D20000\u5B57\u7B26\uFF0C\u6062\u590D\u4F7F\u7528\u5B8C\u6574\u7248\u672C\u3002" });
+          } else {
+            imageURL = URL.createObjectURL(new Blob([bytes], { type: /\.png$/i.test(path) ? "image/png" : /\.jpe?g$/i.test(path) ? "image/jpeg" : /\.gif$/i.test(path) ? "image/gif" : "image/webp" }));
+            m.contentEl.createEl("img", { cls: "rl-history-image", attr: { src: imageURL, alt: "\u5386\u53F2\u56FE\u7247\u9884\u89C8" } });
+          }
+        } else m.contentEl.createEl("p", { text: "\u6B64\u9644\u4EF6\u4EC5\u663E\u793A\u7248\u672C\u4FE1\u606F\uFF0C\u53EF\u6062\u590D\u4E3A\u526F\u672C\u540E\u6253\u5F00\u67E5\u770B\u3002" });
+      }
+      m.contentEl.createEl("p", { text: "\u6062\u590D\u4E3A\u526F\u672C\u4FDD\u7559\u539F\u6587\u4EF6\uFF1B\u66FF\u6362\u5F53\u524D\u6587\u4EF6\u4F1A\u540C\u6B65\u5230\u6D4B\u8BD5\u8BBE\u5907\uFF0C\u5F53\u524D\u5185\u5BB9\u5148\u5907\u4EFD\u3002\u9884\u89C8\u540E\u82E5\u6709\u65B0\u4FEE\u6539\uFF0C\u5C06\u62D2\u7EDD\u66FF\u6362\u5E76\u8981\u6C42\u91CD\u65B0\u9884\u89C8\u3002" });
+      const controls = new import_obsidian.Setting(m.contentEl);
+      if (!v.deleted) controls.addButton((b) => b.setButtonText("\u6062\u590D\u4E3A\u526F\u672C").onClick(async () => {
+        try {
+          const name = path.slice(path.lastIndexOf("/") + 1), dot = name.lastIndexOf("."), target = "\u6062\u590D\u526F\u672C/" + name.slice(0, dot) + "-" + Date.now() + "-" + crypto.randomUUID().slice(0, 6) + name.slice(dot);
+          await this.restoreVersion(path, id2, target, null);
+          new import_obsidian.Notice("\u526F\u672C\u5DF2\u6062\u590D\u5E76\u540C\u6B65\uFF1A" + target);
+          m.close();
+        } catch (e) {
+          new import_obsidian.Notice(this.safeError(e));
+        }
+      }));
+      controls.addButton((b) => b.setButtonText(v.deleted ? "\u6062\u590D\u5220\u9664\u72B6\u6001" : "\u66FF\u6362\u5F53\u524D\u6587\u4EF6").onClick(() => {
+        const confirm = new import_obsidian.Modal(this.app);
+        confirm.titleEl.setText("\u786E\u8BA4\u66FF\u6362 \xB7 " + path);
+        confirm.contentEl.createEl("p", { text: "\u5C06\u7528\u9884\u89C8\u7684\u5386\u53F2\u7248\u672C\u66FF\u6362\u5F53\u524D\u6587\u4EF6\u5E76\u540C\u6B65\u5230\u6D4B\u8BD5\u8BBE\u5907\uFF1B\u5F53\u524D\u5185\u5BB9\u5148\u5907\u4EFD\u3002" });
+        new import_obsidian.Setting(confirm.contentEl).addButton((b2) => b2.setButtonText("\u53D6\u6D88").onClick(() => confirm.close())).addButton((b2) => b2.setButtonText("\u786E\u8BA4\u66FF\u6362").onClick(async () => {
+          try {
+            await this.restoreVersion(path, id2, path, expected);
+            new import_obsidian.Notice("\u5386\u53F2\u7248\u672C\u5DF2\u6062\u590D");
+            confirm.close();
+            m.close();
+          } catch (e) {
+            new import_obsidian.Notice(this.safeError(e));
+          }
+        }));
+        confirm.open();
+      }));
+    } catch (e) {
+      if (!closed) {
+        m.contentEl.empty();
+        m.contentEl.createEl("p", { text: "\u65E0\u6CD5\u9884\u89C8\uFF0C\u672A\u6062\u590D\u4EFB\u4F55\u6587\u4EF6\uFF1A" + this.safeError(e) });
+      }
+    }
+  }
   async history() {
     if (!this.client?.ready) {
       new import_obsidian.Notice("\u8BF7\u5148\u8FDE\u63A5 Files \u6D4B\u8BD5\u670D\u52A1\u5668");
@@ -11413,24 +11557,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
             modal.close();
             void this.history();
           }));
-          for (const v of [...list].reverse()) new import_obsidian.Setting(modal.contentEl).setName(v.time).setDesc(v.deleted ? "\u5DF2\u5220\u9664" : v.kind !== "text" ? v.conflict ? "\u5E76\u53D1\u6574\u6587\u4EF6\u4FDD\u7559\u7248\u672C" : "\u6574\u6587\u4EF6\u7248\u672C" : v.conflict ? "\u5E76\u53D1\u9010\u5B57\u6587\u672C\u4FDD\u7559\u7248\u672C" : "\u9010\u5B57\u6587\u672C\u7248\u672C").addButton((btn) => btn.setButtonText("\u6062\u590D\u6B64\u7248\u672C").onClick(() => {
-            const confirm = new import_obsidian.Modal(this.app);
-            confirm.titleEl.setText("\u6062\u590D " + path);
-            confirm.contentEl.createEl("p", { text: "\u4F1A\u66FF\u6362\u6B64\u6D4B\u8BD5\u6587\u4EF6\u5E76\u540C\u6B65\u5230\u6D4B\u8BD5\u8BBE\u5907\uFF1B\u5F53\u524D\u5185\u5BB9\u5148\u5907\u4EFD\u3002" });
-            new import_obsidian.Setting(confirm.contentEl).addButton((b) => b.setButtonText("\u53D6\u6D88").onClick(() => confirm.close())).addButton((b) => b.setButtonText("\u786E\u8BA4\u6062\u590D").onClick(async () => {
-              try {
-                const f = this.app.vault.getAbstractFileByPath(path);
-                if (f instanceof import_obsidian.TFile) await this.backup(path, await this.read(f));
-                await this.client.request("restore", { path, version: v.id });
-                new import_obsidian.Notice("\u5DF2\u6062\u590D\uFF0C\u6B63\u5728\u540C\u6B65");
-                confirm.close();
-                modal.close();
-              } catch (e) {
-                new import_obsidian.Notice(String(e));
-              }
-            }));
-            confirm.open();
-          }));
+          for (const v of [...list].reverse()) new import_obsidian.Setting(modal.contentEl).setName(new Date(v.time).toLocaleString()).setDesc(v.deleted ? "\u5DF2\u5220\u9664" : v.conflict ? "\u5E76\u53D1\u4FDD\u7559\u7248\u672C" : v.kind === "text" ? "\u9010\u5B57\u6587\u672C\u7248\u672C" : "\u6574\u6587\u4EF6\u7248\u672C").addButton((btn) => btn.setButtonText("\u9884\u89C8\u4E0E\u6062\u590D").onClick(() => void this.previewVersion(path, v.id)));
         } catch (e) {
           new import_obsidian.Notice(String(e));
         }

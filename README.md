@@ -1,14 +1,17 @@
-# Realtime Lab Files 0.5.0-alpha.9
+# Realtime Lab Files 0.5.0-alpha.10
 
-BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Only for initialized Realtime-Lab-V3-Files- isolated test vaults. Update in place: no reset, no initialization, preserve notes, cached state, pending files, token, URL and identity. Keep the existing auto-connect choice.
+BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Only initialized Realtime-Lab-V3-Files- isolated test vaults. Update in place; keep existing content, snapshots, pending blobs, identity, auto-connect setting, URL and token. No reset or initialization.
 
-## Offline recovery
-Reconnect drains dirty files and clears completed transient failure rows. Temporary network failures during cached attachment preparation no longer permanently stop the client. Foreground maintenance and network-online events retry recognised transport failures with backoff; permission, identity, quota and local storage errors remain actionable failures. Queue rows distinguish automatic network retry from manual handling. Keep Obsidian foreground for recovery; no iOS background guarantee.
+## Images and multiple files
+Folder renames/deletions process all supported descendants. Rename keeps immutable prior versions and retains newer unsent bytes for retry. One failed attachment receive no longer blocks later files. Local dirty/pending paths are protected from remote reflection until processed. Transient network retry from alpha.9 remains.
 
-165 automated tests and type checking passed, including previously failing reconnect/queue regression, transient cached-file handshake retry and non-transient error protection. Native Mac validation is separate from physical iPhone acceptance. alpha.8 mobile position is retained.
+## History
+Read-only version previews: Markdown text (first 20000 characters for large whole files), common raster images, and metadata for other attachments such as PDF. Restore as a new copy without replacing the source, or explicitly replace/delete the current file after confirmation and local backup. Server rejects replacement if current content changed after preview. Expired versions and occupied copy paths fail without overwrite. Inline text preview uses the new authenticated history-preview server operation. The independent test server has been updated; an old server rejects preview safely without restoring anything.
 
-Protocol/limits unchanged: named collaboration note ≤16 KiB, other Markdown ≤16 MiB, images/PDF ≤5 MiB, 128 MiB active data. No production migration, hidden/config/recovery file sync or end-to-end encryption.
+171 automated tests and type checking passed. Native Mac and software-peer acceptance are separate from physical iPhone behavior. No iOS background execution guarantee. Keep Obsidian foreground for transfers. Existing mobile status placement retained.
+
+Limits unchanged: collaboration note ≤16 KiB, other Markdown ≤16 MiB, images/PDF ≤5 MiB; 128 MiB active contents, 3000 active paths. Hidden/config/recovery files excluded. No production migration or end-to-end encryption.
 
 ## Build
-source.zip is a frozen source archive. npm install; npm run typecheck; npm test; npm run build:v3-files. Use manifest.v3-files.json; legacy root manifests are not this release.
-Source commit: 1ea8e0c8b49421eeef08dcf256938c5caa47f7c6
+source.zip is frozen source. npm install; npm run typecheck; npm test; npm run build:v3-files. Use manifest.v3-files.json, not legacy root manifests. Server changes are backwards compatible for older V3 clients.
+Source commit: 64af6cf4f8020683176d0abbcda74befbbf2daad

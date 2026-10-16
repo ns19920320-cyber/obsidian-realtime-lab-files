@@ -9931,7 +9931,8 @@ var badgeCSS = `
 .rl-sync-badge[data-tone=error]{color:var(--text-error)}
 .rl-sync-badge:hover{color:var(--text-normal)}
 .rl-sync-badge:focus-visible{outline:2px solid var(--interactive-accent);outline-offset:3px}
-body.is-mobile .rl-sync-row{padding:0 20px 2px;min-height:28px}
+body.is-mobile .rl-sync-row{padding:0 20px 2px;min-height:28px;z-index:5;background:transparent;pointer-events:none}
+body.is-mobile .rl-sync-row .rl-sync-badge{pointer-events:auto}
 body.is-mobile .rl-sync-row .rl-sync-badge{font-size:12px;min-height:28px;line-height:28px}
 .rl-sync-details-note{color:var(--text-muted);font-size:var(--font-ui-small);line-height:1.6}
 `;
@@ -10756,11 +10757,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         badge = void 0;
       }
       if (!badge) {
-        const row = document.createElement("div");
-        row.className = "rl-sync-row";
+        const row2 = document.createElement("div");
+        row2.className = "rl-sync-row";
         const el = document.createElement("div");
-        row.appendChild(el);
-        view.contentEl.before(row);
+        row2.appendChild(el);
+        view.contentEl.before(row2);
         el.addEventListener("click", () => this.openSyncDetails());
         el.addClass("rl-sync-badge");
         el.setAttribute("role", "button");
@@ -10773,6 +10774,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         });
         badge = { el, icon: el.createSpan({ cls: "rl-sync-icon" }), label: el.createSpan({ cls: "rl-sync-label" }), counts: el.createSpan({ cls: "rl-sync-counts" }), signature: "" };
         this.badges.set(view, badge);
+      }
+      const row = badge.el.parentElement;
+      if (row && document.body?.classList.contains("is-mobile")) {
+        if (row.parentElement !== document.body) document.body.appendChild(row);
+        const header = view.containerEl?.querySelector(".view-header"), rect = header?.getBoundingClientRect();
+        row.style.position = "fixed";
+        row.style.top = rect && rect.height > 0 ? `${Math.ceil(rect.bottom) + 4}px` : "";
+        row.style.right = "0";
+        row.style.left = "0";
+        row.style.visibility = rect && rect.height > 0 ? "visible" : "hidden";
       }
       if (badge.signature !== signature) {
         (0, import_obsidian.setIcon)(badge.icon, model.icon);
@@ -10887,6 +10898,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }));
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.updateProgress()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.updateProgress()));
+    this.registerDomEvent(window, "resize", () => this.updateProgress());
     this.registerDomEvent(document, "visibilitychange", () => {
       if (!document.hidden) this.client?.resume();
     });

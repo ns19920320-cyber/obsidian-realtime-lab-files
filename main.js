@@ -33,6 +33,60 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var PERFORMANCE_CAPABILITY = "device-performance-v1";
+var PERFORMANCE_KINDS = ["network", "cache", "vault", "config"];
+var empty = () => ({ count: 0, ms: 0, maxMs: 0, bytes: 0, errors: 0, wallMs: 0 });
+var PerformanceCounters = class {
+  constructor({ now = () => performance.now() } = {}) {
+    this.now = now;
+    this.started = now();
+    this.active = Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, { count: 0, start: 0 }]));
+    this.buckets = Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, empty()]));
+  }
+  add(kind, ms, bytes = 0, error = false) {
+    const b = this.buckets[kind];
+    if (!b) return;
+    b.count++;
+    b.ms += Math.max(0, Math.round(ms));
+    b.maxMs = Math.max(b.maxMs, Math.max(0, Math.round(ms)));
+    b.bytes += Math.max(0, bytes);
+    if (error) b.errors++;
+  }
+  record(kind, ms, bytes = 0, error = false) {
+    this.add(kind, ms, bytes, error);
+    if (this.buckets[kind]) this.buckets[kind].wallMs += Math.max(0, Math.round(ms));
+  }
+  begin(kind) {
+    const t = this.now(), a = this.active[kind];
+    if (!a) return () => {
+    };
+    if (a.count++ === 0) a.start = t;
+    let done = false;
+    return (bytes = 0, error = false) => {
+      if (done) return;
+      done = true;
+      const now = this.now();
+      this.add(kind, now - t, bytes, error);
+      if (--a.count === 0) this.buckets[kind].wallMs += Math.max(0, Math.round(now - a.start));
+    };
+  }
+  async measure(kind, fn) {
+    const done = this.begin(kind);
+    let failed = false;
+    try {
+      return await fn();
+    } catch (e) {
+      failed = true;
+      throw e;
+    } finally {
+      done(0, failed);
+    }
+  }
+  snapshot() {
+    return { elapsedMs: Math.min(1e12, Math.max(0, Math.round(this.now() - this.started))), ...Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, { ...this.buckets[k], wallMs: this.buckets[k].wallMs + (this.active[k].count ? Math.max(0, Math.round(this.now() - this.active[k].start)) : 0) }])) };
+  }
+};
+
 var create = () => /* @__PURE__ */ new Map();
 var copy = (m) => {
   const r2 = create();
@@ -9045,6 +9099,7 @@ var MAX_STATE = 2 * 1024 * 1024;
 var FILE_REFS_CAPABILITY = "versioned-files-v1";
 var MAX_DISK_BYTES = 512 * 1024 * 1024;
 var MAX_DISK_OBJECTS = 8192;
+var BLOB_RESPONSE_IDENTITY_CAPABILITY = "blob-response-identity-v1";
 
 var GENERAL_FILES_CAPABILITY = "general-files-v1";
 var GENERAL = /\.(json|csv|jsonl|html?|py|txt|sha256|log|zip|bak)$/i;
@@ -9775,7 +9830,11 @@ async function hashSource(source, signal) {
 
 var ROOT = ".realtime-lab-v3-cache";
 var ObsidianBlobCache = class {
-  constructor(adapter) {
+  constructor(adapter, { onOperation = (ms, failed) => {
+  }, onStart = () => ((bytes, failed) => {
+  }) } = {}) {
+    this.onStart = onStart;
+    this.onOperation = onOperation;
     this.adapter = adapter;
     this.busy = false;
     this.quota = null;
@@ -9804,16 +9863,20 @@ var ObsidianBlobCache = class {
     this.quota = null;
   }
   async io(method, ...args2) {
-    const started = Date.now();
+    const started = Date.now(), done = this.onStart();
+    let failed = false;
     this.metrics.operations++;
     this.metrics.lastOperation = method;
     try {
       return await this.adapter[method](...args2);
     } catch (e) {
+      failed = true;
       this.metrics.failures++;
       this.invalidateQuota();
       throw new Error("Cache " + method + ": " + String(e?.message || e), { cause: e });
     } finally {
+      this.onOperation(Date.now() - started, failed);
+      done?.(0, failed);
       this.metrics.maxOperationMs = Math.max(this.metrics.maxOperationMs, Date.now() - started);
     }
   }
@@ -9912,15 +9975,29 @@ var ObsidianBlobCache = class {
   }
 };
 
-function requestFetch(requestUrl2) {
+function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
+}, onStart = () => ((bytes, failed) => {
+})) {
   return async (url, options = {}) => {
-    options.signal?.throwIfAborted();
-    const body = options.body;
-    if (body && (!(body instanceof Uint8Array) || body.length > CHUNK_BYTES)) throw Error("Native request frame exceeds 32 KiB");
-    const r2 = await requestUrl2({ url: String(url), method: options.method || "GET", headers: { ...options.headers, ...body ? { "Content-Type": "application/octet-stream" } : {} }, body: body ? body.slice().buffer : void 0, throw: false });
-    options.signal?.throwIfAborted();
-    if (r2.arrayBuffer.byteLength > CHUNK_BYTES) throw Error("Native response frame exceeds 32 KiB");
-    return new Response(r2.status === 204 ? null : r2.arrayBuffer, { status: r2.status, headers: r2.headers });
+    const started = Date.now(), done = onStart();
+    let bytes = 0, failed = false;
+    try {
+      options.signal?.throwIfAborted();
+      const body = options.body;
+      if (body && (!(body instanceof Uint8Array) || body.length > CHUNK_BYTES)) throw Error("Native request frame exceeds 32 KiB");
+      const r2 = await requestUrl2({ url: String(url), method: options.method || "GET", headers: { ...options.headers, ...body ? { "Content-Type": "application/octet-stream" } : {} }, body: body ? body.slice().buffer : void 0, throw: false });
+      options.signal?.throwIfAborted();
+      bytes = r2.arrayBuffer.byteLength;
+      if (r2.status >= 400) failed = true;
+      if (r2.arrayBuffer.byteLength > CHUNK_BYTES) throw Error("Native response frame exceeds 32 KiB");
+      return new Response(r2.status === 204 ? null : r2.arrayBuffer, { status: r2.status, headers: r2.headers });
+    } catch (e) {
+      failed = true;
+      throw e;
+    } finally {
+      onOperation(Date.now() - started, bytes, failed);
+      done?.(bytes, failed);
+    }
   };
 }
 
@@ -10502,8 +10579,8 @@ function checkStatus(s, size2) {
 }
 var BlobTransfer = class {
   constructor({ url, token, fetchImpl = globalThis.fetch, serverId, onIdentity = async () => {
-  }, verifyIdentity }) {
-    Object.assign(this, { url: url.replace(/\/$/, ""), token, fetch: fetchImpl, serverId, onIdentity, verifyIdentity });
+  }, verifyIdentity, responseIdentity = () => false }) {
+    Object.assign(this, { url: url.replace(/\/$/, ""), token, fetch: fetchImpl, serverId, onIdentity, verifyIdentity, responseIdentity });
     this.busy = false;
   }
   async identity(signal) {
@@ -10522,6 +10599,7 @@ var BlobTransfer = class {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw Error("Invalid blob hash");
     const r2 = await this.fetch(`${this.url}/v3/blobs/${hash}?${new URLSearchParams(query)}`, { ...options, headers: { Authorization: "Bearer " + this.token, ...options.headers } });
     if (!r2.ok) throw Error("Blob request failed (" + r2.status + ")");
+    if (this.expectedResponseIdentity && r2.headers.get("X-Realtime-Lab-Server") !== this.expectedResponseIdentity) throw Error("Server identity mismatch in blob response");
     return r2;
   }
   async upload(source, { signal, onProgress = () => {
@@ -10555,7 +10633,12 @@ var BlobTransfer = class {
     const pending = /* @__PURE__ */ new Map();
     try {
       checkRef(ref);
-      await this.identity(signal);
+      const bound = this.responseIdentity() && this.verifyIdentity;
+      if (bound) {
+        this.expectedResponseIdentity = await this.verifyIdentity(signal);
+        if (typeof this.expectedResponseIdentity !== "string" || !this.expectedResponseIdentity) throw Error("Verified metadata identity required");
+      } else await this.identity(signal);
+      const window2 = bound ? 4 : 2;
       if (!ref.size) {
         const s = checkStatus(await boundedJson(await this.call(ref.hash, { status: "1", size: 0 }, { signal })), 0);
         if (!s.complete) throw Error("Remote blob incomplete");
@@ -10564,7 +10647,7 @@ var BlobTransfer = class {
       if (!Number.isSafeInteger(offset) || offset < 0 || offset > ref.size || offset !== ref.size && offset % CHUNK_BYTES) throw Error("Invalid destination length");
       let next = offset;
       const fill = () => {
-        while (pending.size < 2 && next < ref.size) {
+        while (pending.size < window2 && next < ref.size) {
           signal?.throwIfAborted();
           const p = next;
           next += CHUNK_BYTES;
@@ -10596,6 +10679,7 @@ var BlobTransfer = class {
       return ref;
     } finally {
       await Promise.all(pending.values());
+      this.expectedResponseIdentity = void 0;
       this.busy = false;
     }
   }
@@ -10610,7 +10694,7 @@ var VaultClientV3 = class extends VaultClient {
         for (const p of this.pending) await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
       }
     }, maxBufferedBytes: 4 * 1024 * 1024, maxInboxBytes: 8 * 1024 * 1024 });
-    this.blobs = new BlobTransfer({ url: options.url.replace(/^ws/, "http"), token: options.token, fetchImpl: options.fetchImpl, verifyIdentity: async () => {
+    this.blobs = new BlobTransfer({ url: options.url.replace(/^ws/, "http"), token: options.token, fetchImpl: options.fetchImpl, responseIdentity: () => this.serverCapabilities?.includes(BLOB_RESPONSE_IDENTITY_CAPABILITY), verifyIdentity: async () => {
       if (!this.ready && !this.metadataVerified || !this.serverId) throw Error("Connect verified V3 metadata before transferring blobs");
       return this.serverId;
     } });
@@ -10829,6 +10913,7 @@ var equal = (a, b) => a?.kind === b?.kind && (a?.kind === "text" ? a.data === b?
 var MAX_IMAGE2 = 5 * 1024 * 1024;
 var BACKUP = ".realtime-lab-v3-recovery";
 var RealtimeLab = class extends import_obsidian.Plugin {
+  performance = new PerformanceCounters();
   settings = { protocol: 3, capability: FILE_REFS_CAPABILITY, url: "ws://127.0.0.1:17241", token: "", state: "", enabled: false };
   client = null;
   status;
@@ -11102,7 +11187,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.19", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.20", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -11126,6 +11211,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         const result = await c.request("device-diagnostics");
         panel.createEl("p", { text: "\u4EC5\u663E\u793A\u6700\u8FD1\u4E00\u6B21\u8BBE\u5907\u81EA\u62A5\u72B6\u6001\uFF1B\u8D85\u8FC730\u79D2\u3001\u540E\u53F0\u6216\u79BB\u7EBF\u5747\u4E0D\u5224\u4E3A\u540C\u6B65\u5B8C\u6210\u3002\u670D\u52A1\u5668\u91CD\u542F\u6E05\u7A7A\u8BCA\u65AD\uFF0C\u4E0D\u5F71\u54CD\u7B14\u8BB0\u3002" });
         for (const d of result.devices) panel.createEl("p", { text: d.platform + " \xB7 " + d.deviceId.slice(0, 8) + " \xB7 " + d.version + "\uFF1A" + (d.completeAtReport ? "\u6700\u8FD1\u4E0A\u62A5\u5DF2\u540C\u6B65" : !d.connected ? "\u5DF2\u79BB\u7EBF" : !d.fresh ? "\u4E0A\u62A5\u5DF2\u8FC7\u671F" : !d.foreground ? "\u540E\u53F0\uFF0C\u72B6\u6001\u5F85\u786E\u8BA4" : "\u5C1A\u672A\u786E\u8BA4\u5B8C\u6210") + "\uFF1B\u5F85\u5904\u7406 " + d.queued + "\uFF0C\u63A5\u6536 " + d.receiving + "\uFF0C\u5931\u8D25 " + d.failed + "\uFF0C\u51B2\u7A81 " + d.conflicts + "\uFF1B" + Math.floor(d.ageMs / 1e3) + "\u79D2\u524D\u4E0A\u62A5" });
+        for (const d of result.devices) if (d.performance) {
+          const p = d.performance;
+          panel.createEl("p", { text: d.platform + " \u5206\u9636\u6BB5\u7D2F\u8BA1\uFF1A\u7F51\u7EDC/\u539F\u751F\u8BF7\u6C42\u7B49\u5F85 " + p.network.wallMs + "ms\uFF08" + p.network.count + "\u6B21\uFF09\uFF1B\u7F13\u5B58\u8BFB\u5199 " + p.cache.wallMs + "ms\uFF1B\u6587\u4EF6\u5199\u5165 " + p.vault.wallMs + "ms\uFF1B\u914D\u7F6E\u4FDD\u5B58 " + p.config.wallMs + "ms\u3002\u8BA1\u65F6\u81EA\u672C\u6B21\u63D2\u4EF6\u542F\u52A8\uFF0C\u90E8\u5206\u9636\u6BB5\u91CD\u53E0\uFF0C\u4E0D\u80FD\u76F8\u52A0\u4F5C\u4E3A\u603B\u8017\u65F6\u3002" });
+        }
         if (result.unreportedConnections) panel.createEl("p", { text: result.unreportedConnections + "\u4E2A\u8FDE\u63A5\u672A\u4E0A\u62A5\uFF0C\u53EF\u80FD\u662F\u65E7\u7248\u6216\u8F6F\u4EF6\u68C0\u67E5\u7AEF\uFF0C\u4E0D\u80FD\u636E\u6B64\u5224\u5B9A\u5176\u961F\u5217\u3002" });
         if (this.diagnosticError) panel.createEl("p", { text: this.diagnosticError });
       } catch (e) {
@@ -11391,7 +11480,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.legacyConfig) throw Error("\u65E7\u8BBE\u7F6E\u5C1A\u672A\u5907\u4EFD\uFF1B\u62D2\u7EDD\u8986\u76D6");
     const snapshot = structuredClone(this.settings);
     this.configWrites = this.configWrites.catch(() => {
-    }).then(() => this.saveData(snapshot));
+    }).then(() => this.performance.measure("config", () => this.saveData(snapshot)));
     await this.configWrites;
   }
   async onload() {
@@ -11407,7 +11496,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.settings.deviceId = crypto.randomUUID();
       await this.persistConfig();
     }
-    this.cache = new ObsidianBlobCache(this.app.vault.adapter);
+    this.cache = new ObsidianBlobCache(this.app.vault.adapter, { onStart: () => this.performance.begin("cache") });
     this.status = this.addStatusBarItem();
     this.setConnectionStatus("\u672A\u8FDE\u63A5");
     this.addSettingTab(new Settings(this.app, this));
@@ -11693,7 +11782,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.syncedOnce = false;
     const hadState = !!this.settings.state;
     let first = true;
-    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl), mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, pending: this.settings.pending, outbox: this.settings.outbox, onSyncState: () => this.updateProgress(), onOutbox: async (outbox) => {
+    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl, void 0, () => this.performance.begin("network")), mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, pending: this.settings.pending, outbox: this.settings.outbox, onSyncState: () => this.updateProgress(), onOutbox: async (outbox) => {
       this.settings.outbox = outbox;
       await this.persistConfig();
     }, onPending: async (pending) => {
@@ -11796,6 +11885,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     let transportFailures = 0;
     for (const [p, m] of [...files].sort((a, b) => Number(!!(a[1].deleted || c.doc.getMap("deleted").has(a[0]))) - Number(!!(b[1].deleted || c.doc.getMap("deleted").has(b[0]))))) {
       if (this.stopping || this.client !== c) return;
+      if (!c.ready) break;
       if (!supportedFile(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
       try {
         const f = this.app.vault.getAbstractFileByPath(p);
@@ -11839,8 +11929,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.writing.add(p);
         try {
           if (item.kind === "text") {
-            if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, item.data);
-            else await this.app.vault.create(p, item.data);
+            if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modify(f, item.data));
+            else await this.performance.measure("vault", () => this.app.vault.create(p, item.data));
           } else {
             if (!await this.cache.has(item)) {
               this.downloadPaths.add(p);
@@ -11863,10 +11953,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
             const bytes = await this.cache.materialize(item);
             if (/\.md$/i.test(p)) {
               const text2 = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-              if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, text2);
-              else await this.app.vault.create(p, text2);
-            } else if (f instanceof import_obsidian.TFile) await this.app.vault.modifyBinary(f, bytes);
-            else await this.app.vault.createBinary(p, bytes);
+              if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modify(f, text2));
+              else await this.performance.measure("vault", () => this.app.vault.create(p, text2));
+            } else if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modifyBinary(f, bytes));
+            else await this.performance.measure("vault", () => this.app.vault.createBinary(p, bytes));
           }
         } finally {
           this.writing.delete(p);
@@ -11879,8 +11969,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.fileFailures.delete(p);
         transportFailures = 0;
       } catch (e) {
-        this.fileFailures.set(p, this.safeError(e));
+        this.fileFailures.set(p, this.safeError(c.ready ? e : "Disconnected during receive: " + this.safeError(e)));
         this.updateProgress();
+        if (!c.ready) break;
         if (transientFilesystemFailure(e)) {
           this.cache.invalidateQuota();
           break;
@@ -11952,7 +12043,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     let cur = "";
     for (const part of parts) {
       cur = cur ? cur + "/" + part : part;
-      if (!this.app.vault.getAbstractFileByPath(cur)) await this.app.vault.createFolder(cur);
+      if (!this.app.vault.getAbstractFileByPath(cur)) await this.performance.measure("vault", () => this.app.vault.createFolder(cur));
     }
   }
   refresh() {

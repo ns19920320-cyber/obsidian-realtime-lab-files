@@ -1,19 +1,22 @@
-# Realtime Lab Files 0.5.0-alpha.21
+# Realtime Lab Files 0.5.0-alpha.22
 
 BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Isolated initialized Realtime-Lab-V3-Files- vaults only.
 
-## Mobile automatic reconnection
-Fixed a watchdog gap: when readiness was already false, the health check returned without recovering a transport stuck in CONNECTING, CLOSING or an incomplete welcome handshake. Foreground checks now replace a stalled transport after 30 seconds (plus the foreground check interval). Live connections use a separate barrier probe so a delayed native snapshot save cannot hold the liveness probe behind durable confirmation.
+## Small-file batches and download/write pipeline
+When a verified server advertises small-blob-batch-v1, receive up to 16 blobs of at most 32 KiB each in one authenticated GET, with a 256 KiB total response limit. Every response must match the verified metadata server identity; every file hash and exact response length is checked before exposing any bytes to the cache. The server accepts only bounded references to committed blobs. Large files keep the existing bounded frame path. Old servers automatically use the previous per-file path.
 
-Only the transport is replaced. Existing Y.Doc, server identity, pending file references, local outbox, partial chunks, receive checkpoint and notes are retained. Authentication rejection, capacity/path rejection, identity mismatch, explicit stop and paused transport are not automatically bypassed. No endpoint, token, protocol or server data migration is needed. Timers cannot run while iOS suspends the app; recovery resumes when JavaScript runs again.
+One request ahead overlaps the next batch download with current cache and native vault writes. At most two batch payloads (512 KiB) are retained, plus existing bounded transfer/cache overhead; writes remain serial. Durable receive intent is retained until each file is actually written and checkpointed. Stopping drains pending native HTTP requests, and cached verified files can be reused after reconnect or restart. Existing pending uploads, notes, history, server/device identities, endpoint and token are preserved. Identity/authentication/hash failures are never bypassed. A local file newly marked dirty during download is not overwritten.
 
-## Validation and limits
-242 automated tests, typecheck and build passed. New tests cover stale CLOSING sockets, incomplete welcome recovery, independent transport probes while durable confirmation is waiting, and terminal rejection guards. Existing tests cover retained edits, durable outbox confirmation, crash recovery and file identity/hash validation. These are synthetic isolated tests; the initial physical-phone disconnect cause cannot be proven from existing numeric diagnostics. Physical iPhone acceptance requires updating the same rehearsal vault and observing fresh diagnostics. No production vault was changed.
+## Same-file controlled benchmark
+The SAME 96 synthetic small files were tested against an isolated loopback server with injected 40 ms/request latency and 8 ms/native write delay. Previous single-file path: 6756 ms / 96 requests. Batch only: 2806 ms / 6 requests. Batch pipeline: 2711 ms / 6 requests. Interrupted after 21 files and reopened the same cache: all 96 files finished with matching bytes, 8 total requests and no pending files. This is a controlled synthetic comparison, NOT a physical iPhone speed claim or comparison with LiveSync. Physical iPhone acceptance follows a BRAT update in the existing rehearsal vault.
+
+## Validation
+252 automated tests, typecheck and build passed. Coverage includes bounded batches, unauthenticated rejection, wrong identity and corrupt response rejection, exact lengths, cache reuse on restart, native response limits, prefetch while native writes are blocked, durable receive checkpoints, failed batch recovery and previous single-file compatibility/recovery tests.
 
 ## Safe update
-Update through BRAT in the SAME isolated rehearsal vault. Do not reinitialize, clear state, change endpoint/token, or retype test notes. Keep LiveSync disabled in this rehearsal vault. An upgrade can take time to scan retained files before the first diagnostic report. Existing alpha.20 server is compatible and unchanged.
+Only the isolated rehearsal backend is enhanced; existing data is backed up and checked unchanged, old clients remain compatible. Update through BRAT in the SAME isolated rehearsal vault. Do not reinitialize, clear state, change endpoint/token, or retype test notes. Keep LiveSync disabled in the rehearsal vault. Production vaults and other server routes are untouched.
 
 ## Source
 source.zip contains allowlisted source, tests and build files only. Notes, settings, credentials, runtime data, private diagnostics and node_modules are excluded. Build: npm ci; npm run typecheck; node --test --test-concurrency=1 test/*.test.mjs; npm run build:v3-files.
 
-Source commit: dd42eb44631eb165df6dae0ce082501099d8fe78
+Source commit: 2875f908b5ff34700153b3d2404637ea14b88a1a

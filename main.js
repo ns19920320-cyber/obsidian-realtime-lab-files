@@ -33,6 +33,167 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
+var r = (v, n) => v >>> n | v << 32 - n;
+var Sha256 = class {
+  constructor() {
+    this.h = new Uint32Array([1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]);
+    this.block = new Uint8Array(64);
+    this.w = new Uint32Array(64);
+    this.used = 0;
+    this.length = 0;
+    this.done = false;
+  }
+  compress() {
+    const w = this.w, b = this.block;
+    for (let i = 0; i < 16; i++) w[i] = b[i * 4] << 24 | b[i * 4 + 1] << 16 | b[i * 4 + 2] << 8 | b[i * 4 + 3];
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15], y = w[i - 2];
+      w[i] = w[i - 16] + (r(x, 7) ^ r(x, 18) ^ x >>> 3) + w[i - 7] + (r(y, 17) ^ r(y, 19) ^ y >>> 10) >>> 0;
+    }
+    let [a, c, d, e, f, g, h, j] = this.h;
+    for (let i = 0; i < 64; i++) {
+      const t = j + (r(f, 6) ^ r(f, 11) ^ r(f, 25)) + (f & g ^ ~f & h) + K[i] + w[i] >>> 0, u = (r(a, 2) ^ r(a, 13) ^ r(a, 22)) + (a & c ^ a & d ^ c & d) >>> 0;
+      j = h;
+      h = g;
+      g = f;
+      f = e + t >>> 0;
+      e = d;
+      d = c;
+      c = a;
+      a = t + u >>> 0;
+    }
+    const v = [a, c, d, e, f, g, h, j];
+    for (let i = 0; i < 8; i++) this.h[i] = this.h[i] + v[i] >>> 0;
+  }
+  update(bytes) {
+    if (this.done) throw Error("Hash already finished");
+    this.length += bytes.byteLength;
+    for (let p = 0; p < bytes.length; ) {
+      const n = Math.min(64 - this.used, bytes.length - p);
+      this.block.set(bytes.subarray(p, p + n), this.used);
+      this.used += n;
+      p += n;
+      if (this.used === 64) {
+        this.compress();
+        this.used = 0;
+      }
+    }
+    return this;
+  }
+  hex() {
+    if (this.done) throw Error("Hash already finished");
+    const n = this.length;
+    this.update(new Uint8Array([128]));
+    while (this.used !== 56) this.update(new Uint8Array([0]));
+    const bits = n * 8, tail = new Uint8Array(8), v = new DataView(tail.buffer);
+    v.setUint32(0, Math.floor(bits / 4294967296));
+    v.setUint32(4, bits >>> 0);
+    this.update(tail);
+    this.done = true;
+    return Array.from(this.h, (v2) => v2.toString(16).padStart(8, "0")).join("");
+  }
+};
+var CHUNK_BYTES = 32 * 1024;
+async function hashSource(source, signal) {
+  const h = new Sha256();
+  for (let p = 0; p < source.size; p += CHUNK_BYTES) {
+    signal?.throwIfAborted();
+    const n = Math.min(CHUNK_BYTES, source.size - p), bytes = await source.read(p, n);
+    if (!(bytes instanceof Uint8Array) || bytes.length !== n) throw Error("Source changed or short read");
+    h.update(bytes);
+  }
+  return h.hex();
+}
+
+var SMALL_BATCH_CAPABILITY = "small-blob-batch-v1";
+var BATCH_COUNT = 16;
+var BATCH_BYTES = 256 * 1024;
+function batchRefs(refs) {
+  if (!Array.isArray(refs) || !refs.length || refs.length > BATCH_COUNT) throw Error("Invalid batch count");
+  let size2 = 0;
+  const seen = /* @__PURE__ */ new Set();
+  for (const r2 of refs) {
+    if (!r2 || !/^[a-f0-9]{64}$/.test(r2.hash) || !Number.isSafeInteger(r2.size) || r2.size < 0 || r2.size > CHUNK_BYTES || seen.has(r2.hash)) throw Error("Invalid batch reference");
+    seen.add(r2.hash);
+    size2 += r2.size;
+  }
+  if (size2 > BATCH_BYTES) throw Error("Batch exceeds byte limit");
+  return size2;
+}
+async function verifyBatch(refs, bytes, signal) {
+  if (bytes.length !== batchRefs(refs)) throw Error("Batch response length mismatch");
+  const result = /* @__PURE__ */ new Map();
+  let offset = 0;
+  for (const ref of refs) {
+    signal?.throwIfAborted();
+    const data = bytes.subarray(offset, offset + ref.size);
+    offset += ref.size;
+    if (await hashSource({ size: data.length, read: async (p, n) => data.subarray(p, p + n) }, signal) !== ref.hash) throw Error("Batch hash mismatch");
+    result.set(ref.hash, data);
+  }
+  return result;
+}
+var SmallBlobPipeline = class {
+  /** @param {any[]} refs @param {Function} fetchBatch @param {{canRun?:()=>boolean}} options */
+  constructor(refs, fetchBatch, { canRun = () => true } = {}) {
+    this.fetchBatch = fetchBatch;
+    this.canRun = canRun;
+    this.groups = [];
+    this.indexByHash = /* @__PURE__ */ new Map();
+    this.index = -1;
+    this.closed = false;
+    const seen = /* @__PURE__ */ new Set();
+    let group = [], size2 = 0;
+    for (const r2 of refs) {
+      if (r2.size > CHUNK_BYTES || seen.has(r2.hash)) continue;
+      seen.add(r2.hash);
+      if (group.length && (group.length >= BATCH_COUNT || size2 + r2.size > BATCH_BYTES)) {
+        this.groups.push(group);
+        group = [];
+        size2 = 0;
+      }
+      this.indexByHash.set(r2.hash, this.groups.length);
+      group.push(r2);
+      size2 += r2.size;
+    }
+    if (group.length) this.groups.push(group);
+  }
+  start(index) {
+    if (this.closed || !this.canRun() || index >= this.groups.length) return;
+    this.nextIndex = index;
+    this.next = Promise.resolve().then(() => this.fetchBatch(this.groups[index])).then((value) => ({ value }), (error) => ({ error }));
+  }
+  async idle() {
+    if (this.next) await this.next;
+  }
+  async take(ref) {
+    if (this.closed || !this.canRun()) return null;
+    const index = this.indexByHash.get(ref.hash);
+    if (index === void 0 || index < this.index) return null;
+    if (index !== this.index) {
+      if (this.next && this.nextIndex !== index) {
+        await this.next;
+        this.next = null;
+      }
+      if (!this.next) this.start(index);
+      if (!this.next) return null;
+      this.current = await this.next;
+      this.next = null;
+      this.index = index;
+      this.start(index + 1);
+    }
+    if (this.current.error) throw this.current.error;
+    return this.current.value.get(ref.hash) || null;
+  }
+  async close() {
+    this.closed = true;
+    await this.idle();
+    this.next = null;
+    this.current = null;
+  }
+};
+
 var PERFORMANCE_CAPABILITY = "device-performance-v1";
 var PERFORMANCE_KINDS = ["network", "cache", "vault", "config"];
 var empty = () => ({ count: 0, ms: 0, maxMs: 0, bytes: 0, errors: 0, wallMs: 0 });
@@ -9755,79 +9916,6 @@ async function inspectInitialization(vault) {
   return { action: files.length ? "preview-only" : "initialize-empty", files: files.map((f) => f.path) };
 }
 
-var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
-var r = (v, n) => v >>> n | v << 32 - n;
-var Sha256 = class {
-  constructor() {
-    this.h = new Uint32Array([1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]);
-    this.block = new Uint8Array(64);
-    this.w = new Uint32Array(64);
-    this.used = 0;
-    this.length = 0;
-    this.done = false;
-  }
-  compress() {
-    const w = this.w, b = this.block;
-    for (let i = 0; i < 16; i++) w[i] = b[i * 4] << 24 | b[i * 4 + 1] << 16 | b[i * 4 + 2] << 8 | b[i * 4 + 3];
-    for (let i = 16; i < 64; i++) {
-      const x = w[i - 15], y = w[i - 2];
-      w[i] = w[i - 16] + (r(x, 7) ^ r(x, 18) ^ x >>> 3) + w[i - 7] + (r(y, 17) ^ r(y, 19) ^ y >>> 10) >>> 0;
-    }
-    let [a, c, d, e, f, g, h, j] = this.h;
-    for (let i = 0; i < 64; i++) {
-      const t = j + (r(f, 6) ^ r(f, 11) ^ r(f, 25)) + (f & g ^ ~f & h) + K[i] + w[i] >>> 0, u = (r(a, 2) ^ r(a, 13) ^ r(a, 22)) + (a & c ^ a & d ^ c & d) >>> 0;
-      j = h;
-      h = g;
-      g = f;
-      f = e + t >>> 0;
-      e = d;
-      d = c;
-      c = a;
-      a = t + u >>> 0;
-    }
-    const v = [a, c, d, e, f, g, h, j];
-    for (let i = 0; i < 8; i++) this.h[i] = this.h[i] + v[i] >>> 0;
-  }
-  update(bytes) {
-    if (this.done) throw Error("Hash already finished");
-    this.length += bytes.byteLength;
-    for (let p = 0; p < bytes.length; ) {
-      const n = Math.min(64 - this.used, bytes.length - p);
-      this.block.set(bytes.subarray(p, p + n), this.used);
-      this.used += n;
-      p += n;
-      if (this.used === 64) {
-        this.compress();
-        this.used = 0;
-      }
-    }
-    return this;
-  }
-  hex() {
-    if (this.done) throw Error("Hash already finished");
-    const n = this.length;
-    this.update(new Uint8Array([128]));
-    while (this.used !== 56) this.update(new Uint8Array([0]));
-    const bits = n * 8, tail = new Uint8Array(8), v = new DataView(tail.buffer);
-    v.setUint32(0, Math.floor(bits / 4294967296));
-    v.setUint32(4, bits >>> 0);
-    this.update(tail);
-    this.done = true;
-    return Array.from(this.h, (v2) => v2.toString(16).padStart(8, "0")).join("");
-  }
-};
-var CHUNK_BYTES = 32 * 1024;
-async function hashSource(source, signal) {
-  const h = new Sha256();
-  for (let p = 0; p < source.size; p += CHUNK_BYTES) {
-    signal?.throwIfAborted();
-    const n = Math.min(CHUNK_BYTES, source.size - p), bytes = await source.read(p, n);
-    if (!(bytes instanceof Uint8Array) || bytes.length !== n) throw Error("Source changed or short read");
-    h.update(bytes);
-  }
-  return h.hex();
-}
-
 var ROOT = ".realtime-lab-v3-cache";
 var ObsidianBlobCache = class {
   constructor(adapter, { onOperation = (ms, failed) => {
@@ -9989,7 +10077,8 @@ function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
       options.signal?.throwIfAborted();
       bytes = r2.arrayBuffer.byteLength;
       if (r2.status >= 400) failed = true;
-      if (r2.arrayBuffer.byteLength > CHUNK_BYTES) throw Error("Native response frame exceeds 32 KiB");
+      const limit = (options.method || "GET") === "GET" && new URL(String(url)).pathname.endsWith("/v3/batch") ? BATCH_BYTES : CHUNK_BYTES;
+      if (r2.arrayBuffer.byteLength > limit) throw Error("Native response frame exceeds 32 KiB");
       return new Response(r2.status === 204 ? null : r2.arrayBuffer, { status: r2.status, headers: r2.headers });
     } catch (e) {
       failed = true;
@@ -10626,6 +10715,23 @@ var BlobTransfer = class {
       this.busy = false;
     }
   }
+  async downloadBatch(refs, { signal } = {}) {
+    if (this.busy) throw Error("Transfer busy");
+    this.busy = true;
+    try {
+      batchRefs(refs);
+      if (!this.responseIdentity() || !this.verifyIdentity) throw Error("Verified batch capability required");
+      const expected = await this.verifyIdentity(signal);
+      signal?.throwIfAborted();
+      const query = refs.map((r3) => r3.hash + ":" + r3.size).join(",");
+      const r2 = await this.fetch(this.url + "/v3/batch?refs=" + encodeURIComponent(query), { signal, headers: { Authorization: "Bearer " + this.token } });
+      if (!r2.ok) throw Error("Blob request failed (" + r2.status + ")");
+      if (!expected || r2.headers.get("X-Realtime-Lab-Server") !== expected) throw Error("Server identity mismatch in batch response");
+      return await verifyBatch(refs, await boundedBytes(r2, BATCH_BYTES), signal);
+    } finally {
+      this.busy = false;
+    }
+  }
   async download(ref, sink, { signal, onProgress = () => {
   } } = {}) {
     if (this.busy) throw Error("Transfer busy");
@@ -11223,7 +11329,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.21", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.22", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -11918,110 +12024,129 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const files = c.doc.getMap("files");
     await this.checkpointReceives();
     await this.prepareRemoteDeletes();
-    let transportFailures = 0;
-    for (const [p, m] of [...files].sort((a, b) => Number(!!(a[1].deleted || c.doc.getMap("deleted").has(a[0]))) - Number(!!(b[1].deleted || c.doc.getMap("deleted").has(b[0]))))) {
-      if (this.stopping || this.client !== c) return;
-      if (!c.ready) break;
-      if (!supportedFile(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
-      try {
-        const f = this.app.vault.getAbstractFileByPath(p);
-        if (m.deleted || c.doc.getMap("deleted").has(p)) {
-          if (f instanceof import_obsidian.TFile) {
-            if (this.fileFailures.size || this.downloadPaths.size || !this.remoteDeleteAllowed(p)) continue;
-            const saved = await this.read(f);
-            await this.backup(p, saved);
-            if (content(c.doc, p) || this.dirtyFiles.has(p) || !equal(await this.read(f), saved) || !this.remoteDeleteAllowed(p)) continue;
-            this.writing.add(p);
-            try {
-              await this.app.vault.trash(f, false);
-            } finally {
-              this.writing.delete(p);
-            }
-          }
-          continue;
-        }
-        const item = content(c.doc, p);
-        if (!item) continue;
-        if (item.kind !== "text") {
-          for (const [cm, b] of this.bindings) if (b.path === p) {
-            cm.dispatch({ effects: b.c.reconfigure([]) });
-            b.undo.destroy();
-            this.bindings.delete(cm);
-          }
-        }
-        const bound = [...this.bindings.values()].some((b) => b.path === p);
-        if (bound && item.kind === "text") continue;
-        if (f instanceof import_obsidian.TFile) {
-          const old = await this.read(f);
-          if (equal(old, item)) {
-            await this.received(p);
-            this.fileFailures.delete(p);
-            transportFailures = 0;
-            continue;
-          }
-          await this.backup(p, old);
-        }
-        await this.parents(p);
-        this.writing.add(p);
+    const pipeline = c.serverCapabilities?.includes(SMALL_BATCH_CAPABILITY) ? new SmallBlobPipeline(Object.values(entries(c.doc)).filter((r2) => r2.kind !== "text" && r2.size <= 32768), async (refs) => {
+      const missing = [];
+      for (const r2 of refs) if (!await this.cache.has(r2)) missing.push(r2);
+      return missing.length ? c.blobs.downloadBatch(missing, { signal: c.binaryAbort.signal }) : /* @__PURE__ */ new Map();
+    }, { canRun: () => c.ready && !this.stopping && this.client === c }) : null;
+    try {
+      let transportFailures = 0;
+      for (const [p, m] of [...files].sort((a, b) => Number(!!(a[1].deleted || c.doc.getMap("deleted").has(a[0]))) - Number(!!(b[1].deleted || c.doc.getMap("deleted").has(b[0]))))) {
+        if (this.stopping || this.client !== c) return;
+        if (!c.ready) break;
+        if (!supportedFile(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
         try {
-          if (item.kind === "text") {
-            if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modify(f, item.data));
-            else await this.performance.measure("vault", () => this.app.vault.create(p, item.data));
-          } else {
-            if (!await this.cache.has(item)) {
-              this.downloadPaths.add(p);
-              this.updateProgress();
+          const f = this.app.vault.getAbstractFileByPath(p);
+          if (m.deleted || c.doc.getMap("deleted").has(p)) {
+            if (f instanceof import_obsidian.TFile) {
+              if (this.fileFailures.size || this.downloadPaths.size || !this.remoteDeleteAllowed(p)) continue;
+              const saved = await this.read(f);
+              await this.backup(p, saved);
+              if (content(c.doc, p) || this.dirtyFiles.has(p) || !equal(await this.read(f), saved) || !this.remoteDeleteAllowed(p)) continue;
+              this.writing.add(p);
               try {
-                await c.blobs.download(item, this.cache.sink(item));
-                this.fileFailures.delete(p);
-              } catch (e) {
-                this.fileFailures.set(p, this.safeError(e));
-                throw e;
+                await this.app.vault.trash(f, false);
               } finally {
-                this.downloadPaths.delete(p);
-                this.updateProgress();
+                this.writing.delete(p);
               }
             }
-            if (content(c.doc, p)?.hash !== item.hash) {
-              this.reflection.request();
+            continue;
+          }
+          const item = content(c.doc, p);
+          if (!item) continue;
+          if (item.kind !== "text") {
+            for (const [cm, b] of this.bindings) if (b.path === p) {
+              cm.dispatch({ effects: b.c.reconfigure([]) });
+              b.undo.destroy();
+              this.bindings.delete(cm);
+            }
+          }
+          const bound = [...this.bindings.values()].some((b) => b.path === p);
+          if (bound && item.kind === "text") continue;
+          if (f instanceof import_obsidian.TFile) {
+            const old = await this.read(f);
+            if (equal(old, item)) {
+              await this.received(p);
+              this.fileFailures.delete(p);
+              transportFailures = 0;
               continue;
             }
-            const bytes = await this.cache.materialize(item);
-            if (/\.md$/i.test(p)) {
-              const text2 = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-              if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modify(f, text2));
-              else await this.performance.measure("vault", () => this.app.vault.create(p, text2));
-            } else if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modifyBinary(f, bytes));
-            else await this.performance.measure("vault", () => this.app.vault.createBinary(p, bytes));
+            await this.backup(p, old);
           }
-        } finally {
-          this.writing.delete(p);
+          await this.parents(p);
+          this.writing.add(p);
+          try {
+            if (item.kind === "text") {
+              if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modify(f, item.data));
+              else await this.performance.measure("vault", () => this.app.vault.create(p, item.data));
+            } else {
+              if (!await this.cache.has(item)) {
+                this.downloadPaths.add(p);
+                this.updateProgress();
+                try {
+                  const small = pipeline && item.size <= 32768 ? await pipeline.take(item) : null;
+                  if (small) {
+                    const sink = this.cache.sink(item);
+                    const offset = await sink.length();
+                    if (offset === 0 && item.size) await sink.write(0, small);
+                    else if (offset !== item.size) throw Error("Invalid small cache offset");
+                    await sink.commit();
+                  } else {
+                    await pipeline?.idle();
+                    await c.blobs.download(item, this.cache.sink(item));
+                  }
+                  this.fileFailures.delete(p);
+                } catch (e) {
+                  this.fileFailures.set(p, this.safeError(e));
+                  throw e;
+                } finally {
+                  this.downloadPaths.delete(p);
+                  this.updateProgress();
+                }
+              }
+              if (this.dirtyFiles.has(p) || content(c.doc, p)?.hash !== item.hash) {
+                this.reflection.request();
+                continue;
+              }
+              const bytes = await this.cache.materialize(item);
+              if (/\.md$/i.test(p)) {
+                const text2 = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+                if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modify(f, text2));
+                else await this.performance.measure("vault", () => this.app.vault.create(p, text2));
+              } else if (f instanceof import_obsidian.TFile) await this.performance.measure("vault", () => this.app.vault.modifyBinary(f, bytes));
+              else await this.performance.measure("vault", () => this.app.vault.createBinary(p, bytes));
+            }
+          } finally {
+            this.writing.delete(p);
+          }
+          if (item.kind !== "text") {
+            const written = this.app.vault.getAbstractFileByPath(p);
+            if (written instanceof import_obsidian.TFile) this.fingerprints.set(p, { key: written.stat.size + ":" + written.stat.mtime, item });
+          }
+          await this.received(p);
+          this.fileFailures.delete(p);
+          transportFailures = 0;
+        } catch (e) {
+          this.fileFailures.set(p, this.safeError(c.ready ? e : "Disconnected during receive: " + this.safeError(e)));
+          this.updateProgress();
+          if (!c.ready) break;
+          if (transientFilesystemFailure(e)) {
+            this.cache.invalidateQuota();
+            break;
+          }
+          if (transientTransferFailure(e) && ++transportFailures >= 3) break;
         }
-        if (item.kind !== "text") {
-          const written = this.app.vault.getAbstractFileByPath(p);
-          if (written instanceof import_obsidian.TFile) this.fingerprints.set(p, { key: written.stat.size + ":" + written.stat.mtime, item });
-        }
-        await this.received(p);
-        this.fileFailures.delete(p);
-        transportFailures = 0;
-      } catch (e) {
-        this.fileFailures.set(p, this.safeError(c.ready ? e : "Disconnected during receive: " + this.safeError(e)));
-        this.updateProgress();
-        if (!c.ready) break;
-        if (transientFilesystemFailure(e)) {
-          this.cache.invalidateQuota();
-          break;
-        }
-        if (transientTransferFailure(e) && ++transportFailures >= 3) break;
       }
+      if (this.settings.remoteDeleteReview?.approved && this.settings.remoteDeleteReview.paths.every((p) => !this.app.vault.getAbstractFileByPath(p))) {
+        this.settings.remoteDeleteReview = void 0;
+        await this.persistConfig();
+      }
+      await this.flushReceipts();
+      this.refresh();
+      this.updateProgress();
+    } finally {
+      await pipeline?.close();
     }
-    if (this.settings.remoteDeleteReview?.approved && this.settings.remoteDeleteReview.paths.every((p) => !this.app.vault.getAbstractFileByPath(p))) {
-      this.settings.remoteDeleteReview = void 0;
-      await this.persistConfig();
-    }
-    await this.flushReceipts();
-    this.refresh();
-    this.updateProgress();
   }
   // Record receive intent before any file mutation. Only these never-present
   // paths may resume without interpreting a genuine local deletion as a download.

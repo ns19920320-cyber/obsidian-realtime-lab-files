@@ -1,3 +1,7 @@
+# 0.5.0-alpha.12 状态条重叠修复
+
+手机仅为当前活动笔记显示同步状态；后台标签不再叠加浮动状态。25 项相关测试、类型检查和构建通过；iPhone 真机外观待更新后确认。原有 23 个文件摘要未变，合成冲突保留双方验证通过。BRAT 原地更新，无需初始化或重复输入。
+
 # Realtime Lab Files 0.5.0-alpha.11
 
 BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Only initialized Realtime-Lab-V3-Files- isolated test vaults. Update in place without resetting content, cached snapshots, pending files, token, URL, server identity or auto-connect choice.

@@ -1,19 +1,26 @@
-# Realtime Lab Files 0.5.0-alpha.18
+# Realtime Lab Files 0.5.0-alpha.19
 
 BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Isolated initialized Realtime-Lab-V3-Files- vaults only.
 
-## File progress
-The reading/editing header now shows completed / total files, remaining paths, and paths awaiting retry. Retry paths are included in remaining, never added twice. Active download concurrency is explained separately in the detail panel. Progress is measured in unique file paths, not bytes or HTTP requests. During initial identity/checkpoint reconciliation, progress is marked as unverified rather than displaying a false 100%. Uploads and acknowledgements are included. A cleared local queue does not prove that another device has received the files.
+## Faster first receive
+Receive completion checkpoints are coalesced at 16 files or on the next completion after one second, and flushed at reconciliation completion, normal stop and background notification. Durable receive intent is still saved BEFORE creating files; a crash before completion checkpointing conservatively rechecks existing files by content rather than treating them as deletions or losing unfinished work. Background delivery is best-effort on iOS, so recovery never depends on the notification running. Uploads, identity, metadata snapshots and path-protection approvals keep their existing persistence rules.
 
-Recognized recoverable failures show recovery in progress while receives are actively retrying; conflicts, protected path operations and blocking errors remain visible. A failure counter is not a count of lost files. The new display reads existing queues and durable receive checkpoints without resetting them.
+Non-empty downloads omit the redundant blob-status request because the server exposes only committed content at the GET endpoint. Server identity is still checked for EVERY file before transfer. Empty blobs still check status. Two 32 KiB data frames are prefetched at most; cache writes remain ordered and full hash verification remains mandatory. Uploads and native file mutations remain serialized within each client. Redundant cache directory existence checks were removed after reservation establishes the directory. No file-size, history or quota limits are weakened.
 
-## Update and compatibility
-Update the existing isolated rehearsal vault through BRAT. Retain notes, settings, identity, URL, token, cache, history and pending receive/upload state. No server upgrade or protocol change is required from alpha.17. Requires versioned-files-v1 and general-files-v1 (alpha.16+ server). The old alpha.15 service is incompatible. Do not enable LiveSync in the same rehearsal vault. Production migration is not approved.
+Three consecutive recognized transport failures pause a receive pass for normal bounded backoff; an isolated file failure does not block healthy files. Temporary blob writer-busy HTTP 409 is retryable with its durable upload queue retained; version-publication conflicts are not blindly retried. The completed / remaining / retry header introduced in alpha.18 is retained.
 
-## Validation
-223 automated tests passed, typecheck and build passed; 52 focused tests passed after the final adjustment. Tests cover unique-path progress accounting, retry recovery to zero, unchanged saved settings during progress reads, header ownership/position, conflicts and protected operations. Layout was inspected at a 390 px content width with synthetic counters. This release has not yet been visually accepted on a physical iPhone; large mobile first-sync remains in progress. Validation uses isolated synthetic fixtures; no production notes or connection settings are changed.
+## Personal-device concurrency
+Five devices do not require a distributed job system. Basic concurrent editing/version-conflict protection remains essential and is retained. The two-frame download window reduces request latency within one device; it does not permit concurrent overwrites of local files. Five simultaneous attachment receivers were verified against the real local server with synthetic files.
+
+## Validation and performance limits
+233 automated tests, typecheck and build passed. Tests include ordered bounded prefetch, abort/resume, a later frame failing first, empty blobs, checkpoint save failure, crash snapshots containing unflushed receipts, five receivers, and temporary writer contention. Existing synthetic content was preserved.
+
+Synthetic transport benchmark (25 ms/request, 3 ms/cache write): 40 small files took 3327 ms before and 2249 ms after (120 to 80 requests); one 1 MiB attachment took 1033 ms before and 532 ms after. Isolated plugin/loopback benchmark with an emulated Obsidian adapter and 10 ms/config save: 120 files took 1613 ms before and 240 ms after, with 124 to 13 config saves, including final metadata persistence. These are controlled synthetic benchmarks, NOT measured iPhone speedups or comparisons against LiveSync. Physical-device alpha.19 performance acceptance remains pending.
+
+## Safe update
+Update the existing isolated rehearsal vault through BRAT. Preserve notes, connection settings, server/device identity, cache, history, pending uploads and receive state. No initialization, endpoint/token change, server upgrade or protocol change is required from alpha.18. Requires versioned-files-v1 and general-files-v1 on an alpha.16+ server; the old alpha.15 service is incompatible. Never enable LiveSync in the same rehearsal vault. This is not approval to migrate production.
 
 ## Source
-source.zip contains allowlisted source/tests/build manifests only. It excludes notes, settings, tokens, runtime snapshots and node_modules. Build: npm ci; npm run typecheck; node --test --test-concurrency=1 test/*.test.mjs; npm run build:v3-files.
+source.zip contains allowlisted source, tests and build files only. Notes, settings, credentials, snapshots, private benchmark results and node_modules are excluded. Build: npm ci; npm run typecheck; node --test --test-concurrency=1 test/*.test.mjs; npm run build:v3-files.
 
-Source commit: 6f0da6df1145eb88d7046fdcf399cbc48eaf68c7
+Source commit: d14d12bf6af5f1e1d6c261a74bbf3ce69273df5c

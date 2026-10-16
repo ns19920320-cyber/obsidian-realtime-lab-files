@@ -9868,8 +9868,6 @@ var ObsidianBlobCache = class {
     const s = await this.state(ref);
     if (s.complete) return;
     if (p !== s.offset || bytes.length !== Math.min(CHUNK_BYTES, ref.size - p)) throw Error("Invalid cache chunk offset");
-    await this.mkdir(ROOT);
-    await this.mkdir(this.base(ref));
     await this.io("writeBinary", this.base(ref) + "/" + p + ".bin", bytes.slice().buffer);
     await this.io("write", this.base(ref) + "/state.json", JSON.stringify({ size: ref.size, offset: p + bytes.length, complete: false }));
   }
@@ -9877,8 +9875,6 @@ var ObsidianBlobCache = class {
     await this.reserve(ref);
     if ((await this.state(ref)).offset !== ref.size) throw Error("Cache incomplete");
     if (await hashSource(this.source(ref)) !== ref.hash) throw Error("Cache hash mismatch");
-    await this.mkdir(ROOT);
-    await this.mkdir(this.base(ref));
     await this.io("write", this.base(ref) + "/state.json", JSON.stringify({ size: ref.size, offset: ref.size, complete: true }));
   }
   source(ref) {
@@ -9931,7 +9927,7 @@ function requestFetch(requestUrl2) {
 function transientTransferFailure(error) {
   const s = String(error?.message || error);
   if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
-  return /failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
+  return /blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
 }
 function transientFilesystemFailure(error) {
   return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
@@ -10556,26 +10552,50 @@ var BlobTransfer = class {
   } } = {}) {
     if (this.busy) throw Error("Transfer busy");
     this.busy = true;
+    const pending = /* @__PURE__ */ new Map();
     try {
       checkRef(ref);
       await this.identity(signal);
-      const s = await boundedJson(await this.call(ref.hash, { status: "1", size: ref.size }, { signal }));
-      checkStatus(s, ref.size);
-      if (!s.complete) throw Error("Remote blob incomplete");
+      if (!ref.size) {
+        const s = checkStatus(await boundedJson(await this.call(ref.hash, { status: "1", size: 0 }, { signal })), 0);
+        if (!s.complete) throw Error("Remote blob incomplete");
+      }
       let offset = await sink.length();
-      if (!Number.isSafeInteger(offset) || offset < 0 || offset > ref.size) throw Error("Invalid destination length");
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > ref.size || offset !== ref.size && offset % CHUNK_BYTES) throw Error("Invalid destination length");
+      let next = offset;
+      const fill = () => {
+        while (pending.size < 2 && next < ref.size) {
+          signal?.throwIfAborted();
+          const p = next;
+          next += CHUNK_BYTES;
+          pending.set(p, (async () => {
+            try {
+              const r2 = await this.call(ref.hash, { offset: p }, { signal }), bytes = await boundedBytes(r2, CHUNK_BYTES);
+              if (bytes.length !== Math.min(CHUNK_BYTES, ref.size - p)) throw Error("Short download frame");
+              return { bytes };
+            } catch (error) {
+              return { error };
+            }
+          })());
+        }
+      };
+      fill();
       while (offset < ref.size) {
         signal?.throwIfAborted();
-        const r2 = await this.call(ref.hash, { offset }, { signal }), bytes = await boundedBytes(r2, CHUNK_BYTES);
-        if (bytes.length !== Math.min(CHUNK_BYTES, ref.size - offset)) throw Error("Short download frame");
-        await sink.write(offset, bytes);
-        offset += bytes.length;
+        const result = await pending.get(offset);
+        if (result.error) throw result.error;
+        signal?.throwIfAborted();
+        await sink.write(offset, result.bytes);
+        pending.delete(offset);
+        offset += result.bytes.length;
         onProgress(offset);
+        fill();
       }
       if (await hashSource({ size: ref.size, read: (p, n) => sink.read(p, n) }, signal) !== ref.hash) throw Error("Downloaded blob hash mismatch; discard partial and retry");
       await sink.commit?.(ref);
       return ref;
     } finally {
+      await Promise.all(pending.values());
       this.busy = false;
     }
   }
@@ -10825,6 +10845,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   reflection = coalescedTask((fn) => this.enqueue(fn), () => this.reflect(), () => !!this.client?.ready && !this.stopping);
   safetyTimer;
   safetyBusy = false;
+  receiveAcks = /* @__PURE__ */ new Set();
+  receiptFlush;
+  receiptLastSaved = 0;
   recoveryBusy = false;
   recoveryAttempts = 0;
   retryAfter = 0;
@@ -10872,7 +10895,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   fingerprints = /* @__PURE__ */ new Map();
   configWrites = Promise.resolve();
   pendingRows() {
-    const rows = new Map(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [.../* @__PURE__ */ new Set([...this.downloadPaths, ...this.settings.receivePending?.paths || []])] }).map((r2) => [r2.path, r2]));
+    const rows = new Map(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [.../* @__PURE__ */ new Set([...this.downloadPaths, ...(this.settings.receivePending?.paths || []).filter((p) => !this.receiveAcks.has(p))])] }).map((r2) => [r2.path, r2]));
     for (const i of this.settings.pathSafety?.items || []) for (const path of operationPaths(i.op)) rows.set(path, { path, state: i.error ? "\u8DEF\u5F84\u64CD\u4F5C\u5F85\u590D\u6838\uFF1A" + i.error : "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u4F20\u64AD/\u786E\u8BA4" });
     for (const path of this.settings.remoteDeleteReview?.paths || []) rows.set(path, { path, state: "\u8FDC\u7AEF\u6279\u91CF\u5220\u9664\u5F85\u786E\u8BA4" });
     return [...rows.values()];
@@ -10897,6 +10920,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (!this.syncedOnce || this.initializing) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u51C6\u5907\u6587\u4EF6";
     if (this.reflection.queued || this.downloadPaths.size) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u63A5\u6536\u6587\u4EF6";
     if (this.pendingRows().length) return "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4";
+    if (this.receiveAcks.size || this.receiptFlush) return "\u6B63\u5728\u4FDD\u5B58\u63A5\u6536\u8FDB\u5EA6";
     if (!c.lastConfirmedAt) return "\u5DF2\u8FDE\u63A5\uFF0C\u7B49\u5F85\u670D\u52A1\u5668\u786E\u8BA4";
     return "\u5DF2\u63D0\u4EA4\u670D\u52A1\u5668";
   }
@@ -10974,7 +10998,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client, progress = this.progressModel(), uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
-    return badgeState({ progress, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ progress, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -11078,7 +11102,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.18", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.19", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -11464,6 +11488,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     });
     this.registerDomEvent(document, "visibilitychange", () => {
       if (!document.hidden) this.client?.resume();
+      else void this.flushReceipts().catch(() => this.updateProgress());
       void this.reportDiagnostic();
     });
     this.registerInterval(window.setInterval(() => {
@@ -11768,6 +11793,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const files = c.doc.getMap("files");
     await this.checkpointReceives();
     await this.prepareRemoteDeletes();
+    let transportFailures = 0;
     for (const [p, m] of [...files].sort((a, b) => Number(!!(a[1].deleted || c.doc.getMap("deleted").has(a[0]))) - Number(!!(b[1].deleted || c.doc.getMap("deleted").has(b[0]))))) {
       if (this.stopping || this.client !== c) return;
       if (!supportedFile(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
@@ -11804,6 +11830,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           if (equal(old, item)) {
             await this.received(p);
             this.fileFailures.delete(p);
+            transportFailures = 0;
             continue;
           }
           await this.backup(p, old);
@@ -11850,6 +11877,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         }
         await this.received(p);
         this.fileFailures.delete(p);
+        transportFailures = 0;
       } catch (e) {
         this.fileFailures.set(p, this.safeError(e));
         this.updateProgress();
@@ -11857,12 +11885,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.cache.invalidateQuota();
           break;
         }
+        if (transientTransferFailure(e) && ++transportFailures >= 3) break;
       }
     }
     if (this.settings.remoteDeleteReview?.approved && this.settings.remoteDeleteReview.paths.every((p) => !this.app.vault.getAbstractFileByPath(p))) {
       this.settings.remoteDeleteReview = void 0;
       await this.persistConfig();
     }
+    await this.flushReceipts();
     this.refresh();
     this.updateProgress();
   }
@@ -11884,13 +11914,36 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   async received(path) {
     const plan = this.settings.receivePending;
     if (plan?.serverId !== this.client?.serverId || !plan?.paths.includes(path)) return;
-    const next = { serverId: plan.serverId, paths: plan.paths.filter((p) => p !== path) };
-    this.settings.receivePending = next;
+    this.receiveAcks.add(path);
+    if (this.receiveAcks.size >= 16 || Date.now() - this.receiptLastSaved >= 1e3) await this.flushReceipts();
+  }
+  async flushReceipts() {
+    if (this.receiptFlush) return this.receiptFlush;
+    const plan = this.settings.receivePending;
+    if (!plan || !this.receiveAcks.size) return;
+    const paths = plan.paths.filter((p) => this.receiveAcks.has(p));
+    if (!paths.length) {
+      this.receiveAcks.clear();
+      return;
+    }
+    const job = (async () => {
+      this.settings.receivePending = { serverId: plan.serverId, paths: plan.paths.filter((p) => !paths.includes(p)) };
+      try {
+        await this.persistConfig();
+        for (const p of paths) this.receiveAcks.delete(p);
+        this.receiptLastSaved = Date.now();
+      } catch (e) {
+        const current = this.settings.receivePending;
+        if (current?.serverId === plan.serverId) this.settings.receivePending = { serverId: plan.serverId, paths: [.../* @__PURE__ */ new Set([...current.paths, ...paths])] };
+        this.operationError = this.safeError(e);
+        throw e;
+      }
+    })();
+    this.receiptFlush = job;
     try {
-      await this.persistConfig();
-    } catch (e) {
-      this.settings.receivePending = plan;
-      throw e;
+      await job;
+    } finally {
+      if (this.receiptFlush === job) this.receiptFlush = void 0;
     }
   }
   async parents(p) {
@@ -12294,7 +12347,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }
     this.bindings.clear();
     this.setConnectionStatus("\u5DF2\u65AD\u5F00");
-    return saved;
+    return saved.then(async (ok) => {
+      try {
+        await this.flushReceipts();
+        return ok;
+      } catch {
+        return false;
+      }
+    });
   }
   onunload() {
     this.uiUnloaded = true;

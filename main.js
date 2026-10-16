@@ -10012,6 +10012,36 @@ function validate(doc2, hasBlob) {
   return total;
 }
 
+var PATH_SAFETY_CAPABILITY = "protected-paths-v1";
+var UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+function validatePathOperation(op) {
+  if (!op || !UUID.test(op.id) || !["delete", "rename"].includes(op.kind) || Object.keys(op).some((k) => !["id", "kind", "entries"].includes(k)) || !Array.isArray(op.entries) || !op.entries.length || op.entries.length > 3e3 || new TextEncoder().encode(JSON.stringify(op)).length > 2 * 1024 * 1024) throw Error("Invalid protected path operation");
+  const sources = /* @__PURE__ */ new Set(), targets = /* @__PURE__ */ new Set();
+  for (const e of op.entries) {
+    if (!e || !supported2(e.from) || sources.has(e.from) || Object.keys(e).some((k) => !["from", "to", "base", "target"].includes(k)) || !e.base || !["text", "image", "file"].includes(e.base.kind)) throw Error("Invalid protected source");
+    sources.add(e.from);
+    if (op.kind === "rename") {
+      if (!supported2(e.to) || e.to.toLowerCase() === e.from.toLowerCase() || targets.has(e.to.toLowerCase())) throw Error("Invalid or case-only rename target");
+      targets.add(e.to.toLowerCase());
+    } else if (e.to !== void 0) throw Error("Delete cannot have target");
+  }
+  return op;
+}
+function bulkDeletion(count, total) {
+  return count >= 5 || count >= 3 && count / Math.max(1, total) >= 0.25;
+}
+function operationPaths(op) {
+  return op.entries.flatMap((e) => e.to ? [e.from, e.to] : [e.from]);
+}
+function validateSafetyQueue(queue, serverId) {
+  if (!queue) return;
+  if (queue.serverId !== serverId || !Array.isArray(queue.items) || queue.items.length > 128 || queue.items.reduce((n, x) => n + x.op.entries.length, 0) > 3e3 || new TextEncoder().encode(JSON.stringify(queue)).length > 2 * 1024 * 1024) throw Error("Protected queue identity or capacity mismatch");
+  for (const item of queue.items) {
+    validatePathOperation(item.op);
+    if (typeof item.approved !== "boolean" || typeof item.backedUp !== "boolean") throw Error("Invalid protected queue item");
+  }
+}
+
 var DIAGNOSTICS_CAPABILITY = "device-diagnostics-v1";
 function documentDigest(doc2) {
   const active = entries(doc2), deleted = new Set(doc2.getMap("deleted").keys());
@@ -10020,12 +10050,16 @@ function documentDigest(doc2) {
   return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
 }
 
-function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0 }) {
+function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0 }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
     tone = "error";
     icon = "alert-circle";
     label = "\u51B2\u7A81\u5F85\u5904\u7406";
+  } else if (ready && protectedCount) {
+    tone = "waiting";
+    icon = "alert-circle";
+    label = "\u8DEF\u5F84\u64CD\u4F5C\u5F85\u786E\u8BA4";
   } else if (error) {
     tone = "error";
     icon = "alert-circle";
@@ -10050,7 +10084,7 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     label = "\u5DF2\u786E\u8BA4";
   }
   const counts = "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads;
-  const display = "Sync: " + (ready && conflicts ? "\u26A0 \u51B2\u7A81" + conflicts : tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
+  const display = "Sync: " + (ready && conflicts ? "\u26A0 \u51B2\u7A81" + conflicts : ready && protectedCount ? "\u26A0 \u5F85\u786E\u8BA4" + protectedCount : tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
   return { tone, icon, label, display, busy, counts, description: label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
 var badgeCSS = `
@@ -10651,7 +10685,7 @@ var VaultClientV3 = class extends VaultClient {
     if (this.pending.length >= 3e3) throw Error("Pending reference limit");
     this.binaryBusy = true;
     try {
-      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), base: previous ? { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", hash: previous.hash, size: previous.size, version: previous.version } : content(this.doc, path) };
+      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), base: previous ? { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", hash: previous.hash, size: previous.size, version: previous.version } : options && Object.hasOwn(options, "base") ? options.base : content(this.doc, path) };
       if (previous?.hash === ref.hash && previous?.size === ref.size) return ref;
       const next = [...this.pending, item];
       await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
@@ -10708,6 +10742,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   dirtyFiles = /* @__PURE__ */ new Map();
   fileUploads = coalescedTask((fn) => this.enqueue(fn), () => this.flushLocalFiles(), () => !!this.client && !this.stopping);
   reflection = coalescedTask((fn) => this.enqueue(fn), () => this.reflect(), () => !!this.client?.ready && !this.stopping);
+  safetyTimer;
+  safetyBusy = false;
   recoveryBusy = false;
   recoveryAttempts = 0;
   retryAfter = 0;
@@ -10736,12 +10772,28 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   badgeObserver;
   detailPanels = /* @__PURE__ */ new Set();
   detailModals = /* @__PURE__ */ new Set();
+  digestCache;
+  currentDigest() {
+    const doc2 = this.client?.doc;
+    if (!doc2) throw Error("\u672A\u8FDE\u63A5\u8BCA\u65AD\u6587\u6863");
+    if (this.digestCache?.doc !== doc2) this.digestCache = { doc: doc2, value: documentDigest(doc2) };
+    return this.digestCache.value;
+  }
+  reviewDigest() {
+    this.currentDigest();
+    const cached = this.digestCache;
+    if (!cached.approval) cached.approval = new Sha256().update(encodeStateAsUpdate(cached.doc)).hex();
+    return cached.approval;
+  }
   cache;
   legacyConfig = null;
   fingerprints = /* @__PURE__ */ new Map();
   configWrites = Promise.resolve();
   pendingRows() {
-    return queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [...this.downloadPaths] });
+    const rows = new Map(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [...this.downloadPaths] }).map((r2) => [r2.path, r2]));
+    for (const i of this.settings.pathSafety?.items || []) for (const path of operationPaths(i.op)) rows.set(path, { path, state: i.error ? "\u8DEF\u5F84\u64CD\u4F5C\u5F85\u590D\u6838\uFF1A" + i.error : "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u4F20\u64AD/\u786E\u8BA4" });
+    for (const path of this.settings.remoteDeleteReview?.paths || []) rows.set(path, { path, state: "\u8FDC\u7AEF\u6279\u91CF\u5220\u9664\u5F85\u786E\u8BA4" });
+    return [...rows.values()];
   }
   safeError(error) {
     return String(error || "").replaceAll(this.settings.token || "__no_token__", "[\u4EE4\u724C\u5DF2\u9690\u85CF]").slice(0, 240);
@@ -10754,6 +10806,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   summaryStatus() {
     const c = this.client;
     if (!c?.ready) return this.connectionStatus;
+    if (this.settings.pathSafety?.items.length) return "\u6709" + this.settings.pathSafety.items.length + "\u9879\u5220\u9664\u6216\u91CD\u547D\u540D\u7B49\u5F85\u786E\u8BA4/\u91CD\u8BD5";
+    if (this.settings.remoteDeleteReview) return "\u6709" + this.settings.remoteDeleteReview.paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\u7B49\u5F85\u786E\u8BA4";
     if (this.conflicts.length) return "\u6709" + this.conflicts.length + "\u9879\u51B2\u7A81\u5F85\u5904\u7406\uFF0C\u53CC\u65B9\u7248\u672C\u5DF2\u4FDD\u7559";
     if (this.conflictError) return "\u5DF2\u8FDE\u63A5\uFF0C\u51B2\u7A81\u72B6\u6001\u5C1A\u672A\u786E\u8BA4";
     if (c.lastError || this.fileFailures.size || this.operationError) return "\u5DF2\u8FDE\u63A5\uFF0C\u6709\u5931\u8D25\u9879\u76EE\uFF0C\u5185\u5BB9\u4FDD\u7559";
@@ -10817,6 +10871,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.enqueue(async () => {
       await this.flushLocalFiles();
       if (c.pending.length) await c.flushPending();
+      await this.flushPathSafety();
       await c.confirmUploads();
       await this.reflect();
       this.updateProgress();
@@ -10824,8 +10879,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   badgeModel() {
     const c = this.client, uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
+    for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
-    return badgeState({ ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size, unknown, conflicts: this.conflicts.length, known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -10908,7 +10964,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.detailPanels.add(panel);
     this.detailModals.add(m);
     m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u2191 \u5F85\u4E0A\u4F20\u6216\u7B49\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF1B\u2193 \u5F53\u524D\u63A5\u6536\u4E2D\u7684\u8DEF\u5F84\u6570\u3002\u26A1 \u8868\u793A\u8FDE\u63A5\u4E14\u5DF2\u83B7\u670D\u52A1\u5668\u786E\u8BA4\uFF1B\u65F6\u949F\u8868\u793A\u7B49\u5F85\u786E\u8BA4\uFF1B\u79BB\u7EBF\u4E0E\u5F02\u5E38\u4F1A\u76F4\u63A5\u6807\u660E\u3002\u786E\u8BA4\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
-    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u8BBE\u5907\u8FDC\u7A0B\u8BCA\u65AD").onClick(() => void this.openDeviceDiagnostics())).addButton((b) => b.setButtonText("\u67E5\u770B\u540C\u6B65\u51B2\u7A81").onClick(() => void this.openConflicts())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4").onClick(() => void this.openPathSafety())).addButton((b) => b.setButtonText("\u8BBE\u5907\u8FDC\u7A0B\u8BCA\u65AD").onClick(() => void this.openDeviceDiagnostics())).addButton((b) => b.setButtonText("\u67E5\u770B\u540C\u6B65\u51B2\u7A81").onClick(() => void this.openConflicts())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
     m.onClose = () => {
       this.detailPanels.delete(panel);
       this.detailModals.delete(m);
@@ -10929,7 +10985,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.14", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: documentDigest(c.doc) } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.15", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -10963,6 +11019,257 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     m.open();
     await refresh();
   }
+  pathBase(path) {
+    const pending = [...this.client?.pending || []].reverse().find((p) => p.path === path);
+    if (pending) return { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", hash: pending.hash, size: pending.size, version: pending.version };
+    const live = this.client ? content(this.client.doc, path) : null;
+    if (live) return live;
+    for (const i of [...this.settings.pathSafety?.items || []].reverse()) for (const e of i.op.entries) if (e.to === path) return e.target || e.base;
+    return null;
+  }
+  pathBlocked(path) {
+    return (this.settings.pathSafety?.items || []).some((i) => operationPaths(i.op).includes(path));
+  }
+  queuePathSafety(kind, entries2, review = false, approved = false) {
+    const c = this.client;
+    if (!c?.serverId || !entries2.length) return;
+    const prior = this.settings.pathSafety?.items || [];
+    if (kind === "delete") entries2 = entries2.filter((e) => !prior.some((i) => i.op.kind === "delete" && i.op.entries.some((x) => x.from === e.from)));
+    if (!entries2.length) return;
+    const item = { op: { id: crypto.randomUUID(), kind, entries: entries2 }, approved, backedUp: false, review, prepared: false, error: "" }, next = { serverId: c.serverId, items: [...prior, item] };
+    try {
+      validateSafetyQueue(next, c.serverId);
+    } catch (e) {
+      this.operationError = this.safeError(e);
+      new import_obsidian.Notice("\u8DEF\u5F84\u4FDD\u62A4\u65E0\u6CD5\u8BB0\u5F55\u8BA1\u5212\uFF0C\u672A\u5411\u670D\u52A1\u5668\u4F20\u64AD\uFF1A" + this.operationError);
+      return;
+    }
+    this.settings.pathSafety = next;
+    for (const e of entries2) {
+      this.dirtyFiles.delete(e.from);
+      this.fileFailures.delete(e.from);
+    }
+    this.updateProgress();
+    this.enqueue(async () => {
+      await this.persistConfig();
+      this.schedulePathSafety();
+    });
+  }
+  schedulePathSafety() {
+    if (this.uiUnloaded || this.stopping || !this.client?.ready || this.safetyTimer !== void 0) return;
+    this.safetyTimer = window.setTimeout(() => {
+      this.safetyTimer = void 0;
+      this.enqueue(() => this.flushPathSafety());
+    }, 750);
+  }
+  async flushPathSafety() {
+    const c = this.client;
+    if (this.safetyBusy || !c?.ready || this.stopping) return;
+    const queue = this.settings.pathSafety;
+    if (!queue?.items.length) return;
+    validateSafetyQueue(queue, c.serverId);
+    this.safetyBusy = true;
+    try {
+      const deleted = new Set(queue.items.filter((i) => i.op.kind === "delete").flatMap((i) => i.op.entries.map((e) => e.from))), bulk = bulkDeletion(deleted.size, Object.keys(entries(c.doc)).length);
+      if (bulk) {
+        for (const i of queue.items) if (i.op.kind === "delete") i.review = true;
+        await this.persistConfig();
+      }
+      while (queue.items.length && this.client === c && c.ready) {
+        const item = queue.items[0];
+        if (!c.serverCapabilities.includes(PATH_SAFETY_CAPABILITY)) {
+          item.error = "\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301\u8DEF\u5F84\u4FDD\u62A4\uFF0C\u672A\u964D\u7EA7\u4E3A\u76F4\u63A5\u5220\u9664";
+          await this.persistConfig();
+          return;
+        }
+        if (!item.approved && (item.review || (item.op.kind === "delete" ? bulk : item.op.entries.length >= 5))) {
+          item.error = "\u6279\u91CF\u6216\u8303\u56F4\u53D8\u5316\u64CD\u4F5C\u7B49\u5F85\u660E\u786E\u786E\u8BA4";
+          await this.persistConfig();
+          return;
+        }
+        try {
+          for (const e of item.op.entries) if (this.app.vault.getAbstractFileByPath(e.from)) throw Error("\u539F\u8DEF\u5F84\u53C8\u6709\u672C\u673A\u6587\u4EF6\uFF0C\u672A\u4F20\u64AD\u5220\u9664/\u91CD\u547D\u540D\uFF0C\u8BF7\u68C0\u67E5");
+          if (!item.prepared) {
+            for (const e of item.op.entries) {
+              const local = item.op.kind === "rename" ? this.app.vault.getAbstractFileByPath(e.to) : null;
+              let saved = e.base;
+              if (local instanceof import_obsidian.TFile) {
+                saved = e.base.kind === "text" ? { kind: "text", data: await this.app.vault.read(local) } : await this.read(local);
+                await this.backup(e.to, saved);
+                e.target = saved.kind === "text" ? saved : { ...saved, version: crypto.randomUUID() };
+                if (saved.kind !== "text") await c.blobs.upload(this.cache.source(saved));
+              } else {
+                if (saved.kind !== "text" && !await this.cache.has(saved)) await c.blobs.download(saved, this.cache.sink(saved));
+                await this.backup(e.from, saved);
+              }
+            }
+            item.backedUp = true;
+            item.prepared = true;
+            await this.persistConfig();
+          }
+          await c.request("path-operation", { op: item.op });
+          if (item.op.kind === "rename") for (const e of item.op.entries) {
+            const f = this.app.vault.getAbstractFileByPath(e.to);
+            if (!(f instanceof import_obsidian.TFile)) continue;
+            const current = e.base.kind === "text" ? { kind: "text", data: await this.app.vault.read(f) } : await this.read(f), published = e.target || e.base;
+            if (!equal(current, published)) {
+              if (current.kind === "text") {
+                const b = new TextEncoder().encode(current.data);
+                const ref = await this.cache.stage({ size: b.length, read: async (p, n) => b.subarray(p, p + n) });
+                await c.stageFile(e.to, this.cache.source(ref), { base: published });
+              } else await c.stageFile(e.to, this.cache.source(current), { base: published });
+            }
+          }
+          queue.items.shift();
+          for (const e of item.op.entries) {
+            this.dirtyFiles.delete(e.from);
+            this.fileFailures.delete(e.from);
+            if (e.to) {
+              this.dirtyFiles.delete(e.to);
+              this.fileFailures.delete(e.to);
+            }
+          }
+          await this.persistConfig();
+          const confirmed = await c.confirmUploads();
+          if (confirmed && !queue.items.length && !this.fileFailures.size && !this.operationError) this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
+        } catch (e) {
+          item.error = this.safeError(e);
+          await this.persistConfig();
+          return;
+        }
+      }
+    } finally {
+      this.safetyBusy = false;
+      this.updateProgress();
+    }
+  }
+  async prepareRemoteDeletes() {
+    const c = this.client;
+    if (!c?.ready) return;
+    const paths = [...c.doc.getMap("files")].filter(([p, m]) => (m.deleted || c.doc.getMap("deleted").has(p)) && !this.pathBlocked(p) && this.app.vault.getAbstractFileByPath(p) instanceof import_obsidian.TFile).map(([p]) => p).sort();
+    if (!paths.length) {
+      if (this.settings.remoteDeleteReview) {
+        this.settings.remoteDeleteReview = void 0;
+        await this.persistConfig();
+      }
+      return;
+    }
+    const signature = this.reviewDigest(), prior = this.settings.remoteDeleteReview;
+    if (prior?.signature === signature) return;
+    if (bulkDeletion(paths.length, this.app.vault.getFiles().filter((f) => supported2(f.path)).length) || prior) {
+      this.settings.remoteDeleteReview = { signature, paths, approved: false };
+      await this.persistConfig();
+      new import_obsidian.Notice("\u68C0\u6D4B\u5230" + paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\uFF0C\u5DF2\u4FDD\u7559\u672C\u673A\u6587\u4EF6\uFF1B\u8BF7\u6253\u5F00\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4\u786E\u8BA4\u3002");
+    }
+  }
+  remoteDeleteAllowed(path) {
+    const r2 = this.settings.remoteDeleteReview;
+    if (!r2) return true;
+    return !!r2.approved && r2.signature === this.reviewDigest() && r2.paths.includes(path);
+  }
+  async approvePathSafety(reviewed) {
+    if (this.uiUnloaded || !this.client?.ready) throw Error("\u8BF7\u8FDE\u63A5\u5F53\u524D\u7248\u672C\u5E76\u91CD\u65B0\u5BA1\u6838");
+    const q = this.settings.pathSafety;
+    if (!q) return;
+    const selected = reviewed || q.items.map((i) => ({ id: i.op.id, plan: JSON.stringify(i.op) }));
+    for (const r2 of selected) if (!q.items.some((i) => i.op.id === r2.id && JSON.stringify(i.op) === r2.plan)) throw Error("\u8DEF\u5F84\u8BA1\u5212\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u5BA1\u6838");
+    for (const i of q.items) if (selected.some((r2) => r2.id === i.op.id)) {
+      i.approved = true;
+      i.error = "";
+    }
+    await this.persistConfig();
+    await this.flushPathSafety();
+    await this.flushLocalFiles();
+    await this.reflect();
+  }
+  async cancelPathSafety(reviewed) {
+    const q = this.settings.pathSafety, c = this.client;
+    if (this.uiUnloaded || !q || !c?.ready) throw Error("\u8BF7\u5148\u8FDE\u63A5\u5F53\u524D\u7248\u672C\u4EE5\u5B89\u5168\u4FDD\u7559\u53CC\u65B9");
+    const selected = reviewed || q.items.map((i) => ({ id: i.op.id, plan: JSON.stringify(i.op) }));
+    for (const r2 of selected) if (!q.items.some((i) => i.op.id === r2.id && JSON.stringify(i.op) === r2.plan)) throw Error("\u8DEF\u5F84\u8BA1\u5212\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u5BA1\u6838");
+    const items = q.items.filter((i) => selected.some((r2) => r2.id === i.op.id));
+    const paths = [...new Set(items.flatMap((i) => operationPaths(i.op)))];
+    const newFiles = [];
+    for (const path of paths) {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (!(f instanceof import_obsidian.TFile)) continue;
+      const local = await this.read(f), remote = content(c.doc, path), known = c.doc.getMap("files").has(path) || c.doc.getMap("deleted").has(path);
+      if (known && !equal(local, remote)) {
+        await this.backup(path, local);
+        const copy2 = "\u6062\u590D\u526F\u672C/\u53D6\u6D88\u8DEF\u5F84\u64CD\u4F5C-" + Date.now() + "-" + crypto.randomUUID().slice(0, 8) + "-" + path.slice(path.lastIndexOf("/") + 1).slice(-180);
+        await this.parents(copy2);
+        this.writing.add(copy2);
+        try {
+          if (local.kind === "text") await this.app.vault.create(copy2, local.data);
+          else await this.app.vault.createBinary(copy2, await this.cache.materialize(local));
+        } finally {
+          this.writing.delete(copy2);
+        }
+        newFiles.push(copy2);
+      } else if (!known) newFiles.push(path);
+      this.dirtyFiles.delete(path);
+    }
+    this.settings.pathSafety = { serverId: q.serverId, items: q.items.filter((i) => !selected.some((r2) => r2.id === i.op.id)) };
+    await this.persistConfig();
+    for (const path of newFiles) {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (f instanceof import_obsidian.TFile) this.dirtyFiles.set(path, f);
+    }
+    await this.flushLocalFiles();
+    await this.reflect();
+    this.updateProgress();
+  }
+  ownPathModal(m) {
+    this.detailModals.add(m);
+    m.onClose = () => this.detailModals.delete(m);
+    return m;
+  }
+  async openPathSafety() {
+    const reviewed = (this.settings.pathSafety?.items || []).map((i) => ({ id: i.op.id, plan: JSON.stringify(i.op) }));
+    const m = new import_obsidian.Modal(this.app);
+    m.titleEl.setText("\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4");
+    this.detailModals.add(m);
+    m.onClose = () => this.detailModals.delete(m);
+    m.contentEl.createEl("p", { text: "\u672C\u673A\u5220\u9664\u6216\u6539\u540D\u5DF2\u53D1\u751F\uFF0C\u4F20\u64AD\u8BA1\u5212\u5148\u6301\u4E45\u5316\u5E76\u5907\u4EFD\u3002\u6279\u91CF\u64CD\u4F5C\u9700\u786E\u8BA4\uFF1B\u670D\u52A1\u5668\u7248\u672C\u53D8\u5316\u6216\u76EE\u6807\u5DF2\u5B58\u5728\u4F1A\u62D2\u7EDD\u6574\u7EC4\u64CD\u4F5C\uFF0C\u4E0D\u81EA\u52A8\u8986\u76D6\u3002\u6539\u540D\u540E\u7684\u7B14\u8BB0\u94FE\u63A5\u7531 Obsidian \u7684\u201C\u81EA\u52A8\u66F4\u65B0\u5185\u90E8\u94FE\u63A5\u201D\u5904\u7406\uFF0C\u672C\u63D2\u4EF6\u540C\u6B65\u5176\u4FDD\u5B58\u7ED3\u679C\uFF0C\u4E0D\u6279\u91CF\u6539\u5199\u5176\u4ED6\u7B14\u8BB0\u3002" });
+    for (const i of this.settings.pathSafety?.items || []) m.contentEl.createEl("pre", { text: i.op.kind + " \xB7 " + i.op.entries.map((e) => e.from + (e.to ? " \u2192 " + e.to : "")).join("\n") + (i.error ? "\n" + i.error : "") });
+    if (this.settings.pathSafety?.items.length) new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5BA1\u6838\u540E\u786E\u8BA4\u4F20\u64AD").onClick(() => {
+      m.close();
+      const confirm = this.ownPathModal(new import_obsidian.Modal(this.app));
+      confirm.titleEl.setText("\u786E\u8BA4\u4F20\u64AD\u5220\u9664\u6216\u91CD\u547D\u540D");
+      confirm.contentEl.createEl("p", { text: "\u4EC5\u5BF9\u521A\u624D\u5C55\u793A\u7684\u8BA1\u5212\u8FDB\u884C\u7248\u672C\u68C0\u67E5\u548C\u4F20\u64AD\uFF1B\u7248\u672C\u53D8\u5316\u4ECD\u4F1A\u62D2\u7EDD\u3002\u5F53\u524D\u5185\u5BB9\u5148\u5907\u4EFD\uFF0C\u6279\u91CF\u8DEF\u5F84\u4F1A\u5F71\u54CD\u5176\u4ED6\u6D4B\u8BD5\u8BBE\u5907\u3002" });
+      new import_obsidian.Setting(confirm.contentEl).addButton((x) => x.setButtonText("\u786E\u8BA4\u4F20\u64AD").onClick(() => {
+        confirm.close();
+        this.enqueue(() => this.approvePathSafety(reviewed));
+      })).addButton((x) => x.setButtonText("\u53D6\u6D88").onClick(() => confirm.close()));
+      confirm.open();
+    })).addButton((b) => b.setButtonText("\u53D6\u6D88\u4F20\u64AD\u5E76\u4FDD\u7559\u53CC\u65B9").onClick(() => {
+      m.close();
+      this.enqueue(() => this.cancelPathSafety(reviewed));
+    }));
+    const review = this.settings.remoteDeleteReview;
+    if (review) {
+      m.contentEl.createEl("pre", { text: "\u8FDC\u7AEF\u5220\u9664\u7B49\u5F85\u786E\u8BA4\uFF1A\n" + review.paths.join("\n") });
+      new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5907\u4EFD\u540E\u5E94\u7528\u8FD9\u4E9B\u8FDC\u7AEF\u5220\u9664").onClick(() => {
+        m.close();
+        const confirm = this.ownPathModal(new import_obsidian.Modal(this.app));
+        confirm.titleEl.setText("\u786E\u8BA4\u5E94\u7528\u8FDC\u7AEF\u6279\u91CF\u5220\u9664");
+        confirm.contentEl.createEl("p", { text: "\u5148\u4FDD\u5B58\u672C\u673A\u6062\u590D\u526F\u672C\uFF0C\u518D\u79FB\u5165 Obsidian \u56DE\u6536\u7AD9\u3002\u670D\u52A1\u5668\u72B6\u6001\u82E5\u5DF2\u6539\u53D8\uFF0C\u672C\u6B21\u786E\u8BA4\u5931\u6548\u3002" });
+        new import_obsidian.Setting(confirm.contentEl).addButton((x) => x.setButtonText("\u786E\u8BA4\u5E94\u7528").onClick(() => {
+          confirm.close();
+          this.enqueue(async () => {
+            if (this.uiUnloaded || this.settings.remoteDeleteReview !== review || this.reviewDigest() !== review.signature) throw Error("\u5220\u9664\u8BA1\u5212\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u5BA1\u6838");
+            review.approved = true;
+            await this.persistConfig();
+            await this.reflect();
+          });
+        })).addButton((x) => x.setButtonText("\u53D6\u6D88").onClick(() => confirm.close()));
+        confirm.open();
+      }));
+    }
+    if (!this.settings.pathSafety?.items.length && !review) m.contentEl.createEl("p", { text: "\u6CA1\u6709\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u64CD\u4F5C\u3002" });
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    m.open();
+  }
   async persistConfig() {
     if (this.legacyConfig) throw Error("\u65E7\u8BBE\u7F6E\u5C1A\u672A\u5907\u4EFD\uFF1B\u62D2\u7EDD\u8986\u76D6");
     const snapshot = structuredClone(this.settings);
@@ -10988,35 +11295,21 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.setConnectionStatus("\u672A\u8FDE\u63A5");
     this.addSettingTab(new Settings(this.app, this));
     this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u72EC\u7ACB\u6D4B\u8BD5\u5E93", callback: () => void this.start() });
+    this.addCommand({ id: "path-safety", name: "\u67E5\u770B\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4", callback: () => void this.openPathSafety() });
     this.addCommand({ id: "device-diagnostics", name: "\u67E5\u770B\u8BBE\u5907\u8FDC\u7A0B\u540C\u6B65\u8BCA\u65AD", callback: () => void this.openDeviceDiagnostics() });
     this.addCommand({ id: "conflicts", name: "\u67E5\u770B\u4E0E\u5904\u7406\u540C\u6B65\u51B2\u7A81", callback: () => void this.openConflicts() });
     this.addCommand({ id: "history", name: "\u67E5\u770B\u4E0E\u6062\u590D\u5386\u53F2\u7248\u672C", callback: () => void this.history() });
     this.addCommand({ id: "stop", name: "\u65AD\u5F00\u6D4B\u8BD5\u5E93\u540C\u6B65", callback: () => this.stop() });
     for (const event of ["create", "modify", "delete"]) this.registerEvent(this.app.vault.on(event, (f) => {
       if (f instanceof import_obsidian.TFile) this.fingerprints.delete(f.path);
-      if (event === "delete" && !(f instanceof import_obsidian.TFile) && this.client && this.syncedOnce && !this.initializing) {
-        const paths = [...this.client.doc.getMap("files").keys()].filter((p) => p.startsWith(f.path + "/") && supported2(p));
-        for (const p of paths) {
-          this.dirtyFiles.delete(p);
-          this.fileFailures.delete(p);
-          this.fingerprints.delete(p);
-        }
-        this.enqueue(async () => {
-          const c = this.client;
-          if (c) await c.batchFiles(async () => {
-            for (const p of paths) remove(c.doc, p, "folder-delete");
-          });
-        });
-        return;
-      }
-      if (!(f instanceof import_obsidian.TFile) || !supported2(f.path) || this.writing.has(f.path) || !this.client || !this.syncedOnce || this.initializing) return;
+      if (!this.client || !this.syncedOnce || this.initializing) return;
       if (event === "delete") {
-        this.dirtyFiles.delete(f.path);
-        this.enqueue(async () => {
-          if (this.client) remove(this.client.doc, f.path, "disk");
-        });
+        if (this.writing.has(f.path)) return;
+        const paths = f instanceof import_obsidian.TFile ? [f.path] : [...this.client.doc.getMap("files").keys()].filter((p) => p.startsWith(f.path + "/"));
+        this.queuePathSafety("delete", paths.filter(supported2).map((from2) => ({ from: from2, base: this.pathBase(from2) })).filter((e) => e.base));
         return;
       }
+      if (!(f instanceof import_obsidian.TFile) || !supported2(f.path) || this.writing.has(f.path)) return;
       if (this.dirtyFiles.size >= 3e3 && !this.dirtyFiles.has(f.path)) {
         new import_obsidian.Notice("\u672C\u5730\u5F85\u540C\u6B65\u8DEF\u5F84\u8D85\u8FC73000\uFF0C\u672A\u4E22\u5F03\u539F\u6587\u4EF6\uFF1B\u8BF7\u68C0\u67E5\u5BB9\u91CF\u3002");
         return;
@@ -11026,39 +11319,20 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.fileUploads.request();
     }));
     this.registerEvent(this.app.vault.on("rename", (f, old) => {
-      if (!this.client || !this.syncedOnce || this.initializing) return;
+      if (!this.client || !this.syncedOnce || this.initializing || this.writing.has(old) || this.writing.has(f.path)) return;
       const moved = f instanceof import_obsidian.TFile ? [{ file: f, from: old }] : this.app.vault.getFiles().filter((x) => x.path.startsWith(f.path + "/")).map((file) => ({ file, from: old + file.path.slice(f.path.length) }));
       for (const { file, from: from2 } of moved) {
         this.fingerprints.delete(from2);
         this.fingerprints.delete(file.path);
         this.dirtyFiles.delete(from2);
-        this.fileFailures.delete(from2);
         if (supported2(file.path)) this.dirtyFiles.set(file.path, file);
       }
-      this.enqueue(async () => {
-        const c = this.client;
-        if (!c) return;
-        await c.batchFiles(async () => {
-          for (const { file, from: from2 } of moved) {
-            const prior = supported2(from2) ? content(c.doc, from2) : null;
-            if (prior && supported2(file.path)) {
-              const trial = new Doc();
-              try {
-                applyUpdate(trial, encodeStateAsUpdate(c.doc));
-                put(trial, file.path, prior, "rename");
-                remove(trial, from2, "rename");
-                validate(trial);
-              } finally {
-                trial.destroy();
-              }
-              put(c.doc, file.path, prior, "rename");
-            }
-            if (supported2(from2)) remove(c.doc, from2, "rename");
-          }
-        });
-        await this.flushLocalFiles();
-        this.refresh();
-      });
+      const plans = moved.filter(({ from: from2 }) => supported2(from2)).map(({ file, from: from2 }) => ({ from: from2, to: file.path, base: this.pathBase(from2) })).filter((e) => e.base);
+      if (plans.every((e) => supported2(e.to))) this.queuePathSafety("rename", plans);
+      else {
+        this.queuePathSafety("delete", plans.map(({ from: from2, base }) => ({ from: from2, base })), true);
+        new import_obsidian.Notice("\u6587\u4EF6\u5DF2\u79FB\u51FA\u540C\u6B65\u8303\u56F4\uFF1B\u8FDC\u7AEF\u5220\u9664\u5DF2\u6682\u505C\uFF0C\u8BF7\u67E5\u770B\u8DEF\u5F84\u4FDD\u62A4\u3002");
+      }
     }));
     this.registerEvent(this.app.workspace.on("editor-change", (editor, view) => {
       const c = this.client, p = view.file?.path;
@@ -11105,6 +11379,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         void this.recoverQueue();
         void this.refreshConflicts();
         void this.reportDiagnostic();
+        if (this.settings.pathSafety?.items.length) this.schedulePathSafety();
       }
     }, 1e4));
     this.app.workspace.onLayoutReady(() => {
@@ -11132,6 +11407,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       const f = this.dirtyFiles.get(p);
       this.dirtyFiles.delete(p);
       if (!f || !this.client || this.stopping) return;
+      if (this.pathBlocked(p)) {
+        this.dirtyFiles.set(p, f);
+        continue;
+      }
       try {
         await this.upload(f);
         this.fileFailures.delete(p);
@@ -11186,6 +11465,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     return item;
   }
   async upload(f) {
+    const path = f.path;
+    if (this.pathBlocked(path)) return;
     const c = this.client;
     if (!c) return;
     if (/\.md$/i.test(f.path) && [...this.bindings.values()].some((b) => b.path === f.path)) {
@@ -11196,7 +11477,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.bindings.delete(cm);
       }
     }
-    const item = await this.read(f), old = content(c.doc, f.path);
+    const item = await this.read(f);
+    if (f.path !== path) throw Error("\u6587\u4EF6\u8BFB\u53D6\u671F\u95F4\u53D1\u751F\u91CD\u547D\u540D\uFF0C\u5DF2\u4FDD\u7559\u672C\u5730\u6587\u4EF6");
+    const old = content(c.doc, f.path);
     if (equal(old, item)) return;
     if (item.kind !== "text") {
       const source = this.cache.source(item);
@@ -11280,6 +11563,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }
     try {
       assertStateOrigin(this.settings);
+      validateSafetyQueue(this.settings.pathSafety, this.settings.serverId);
       if (this.settings.pending?.items?.length && canonicalEndpoint(this.settings.url) !== canonicalEndpoint(this.settings.stateOrigin || "")) throw Error("\u5F85\u4E0A\u4F20\u9644\u4EF6\u7ED1\u5B9A\u65E7\u670D\u52A1\u5668\u5730\u5740\uFF1B\u62D2\u7EDD\u8DE8\u5730\u5740\u53D1\u9001");
     } catch (e) {
       new import_obsidian.Notice(String(e));
@@ -11314,11 +11598,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         try {
           await this.flushLocalFiles();
           if (c.pending.length) await c.flushPending();
+          await this.flushPathSafety();
           if (first) {
             new import_obsidian.Notice("\u6587\u4EF6\u6A21\u5F0F\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md\uFF08\u226416 KiB\uFF09\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59\u65B0 Markdown \u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\u3002");
             const remote = entries(c.doc);
             await c.batchFiles(async () => {
               for (const f of this.app.vault.getFiles().filter((f2) => supported2(f2.path))) {
+                if (this.pathBlocked(f.path)) continue;
                 const local = await this.read(f), r2 = remote[f.path];
                 const meta = c.doc.getMap("files").get(f.path);
                 if (r2) {
@@ -11336,8 +11622,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.refresh();
           const confirmed = await c.confirmUploads();
           if (c.ready && !this.stopping) {
-            this.setConnectionStatus(confirmed ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
-            if (confirmed && !this.fileFailures.size) {
+            this.setConnectionStatus(confirmed && !this.pendingRows().length ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
+            if (confirmed && !this.fileFailures.size && !this.pendingRows().length) {
               if (transientTransferFailure(this.operationError)) this.operationError = "";
               new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
             }
@@ -11349,6 +11635,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     } });
     this.client = c;
     c.doc.on("update", (_u, origin) => {
+      this.digestCache = void 0;
       if (origin === "remote" && c.ready) {
         this.scheduleConflicts();
         this.reflection.request();
@@ -11356,16 +11643,17 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
     });
     if (hadState) {
-      const missing = [.../* @__PURE__ */ new Set([...Object.keys(entries(c.doc)), ...c.pending.map((p) => p.path)])].filter((p) => !this.app.vault.getAbstractFileByPath(p));
+      const missing = [.../* @__PURE__ */ new Set([...Object.keys(entries(c.doc)), ...c.pending.map((p) => p.path)])].filter((p) => !this.app.vault.getAbstractFileByPath(p) && !this.pathBlocked(p));
       if (missing.length) {
         const choice = await this.resolveMissing(missing);
         if (choice === "cancel") {
           this.stop();
           return;
         }
-        if (choice === "delete") for (const p of missing) remove(c.doc, p, "confirmed-disk-delete");
+        if (choice === "delete") this.queuePathSafety("delete", missing.map((from2) => ({ from: from2, base: this.pathBase(from2) })).filter((e) => e.base), false, true);
       }
       for (const f of this.app.vault.getFiles().filter((f2) => supported2(f2.path))) {
+        if (this.pathBlocked(f.path)) continue;
         const local = await this.read(f), known = content(c.doc, f.path), meta = c.doc.getMap("files").get(f.path);
         if (meta?.deleted || c.doc.getMap("deleted").has(f.path)) {
           await this.backup(f.path, local);
@@ -11384,19 +11672,18 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client;
     if (!c?.ready || this.stopping) return;
     const files = c.doc.getMap("files");
-    for (const [p, m] of files) {
+    await this.prepareRemoteDeletes();
+    for (const [p, m] of [...files].sort((a, b) => Number(!!(a[1].deleted || c.doc.getMap("deleted").has(a[0]))) - Number(!!(b[1].deleted || c.doc.getMap("deleted").has(b[0]))))) {
       if (this.stopping || this.client !== c) return;
-      if (!supported2(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
+      if (!supported2(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
       try {
         const f = this.app.vault.getAbstractFileByPath(p);
         if (m.deleted || c.doc.getMap("deleted").has(p)) {
           if (f instanceof import_obsidian.TFile) {
+            if (this.fileFailures.size || this.downloadPaths.size || !this.remoteDeleteAllowed(p)) continue;
             const saved = await this.read(f);
-            if (/\.md$/i.test(p)) {
-              const merged = c.doc.getText("text:" + p).toString();
-              if (merged) saved.data = merged;
-            }
             await this.backup(p, saved);
+            if (content(c.doc, p) || this.dirtyFiles.has(p) || !equal(await this.read(f), saved) || !this.remoteDeleteAllowed(p)) continue;
             this.writing.add(p);
             try {
               await this.app.vault.trash(f, false);
@@ -11467,6 +11754,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.fileFailures.set(p, this.safeError(e));
         this.updateProgress();
       }
+    }
+    if (this.settings.remoteDeleteReview?.approved && this.settings.remoteDeleteReview.paths.every((p) => !this.app.vault.getAbstractFileByPath(p))) {
+      this.settings.remoteDeleteReview = void 0;
+      await this.persistConfig();
     }
     this.refresh();
     this.updateProgress();
@@ -11846,6 +12137,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }
   }
   stop() {
+    window.clearTimeout(this.safetyTimer);
+    this.safetyTimer = void 0;
     this.stopping = true;
     window.clearTimeout(this.conflictTimer);
     this.reflection.cancel();
@@ -11871,6 +12164,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   onunload() {
     this.uiUnloaded = true;
+    window.clearTimeout(this.safetyTimer);
     window.clearTimeout(this.diagnosticTimer);
     this.badgeObserver?.disconnect();
     this.stop();
@@ -11918,6 +12212,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
       if (v && !this.p.client) await this.p.start();
     }));
     new import_obsidian.Setting(e).setName("\u8FDE\u63A5\u6574\u4E2A\u6D4B\u8BD5\u5E93").addButton((b) => b.setButtonText("\u8FDE\u63A5").onClick(() => void this.p.start()));
+    new import_obsidian.Setting(e).setName("\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4").addButton((b) => b.setButtonText("\u67E5\u770B\u5F85\u786E\u8BA4\u64CD\u4F5C").onClick(() => void this.p.openPathSafety()));
     new import_obsidian.Setting(e).setName("\u8BBE\u5907\u8FDC\u7A0B\u8BCA\u65AD").addButton((b) => b.setButtonText("\u67E5\u770B\u8BBE\u5907\u72B6\u6001").onClick(() => void this.p.openDeviceDiagnostics()));
     new import_obsidian.Setting(e).setName("\u540C\u6B65\u51B2\u7A81").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => void this.p.openConflicts()));
     new import_obsidian.Setting(e).setName("\u5386\u53F2\u7248\u672C\uFF08\u542B\u5DF2\u5220\u9664\u6587\u4EF6\uFF09").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u6062\u590D").onClick(() => void this.p.history()));

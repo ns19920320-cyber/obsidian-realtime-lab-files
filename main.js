@@ -10810,10 +10810,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   syncBadges() {
     if (!this.app.vault.getName().startsWith("Realtime-Lab-V3-Files-")) return;
+    const mobile = document.body?.classList.contains("is-mobile");
+    const active = mobile ? this.app.workspace.getActiveViewOfType?.(import_obsidian.MarkdownView) : null;
     const seen = /* @__PURE__ */ new Set(), model = this.badgeModel(), signature = JSON.stringify(model);
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (!(view instanceof import_obsidian.MarkdownView) || !view.file || !supported2(view.file.path)) continue;
+      if (!(view instanceof import_obsidian.MarkdownView) || !view.file || !supported2(view.file.path) || mobile && view !== active) continue;
       seen.add(view);
       let badge = this.badges.get(view);
       if (badge && !badge.el.isConnected) {

@@ -9900,9 +9900,25 @@ function queueRows({ metadata = [], files = [], dirty = [], failures = [], downl
   return [...rows.values()];
 }
 
-function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0 }) {
+var CONFLICT_CAPABILITY = "conflict-review-v1";
+var fingerprint = (c) => JSON.stringify(c ? c.kind === "text" ? { kind: "text", data: c.data } : { kind: c.kind, hash: c.hash, size: c.size } : null);
+var sameContent = (a, b) => fingerprint(a) === fingerprint(b);
+function textDifference(a, b) {
+  const x = a.slice(0, 2e4).split("\n"), y = b.slice(0, 2e4).split("\n");
+  let start = 0, end = 0;
+  while (start < x.length && start < y.length && x[start] === y[start]) start++;
+  while (end < x.length - start && end < y.length - start && x[x.length - 1 - end] === y[y.length - 1 - end]) end++;
+  const removed = x.slice(start, x.length - end), added = y.slice(start, y.length - end);
+  return { removed: removed.slice(0, 100).map((s) => "\u2212 " + s).join("\n"), added: added.slice(0, 100).map((s) => "+ " + s).join("\n"), truncated: a.length > 2e4 || b.length > 2e4 || removed.length > 100 || added.length > 100, equal: a === b };
+}
+
+function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0 }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
-  if (error) {
+  if (ready && conflicts) {
+    tone = "error";
+    icon = "alert-circle";
+    label = "\u51B2\u7A81\u5F85\u5904\u7406";
+  } else if (error) {
     tone = "error";
     icon = "alert-circle";
     label = "\u9700\u5904\u7406";
@@ -9926,8 +9942,8 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     label = "\u5DF2\u786E\u8BA4";
   }
   const counts = "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads;
-  const display = "Sync: " + (tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
-  return { tone, icon, label, display, busy, counts, description: label + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
+  const display = "Sync: " + (ready && conflicts ? "\u26A0 \u51B2\u7A81" + conflicts : tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
+  return { tone, icon, label, display, busy, counts, description: label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
 var badgeCSS = `
 .rl-sync-row{display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
@@ -10162,6 +10178,7 @@ var VaultClient = class {
             }
             if (this.stopped || this.ws !== ws || ws.readyState !== 1) return;
             applyUpdate(this.doc, decode(m.update), "remote");
+            this.serverCapabilities = m.capabilities || [];
             this.metadataVerified = true;
             try {
               await this.beforeUpload();
@@ -10447,7 +10464,7 @@ var VaultClientV3 = class extends VaultClient {
       await options.beforeUpload?.();
       if (this.pending.length) {
         if (!this.blobCache) throw Error("Pending file cache required");
-        for (const p of this.pending) await this.putFile(p.path, this.blobCache.source(p), { version: p.version, preserveDeleted: true });
+        for (const p of this.pending) await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
       }
     }, maxBufferedBytes: 4 * 1024 * 1024, maxInboxBytes: 8 * 1024 * 1024 });
     this.blobs = new BlobTransfer({ url: options.url.replace(/^ws/, "http"), token: options.token, fetchImpl: options.fetchImpl, verifyIdentity: async () => {
@@ -10583,13 +10600,20 @@ var VaultClientV3 = class extends VaultClient {
   checkPending(p) {
     if (!p || !p.version || !/^[a-f0-9-]{36}$/.test(p.version) || !supported2(p.path) || !/^[a-f0-9]{64}$/.test(p.hash) || !Number.isSafeInteger(p.size) || p.size < 0 || p.size > (/\.md$/i.test(p.path) ? MAX_FILE_TEXT : MAX_BINARY)) throw Error("Invalid pending image reference");
   }
-  async putFile(path, source, options) {
+  async putFile(path, source, options = {}) {
     if (!supported2(path) || source.size > (/\.md$/i.test(path) ? MAX_FILE_TEXT : MAX_BINARY)) throw Error("Unsupported file or per-type size limit");
+    const base = Object.hasOwn(options, "base") ? options.base : content(this.doc, path), version = options.version || crypto.randomUUID();
     const ref = await this.blobs.upload(source, { signal: this.binaryAbort.signal, ...options });
     if (this.stopped) throw Error("Client closed; cached source retained");
+    if (options.prepareOnly) return ref;
+    if (this.serverCapabilities?.includes(CONFLICT_CAPABILITY) && !this.ready) throw Error("Disconnected before version publication; cached source retained");
+    if (this.ready && this.serverCapabilities?.includes(CONFLICT_CAPABILITY)) {
+      await this.request("publish-file", { path, ref, version, base, preserveDeleted: !!options.preserveDeleted });
+      return ref;
+    }
     this.doc.transact(() => {
-      const deleted = options?.preserveDeleted && this.doc.getMap("deleted").has(path);
-      put(this.doc, path, { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", ...ref, ...options?.version ? { version: options.version } : {} });
+      const deleted = options.preserveDeleted && this.doc.getMap("deleted").has(path);
+      put(this.doc, path, { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", ...ref, version });
       if (deleted) remove(this.doc, path);
     });
     return ref;
@@ -10619,7 +10643,7 @@ var VaultClientV3 = class extends VaultClient {
     if (this.pending.length >= 3e3) throw Error("Pending reference limit");
     this.binaryBusy = true;
     try {
-      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), item = { path, ...ref, version: crypto.randomUUID() }, previous = [...this.pending].reverse().find((p) => p.path === path);
+      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), base: previous ? { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", hash: previous.hash, size: previous.size, version: previous.version } : content(this.doc, path) };
       if (previous?.hash === ref.hash && previous?.size === ref.size) return ref;
       const next = [...this.pending, item];
       await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
@@ -10637,7 +10661,7 @@ var VaultClientV3 = class extends VaultClient {
     try {
       while (this.pending.length) {
         const p = this.pending[0];
-        await this.putFile(p.path, this.blobCache.source(p), { ...options, version: p.version, preserveDeleted: true });
+        await this.putFile(p.path, this.blobCache.source(p), { ...options, version: p.version, base: p.base, preserveDeleted: true });
         await this.request("barrier");
         this.flushPersist(true);
         if (!this.persistence.persist || !await this.persistence.wait()) throw Error("Save metadata snapshot before removing pending reference");
@@ -10713,6 +10737,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   summaryStatus() {
     const c = this.client;
     if (!c?.ready) return this.connectionStatus;
+    if (this.conflicts.length) return "\u6709" + this.conflicts.length + "\u9879\u51B2\u7A81\u5F85\u5904\u7406\uFF0C\u53CC\u65B9\u7248\u672C\u5DF2\u4FDD\u7559";
+    if (this.conflictError) return "\u5DF2\u8FDE\u63A5\uFF0C\u51B2\u7A81\u72B6\u6001\u5C1A\u672A\u786E\u8BA4";
     if (c.lastError || this.fileFailures.size || this.operationError) return "\u5DF2\u8FDE\u63A5\uFF0C\u6709\u5931\u8D25\u9879\u76EE\uFF0C\u5185\u5BB9\u4FDD\u7559";
     if (!this.syncedOnce || this.initializing) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u51C6\u5907\u6587\u4EF6";
     if (this.reflection.queued || this.downloadPaths.size) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u63A5\u6536\u6587\u4EF6";
@@ -10732,6 +10758,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
+    e.createEl("p", { text: "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A" + this.conflicts.length });
+    if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
     if ([this.operationError, ...this.fileFailures.values()].some(transientTransferFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u8BF7\u4FDD\u6301 Obsidian \u5728\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
@@ -10778,7 +10806,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   badgeModel() {
     const c = this.client, uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
     const unknown = uploads.delete("*");
-    return badgeState({ ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size, unknown, known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size, unknown, conflicts: this.conflicts.length, known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   syncBadges() {
     if (!this.app.vault.getName().startsWith("Realtime-Lab-V3-Files-")) return;
@@ -10846,7 +10874,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.detailPanels.add(panel);
     this.detailModals.add(m);
     m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u2191 \u5F85\u4E0A\u4F20\u6216\u7B49\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF1B\u2193 \u5F53\u524D\u63A5\u6536\u4E2D\u7684\u8DEF\u5F84\u6570\u3002\u26A1 \u8868\u793A\u8FDE\u63A5\u4E14\u5DF2\u83B7\u670D\u52A1\u5668\u786E\u8BA4\uFF1B\u65F6\u949F\u8868\u793A\u7B49\u5F85\u786E\u8BA4\uFF1B\u79BB\u7EBF\u4E0E\u5F02\u5E38\u4F1A\u76F4\u63A5\u6807\u660E\u3002\u786E\u8BA4\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
-    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u67E5\u770B\u540C\u6B65\u51B2\u7A81").onClick(() => void this.openConflicts())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
     m.onClose = () => {
       this.detailPanels.delete(panel);
       this.detailModals.delete(m);
@@ -10875,6 +10903,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.setConnectionStatus("\u672A\u8FDE\u63A5");
     this.addSettingTab(new Settings(this.app, this));
     this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u72EC\u7ACB\u6D4B\u8BD5\u5E93", callback: () => void this.start() });
+    this.addCommand({ id: "conflicts", name: "\u67E5\u770B\u4E0E\u5904\u7406\u540C\u6B65\u51B2\u7A81", callback: () => void this.openConflicts() });
     this.addCommand({ id: "history", name: "\u67E5\u770B\u4E0E\u6062\u590D\u5386\u53F2\u7248\u672C", callback: () => void this.history() });
     this.addCommand({ id: "stop", name: "\u65AD\u5F00\u6D4B\u8BD5\u5E93\u540C\u6B65", callback: () => this.stop() });
     for (const event of ["create", "modify", "delete"]) this.registerEvent(this.app.vault.on(event, (f) => {
@@ -10978,6 +11007,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.retryAfter = 0;
       if (!this.client.ready) this.client.resume();
       else void this.recoverQueue();
+      void this.refreshConflicts();
     });
     this.registerDomEvent(document, "visibilitychange", () => {
       if (!document.hidden) this.client?.resume();
@@ -10986,6 +11016,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       if (!document.hidden) {
         void this.client?.checkConnection();
         void this.recoverQueue();
+        void this.refreshConflicts();
       }
     }, 1e4));
     this.app.workspace.onLayoutReady(() => {
@@ -11204,6 +11235,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
             first = false;
           }
           this.syncedOnce = true;
+          await this.refreshConflicts();
           await this.reflect();
           this.refresh();
           const confirmed = await c.confirmUploads();
@@ -11222,6 +11254,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.client = c;
     c.doc.on("update", (_u, origin) => {
       if (origin === "remote" && c.ready) {
+        this.scheduleConflicts();
         this.reflection.request();
         this.updateProgress();
       }
@@ -11437,6 +11470,142 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       m.contentEl.createEl("p", { text: String(e) });
     }
   }
+  conflicts = [];
+  conflictRefresh = null;
+  conflictTimer;
+  conflictSeen = /* @__PURE__ */ new Set();
+  conflictError = "";
+  async refreshConflicts() {
+    const c = this.client;
+    if (!c?.ready) return;
+    if (!c.serverCapabilities?.includes(CONFLICT_CAPABILITY)) {
+      this.conflictError = "\u6B64\u670D\u52A1\u5668\u5C1A\u672A\u652F\u6301\u51B2\u7A81\u68C0\u67E5\uFF0C\u672A\u786E\u8BA4\u51B2\u7A81\u72B6\u6001";
+      return;
+    }
+    if (this.conflictRefresh) return this.conflictRefresh;
+    this.conflictRefresh = (async () => {
+      try {
+        const rows = await c.request("conflicts");
+        if (this.client !== c) return;
+        this.conflicts = rows;
+        this.conflictError = "";
+        for (const row of rows) if (!this.conflictSeen.has(row.id)) {
+          this.conflictSeen.add(row.id);
+          new import_obsidian.Notice("\u53D1\u73B0\u6574\u6587\u4EF6\u7248\u672C\u51B2\u7A81\uFF1A" + row.path + "\uFF1B\u53CC\u65B9\u5185\u5BB9\u5DF2\u4FDD\u7559\uFF0C\u70B9\u51FB\u540C\u6B65\u72B6\u6001\u67E5\u770B\u3002");
+        }
+        this.updateProgress();
+      } catch (e) {
+        if (this.client === c) {
+          this.conflictError = this.safeError(e);
+          this.updateProgress();
+        }
+      }
+    })().finally(() => {
+      this.conflictRefresh = null;
+    });
+    return this.conflictRefresh;
+  }
+  scheduleConflicts() {
+    window.clearTimeout(this.conflictTimer);
+    this.conflictTimer = window.setTimeout(() => void this.refreshConflicts(), 500);
+  }
+  async resolveConflict(review, strategy, version, expected) {
+    const c = this.client;
+    if (!c?.ready) throw Error("\u8BF7\u5148\u8FDE\u63A5\u6D4B\u8BD5\u5E93");
+    const task = this.queue.then(async () => {
+      if (c !== this.client || !c.ready) throw Error("\u8FDE\u63A5\u5DF2\u6539\u53D8");
+      if (this.dirtyFiles.has(review.path) || c.pending.some((p) => p.path === review.path) || c.pendingPaths.includes(review.path) || c.pendingPaths.includes("*")) throw Error("\u6B64\u6587\u4EF6\u4ECD\u6709\u5F85\u4F20\u4FEE\u6539\uFF0C\u8BF7\u5148\u540C\u6B65");
+      if (!sameContent(content(c.doc, review.path), expected)) throw Error("\u5F53\u524D\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u67E5\u770B\u51B2\u7A81");
+      if (strategy === "use-version") {
+        const f = this.app.vault.getAbstractFileByPath(review.path);
+        if (f instanceof import_obsidian.TFile) {
+          const local = await this.read(f);
+          if (!equal(local, expected)) throw Error("\u672C\u5730\u5185\u5BB9\u5C1A\u672A\u540C\u6B65\uFF0C\u672A\u66FF\u6362");
+          await this.backup(review.path, local);
+        }
+      }
+      if (this.dirtyFiles.has(review.path) || !sameContent(content(c.doc, review.path), expected)) throw Error("\u5F53\u524D\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u67E5\u770B\u51B2\u7A81");
+      await c.request("resolve-conflict", { path: review.path, reviewId: review.id, strategy, version, expected });
+      await this.reflect();
+      await c.confirmUploads();
+      await this.refreshConflicts();
+    });
+    this.queue = task.catch(() => {
+    });
+    return task;
+  }
+  async conflictText(path, v) {
+    if (!v) return "[\u5F53\u524D\u6587\u4EF6\u5DF2\u5220\u9664]";
+    if (v.kind === "text") return v.data;
+    if (!/\.md$/i.test(path)) return null;
+    if (!await this.cache.has(v)) await this.client.blobs.download(v, this.cache.sink(v));
+    return new TextDecoder("utf-8", { fatal: true }).decode(await this.cache.materialize(v));
+  }
+  async openConflicts() {
+    await this.refreshConflicts();
+    const m = new import_obsidian.Modal(this.app);
+    m.titleEl.setText("\u540C\u6B65\u51B2\u7A81");
+    m.modalEl.addClass("rl-history-modal");
+    m.contentEl.createEl("p", { text: "\u9010\u5B57\u534F\u4F5C\u7B14\u8BB0\u81EA\u52A8\u5408\u5E76\uFF1B\u8FD9\u91CC\u5217\u51FA\u6574\u6587\u4EF6\u7684\u7248\u672C\u5206\u53C9\u3002\u5904\u7406\u4E0D\u4F1A\u4E22\u5F03\u5386\u53F2\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u4F1A\u53E6\u5B58\u5230\u201C\u51B2\u7A81\u526F\u672C\u201D\u3002" });
+    if (this.conflictError) m.contentEl.createEl("p", { text: "\u51B2\u7A81\u5217\u8868\u5C1A\u672A\u786E\u8BA4\uFF1A" + this.conflictError });
+    if (!this.conflicts.length && !this.conflictError) m.contentEl.createEl("p", { text: this.client?.ready ? "\u5F53\u524D\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6574\u6587\u4EF6\u51B2\u7A81\u3002" : "\u5F53\u524D\u672A\u8FDE\u63A5\uFF0C\u8BF7\u8FDE\u63A5\u540E\u5237\u65B0\u51B2\u7A81\u5217\u8868\u3002" });
+    for (const r2 of this.conflicts) new import_obsidian.Setting(m.contentEl).setName(r2.path).setDesc(r2.reason + " \xB7 " + r2.versions.length + " \u4E2A\u4FDD\u7559\u7248\u672C").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => void this.showConflict(r2)));
+    m.open();
+  }
+  async showConflict(review) {
+    const c = this.client;
+    if (!c?.ready) return;
+    const expected = content(c.doc, review.path), m = new import_obsidian.Modal(this.app);
+    m.titleEl.setText("\u5904\u7406\u51B2\u7A81 \xB7 " + review.path);
+    m.modalEl.addClass("rl-history-modal");
+    m.contentEl.createEl("p", { text: "\u5F53\u524D\u6587\u4EF6\u5148\u4FDD\u6301\u539F\u6837\u3002\u53EF\u4FDD\u7559\u6240\u6709\u7248\u672C\u4E3A\u526F\u672C\uFF0C\u6216\u9884\u89C8\u3001\u6BD4\u8F83\u540E\u660E\u786E\u9009\u62E9\u4E00\u4E2A\u7248\u672C\u3002\u9009\u62E9\u7248\u672C\u4E5F\u4F1A\u4FDD\u7559\u5176\u4F59\u7248\u672C\u526F\u672C\u3002" });
+    m.open();
+    try {
+      const list = await c.request("history", { path: review.path });
+      const confirm = (strategy, version) => {
+        const ask = new import_obsidian.Modal(this.app);
+        ask.titleEl.setText(strategy === "keep-both" ? "\u4FDD\u7559\u6240\u6709\u7248\u672C" : "\u786E\u8BA4\u4F7F\u7528\u6B64\u7248\u672C");
+        ask.contentEl.createEl("p", { text: strategy === "keep-both" ? "\u539F\u6587\u4EF6\u4E0D\u53D8\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u53E6\u5B58\u4E3A\u51B2\u7A81\u526F\u672C\u5E76\u6807\u8BB0\u5DF2\u5904\u7406\u3002" : "\u5F53\u524D\u5185\u5BB9\u5148\u5907\u4EFD\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u53E6\u5B58\u4E3A\u51B2\u7A81\u526F\u672C\uFF0C\u518D\u66FF\u6362\u539F\u6587\u4EF6\u5E76\u540C\u6B65\u5230\u6D4B\u8BD5\u8BBE\u5907\u3002" });
+        new import_obsidian.Setting(ask.contentEl).addButton((b) => b.setButtonText("\u53D6\u6D88").onClick(() => ask.close())).addButton((b) => b.setButtonText("\u786E\u8BA4\u5904\u7406").onClick(async () => {
+          try {
+            await this.resolveConflict(review, strategy, version, expected);
+            new import_obsidian.Notice("\u51B2\u7A81\u5DF2\u5904\u7406\uFF0C\u5019\u9009\u7248\u672C\u526F\u672C\u5DF2\u540C\u6B65");
+            ask.close();
+            m.close();
+          } catch (e) {
+            new import_obsidian.Notice(this.safeError(e));
+          }
+        }));
+        ask.open();
+      };
+      new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u4FDD\u7559\u6240\u6709\u7248\u672C\u4E3A\u526F\u672C").onClick(() => confirm("keep-both")));
+      for (const id2 of review.versions) {
+        const v = list.find((x) => x.id === id2);
+        if (!v) {
+          m.contentEl.createEl("p", { text: "\u7248\u672C\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u5148\u5BFC\u51FA\u53EF\u7528\u5386\u53F2\uFF0C\u672A\u81EA\u52A8\u5904\u7406\u3002" });
+          continue;
+        }
+        new import_obsidian.Setting(m.contentEl).setName(new Date(v.time).toLocaleString()).setDesc(sameContent(v, expected) ? "\u5F53\u524D\u7248\u672C" : "\u4FDD\u7559\u7248\u672C").addButton((b) => b.setButtonText("\u9884\u89C8").onClick(() => void this.previewVersion(review.path, id2))).addButton((b) => b.setButtonText("\u5DEE\u5F02").onClick(async () => {
+          try {
+            const selected = await c.request("history-preview", { path: review.path, version: id2 }), a = await this.conflictText(review.path, expected), b2 = await this.conflictText(review.path, selected), diff = new import_obsidian.Modal(this.app);
+            diff.titleEl.setText("\u4E0E\u5F53\u524D\u7248\u672C\u6BD4\u8F83");
+            diff.modalEl.addClass("rl-history-modal");
+            if (a === null || b2 === null) diff.contentEl.createEl("p", { text: "\u56FE\u7247\u4E0E PDF \u8BF7\u5206\u522B\u70B9\u51FB\u9884\u89C8\u67E5\u770B\uFF1B\u6B64\u5904\u4E0D\u505A\u9010\u884C\u6BD4\u8F83\u3002" });
+            else {
+              const d = textDifference(a, b2);
+              diff.contentEl.createEl("p", { text: d.equal ? "\u6587\u5B57\u5185\u5BB9\u76F8\u540C" : "\u8FDE\u7EED\u53D8\u5316\u533A\u95F4\uFF1A\u2212 \u5F53\u524D\u7248\u672C\uFF1B+ \u6240\u9009\u7248\u672C\u3002" + (d.truncated ? "\u5185\u5BB9\u8F83\u957F\uFF0C\u6458\u8981\u5DF2\u622A\u65AD\uFF1B\u5B8C\u6574\u7248\u672C\u4ECD\u4FDD\u7559\u3002" : "") });
+              diff.contentEl.createEl("pre", { cls: "rl-history-preview", text: d.removed + "\n" + d.added });
+            }
+            diff.open();
+          } catch (e) {
+            new import_obsidian.Notice(this.safeError(e));
+          }
+        })).addButton((b) => b.setButtonText("\u4F7F\u7528\u6B64\u7248\u672C").onClick(() => confirm("use-version", id2)));
+      }
+    } catch (e) {
+      m.contentEl.createEl("p", { text: "\u672A\u5904\u7406\u4EFB\u4F55\u6587\u4EF6\uFF1A" + this.safeError(e) });
+    }
+  }
   async restoreVersion(path, version, target, expected) {
     const c = this.client;
     if (!c?.ready) throw Error("\u8BF7\u5148\u8FDE\u63A5\u6D4B\u8BD5\u5E93");
@@ -11579,6 +11748,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   stop() {
     this.stopping = true;
+    window.clearTimeout(this.conflictTimer);
     this.reflection.cancel();
     this.fileUploads.cancel();
     this.dirtyFiles.clear();
@@ -11646,6 +11816,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
       if (v && !this.p.client) await this.p.start();
     }));
     new import_obsidian.Setting(e).setName("\u8FDE\u63A5\u6574\u4E2A\u6D4B\u8BD5\u5E93").addButton((b) => b.setButtonText("\u8FDE\u63A5").onClick(() => void this.p.start()));
+    new import_obsidian.Setting(e).setName("\u540C\u6B65\u51B2\u7A81").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => void this.p.openConflicts()));
     new import_obsidian.Setting(e).setName("\u5386\u53F2\u7248\u672C\uFF08\u542B\u5DF2\u5220\u9664\u6587\u4EF6\uFF09").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u6062\u590D").onClick(() => void this.p.history()));
     new import_obsidian.Setting(e).setName("\u65AD\u5F00").addButton((b) => b.setButtonText("\u65AD\u5F00").onClick(() => this.p.stop()));
   }

@@ -32,8 +32,6 @@ __export(plugin_exports, {
   default: () => RealtimeLab
 });
 module.exports = __toCommonJS(plugin_exports);
-var import_obsidian = require("obsidian");
-var import_state = require("@codemirror/state");
 
 var create = () => /* @__PURE__ */ new Map();
 var copy = (m) => {
@@ -9015,6 +9013,60 @@ if (glo[importIdentifier] === true) {
 }
 glo[importIdentifier] = true;
 
+var MAX_IMAGE = 5 * 1024 * 1024;
+var MAX_TEXT = 1024 * 1024;
+var MAX_TOTAL = 50 * 1024 * 1024;
+var IMAGE = /\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i;
+function supported(p) {
+  return typeof p === "string" && p.length > 0 && p.length <= 512 && p === p.normalize("NFC") && !p.includes("\\") && !/[\x00-\x1f\x7f]/.test(p) && !p.startsWith("/") && !p.split("/").some((s) => !s || s === "." || s === ".." || s.startsWith(".") || /[<>:|?*]/.test(s) || s.includes(String.fromCharCode(34)) || /[. ]$/.test(s) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:[.]|$)/i.test(s)) && (/\.md$/i.test(p) || IMAGE.test(p));
+}
+function patchText(doc2, p, next, origin) {
+  if (!supported(p) || !/\.md$/i.test(p)) throw Error("Invalid Markdown path");
+  const t = doc2.getText("text:" + p), old = t.toString();
+  let from2 = 0;
+  while (from2 < old.length && from2 < next.length && old[from2] === next[from2]) from2++;
+  let tail = 0;
+  while (tail < old.length - from2 && tail < next.length - from2 && old[old.length - 1 - tail] === next[next.length - 1 - tail]) tail++;
+  doc2.transact(() => {
+    if (old.length - from2 - tail) t.delete(from2, old.length - from2 - tail);
+    if (next.length - from2 - tail) t.insert(from2, next.slice(from2, next.length - tail));
+  }, origin);
+}
+
+var MAX_PATHS = 8192;
+var MAX_ACTIVE_PATHS = 6e3;
+var MAX_INLINE_NOTE = 16 * 1024;
+var MAX_INLINE_TOTAL = 128 * 1024;
+var MAX_BINARY = 5 * 1024 * 1024;
+var MAX_FILE_TEXT = 16 * 1024 * 1024;
+var MAX_BLOB_BYTES = MAX_FILE_TEXT;
+var MAX_LIVE_BYTES = 256 * 1024 * 1024;
+var MAX_STATE = 2 * 1024 * 1024;
+var FILE_REFS_CAPABILITY = "versioned-files-v1";
+var MAX_DISK_BYTES = 512 * 1024 * 1024;
+var MAX_DISK_OBJECTS = 8192;
+
+var GENERAL_FILES_CAPABILITY = "general-files-v1";
+var GENERAL = /\.(json|csv|jsonl|html?|py|txt|sha256|log|zip|bak)$/i;
+var DATED_BACKUP = /\.md\.bak\.\d{8}-\d{6}$/i;
+var imagePath = (p) => typeof p === "string" && IMAGE.test(p);
+function supportedFile(p) {
+  return !["realtime-lab-v3-files.json", "realtime-lab-v2.json"].includes(p) && (supported(p) || typeof p === "string" && p.length <= 512 && (/\.pdf$/i.test(p) || GENERAL.test(p) || DATED_BACKUP.test(p)) && supported(p.replace(/\.[^./]+$/, ".png")));
+}
+var fileKind = (p) => imagePath(p) ? "image" : "file";
+var maxFileSize = (p) => /\.md$/i.test(p) ? MAX_FILE_TEXT : imagePath(p) || /\.pdf$/i.test(p) ? MAX_BINARY : MAX_FILE_TEXT;
+var textPreviewPath = (p) => /\.(md|json|csv|jsonl|html?|py|txt|sha256|log|bak)$/i.test(p) || DATED_BACKUP.test(p);
+function decodeTextPreview(bytes) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+var import_obsidian = require("obsidian");
+var import_state = require("@codemirror/state");
+
 var cmView4 = __toESM(require("@codemirror/view"), 1);
 var cmState4 = __toESM(require("@codemirror/state"), 1);
 
@@ -9578,32 +9630,12 @@ function coalescedTask(enqueue, run, allowed = () => true) {
   } };
 }
 
-var MAX_IMAGE = 5 * 1024 * 1024;
-var MAX_TEXT = 1024 * 1024;
-var MAX_TOTAL = 50 * 1024 * 1024;
-var IMAGE = /\.(png|jpe?g|gif|webp|svg|avif|bmp)$/i;
-function supported(p) {
-  return typeof p === "string" && p.length > 0 && p.length <= 512 && p === p.normalize("NFC") && !p.includes("\\") && !/[\x00-\x1f\x7f]/.test(p) && !p.startsWith("/") && !p.split("/").some((s) => !s || s === "." || s === ".." || s.startsWith(".") || /[<>:|?*]/.test(s) || s.includes(String.fromCharCode(34)) || /[. ]$/.test(s) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:[.]|$)/i.test(s)) && (/\.md$/i.test(p) || IMAGE.test(p));
-}
-function patchText(doc2, p, next, origin) {
-  if (!supported(p) || !/\.md$/i.test(p)) throw Error("Invalid Markdown path");
-  const t = doc2.getText("text:" + p), old = t.toString();
-  let from2 = 0;
-  while (from2 < old.length && from2 < next.length && old[from2] === next[from2]) from2++;
-  let tail = 0;
-  while (tail < old.length - from2 && tail < next.length - from2 && old[old.length - 1 - tail] === next[next.length - 1 - tail]) tail++;
-  doc2.transact(() => {
-    if (old.length - from2 - tail) t.delete(from2, old.length - from2 - tail);
-    if (next.length - from2 - tail) t.insert(from2, next.slice(from2, next.length - tail));
-  }, origin);
-}
-
-async function inventory(files, read) {
+async function inventory(files, read, policy = {}) {
   const result = { totalFiles: files.length, totalBytes: 0, markdownFiles: 0, imageFiles: 0, otherFiles: 0, eligibleFiles: 0, eligibleBytes: 0, unsupportedFiles: 0, excludedFiles: 0, conflicts: [], files: [] };
   const seen = /* @__PURE__ */ new Map();
   for (const f of files) {
     const p = f.path;
-    const excluded = p.split("/").some((s) => s.startsWith(".")) || p === "realtime-lab-v2.json";
+    const excluded = p.split("/").some((s) => s.startsWith(".")) || p === "realtime-lab-v2.json" || p === "realtime-lab-v3-files.json";
     if (excluded) {
       result.excludedFiles++;
       result.totalBytes += f.size ?? 0;
@@ -9615,7 +9647,7 @@ async function inventory(files, read) {
     else result.otherFiles++;
     const bytes = new Uint8Array(await read(p)), digest = await crypto.subtle.digest("SHA-256", bytes);
     const sha256 = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
-    const accepted = supported(p), limit = /\.md$/i.test(p) ? MAX_TEXT : MAX_IMAGE;
+    const accepted = (policy.supported || supported)(p), limit = policy.maxFileSize ? policy.maxFileSize(p) : /\.md$/i.test(p) ? MAX_TEXT : MAX_IMAGE;
     const status = !accepted ? "unsupported" : bytes.length > limit ? "oversize" : "eligible";
     const row = { path: p, status, bytes: bytes.length, sha256 };
     result.totalBytes += bytes.length;
@@ -9667,19 +9699,6 @@ async function inspectInitialization(vault) {
   const files = (vault.getFiles?.() || []).filter((f) => f.path !== "realtime-lab-v3-files.json" && !f.path.startsWith("."));
   return { action: files.length ? "preview-only" : "initialize-empty", files: files.map((f) => f.path) };
 }
-
-var MAX_PATHS = 4096;
-var MAX_ACTIVE_PATHS = 3e3;
-var MAX_INLINE_NOTE = 16 * 1024;
-var MAX_INLINE_TOTAL = 128 * 1024;
-var MAX_BINARY = 5 * 1024 * 1024;
-var MAX_FILE_TEXT = 16 * 1024 * 1024;
-var MAX_BLOB_BYTES = MAX_FILE_TEXT;
-var MAX_LIVE_BYTES = 128 * 1024 * 1024;
-var MAX_STATE = 2 * 1024 * 1024;
-var FILE_REFS_CAPABILITY = "versioned-files-v1";
-var MAX_DISK_BYTES = 256 * 1024 * 1024;
-var MAX_DISK_OBJECTS = 4096;
 
 var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
 var r = (v, n) => v >>> n | v << 32 - n;
@@ -9759,6 +9778,44 @@ var ObsidianBlobCache = class {
   constructor(adapter) {
     this.adapter = adapter;
     this.busy = false;
+    this.quota = null;
+    this.reservations = Promise.resolve();
+    this.metrics = { quotaScans: 0, quotaRecords: 0, reservations: 0, operations: 0, failures: 0, maxOperationMs: 0, lastOperation: null };
+  }
+  // The cache is private to this plugin instance. Rebuild once on open, including
+  // incomplete and retained blobs; never trust a durable quota counter after a crash.
+  async scanQuota() {
+    await this.mkdir(ROOT);
+    const listing = await this.io("list", ROOT);
+    let bytes = 0, count = 0;
+    for (const folder of listing.folders) {
+      const p = folder + "/state.json";
+      if (!await this.io("exists", p)) continue;
+      const m = JSON.parse(await this.io("read", p));
+      if (!Number.isSafeInteger(m.size) || m.size < 0 || m.size > MAX_BLOB_BYTES) throw Error("Invalid cache quota metadata");
+      bytes += m.size;
+      count++;
+      this.metrics.quotaRecords++;
+    }
+    this.metrics.quotaScans++;
+    return { bytes, count };
+  }
+  invalidateQuota() {
+    this.quota = null;
+  }
+  async io(method, ...args2) {
+    const started = Date.now();
+    this.metrics.operations++;
+    this.metrics.lastOperation = method;
+    try {
+      return await this.adapter[method](...args2);
+    } catch (e) {
+      this.metrics.failures++;
+      this.invalidateQuota();
+      throw new Error("Cache " + method + ": " + String(e?.message || e), { cause: e });
+    } finally {
+      this.metrics.maxOperationMs = Math.max(this.metrics.maxOperationMs, Date.now() - started);
+    }
   }
   check(ref) {
     if (!ref || !/^[a-f0-9]{64}$/.test(ref.hash) || !Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > MAX_BLOB_BYTES) throw Error("Invalid cache reference");
@@ -9768,12 +9825,12 @@ var ObsidianBlobCache = class {
     return ROOT + "/" + ref.hash;
   }
   async mkdir(p) {
-    if (!await this.adapter.exists(p)) await this.adapter.mkdir(p);
+    if (!await this.io("exists", p)) await this.io("mkdir", p);
   }
   async state(ref) {
     const base = this.base(ref), p = base + "/state.json";
-    if (!await this.adapter.exists(p)) return { size: ref.size, offset: 0, complete: false };
-    const s = JSON.parse(await this.adapter.read(p));
+    if (!await this.io("exists", p)) return { size: ref.size, offset: 0, complete: false };
+    const s = JSON.parse(await this.io("read", p));
     if (s.size !== ref.size || !Number.isSafeInteger(s.offset) || s.offset < 0 || s.offset > ref.size || typeof s.complete !== "boolean" || s.complete && s.offset !== ref.size || !s.complete && s.offset !== ref.size && s.offset % CHUNK_BYTES) throw Error("Invalid cached upload state");
     return s;
   }
@@ -9782,28 +9839,29 @@ var ObsidianBlobCache = class {
   }
   async read(ref, p, n) {
     this.check(ref);
+    if (ref.size === 0 && p === 0 && n === 0) return new Uint8Array();
     if (p % CHUNK_BYTES || n !== Math.min(CHUNK_BYTES, ref.size - p)) throw Error("Unaligned cache read");
-    const bytes = new Uint8Array(await this.adapter.readBinary(this.base(ref) + "/" + p + ".bin"));
+    const bytes = new Uint8Array(await this.io("readBinary", this.base(ref) + "/" + p + ".bin"));
     if (bytes.length !== n) throw Error("Short cache chunk");
     return bytes;
   }
   async reserve(ref) {
-    const base = this.base(ref);
-    await this.mkdir(ROOT);
-    if (await this.adapter.exists(base + "/state.json")) return;
-    const listing = await this.adapter.list(ROOT);
-    let bytes = 0, count = 0;
-    for (const folder of listing.folders) {
-      const p = folder + "/state.json";
-      if (!await this.adapter.exists(p)) continue;
-      const m = JSON.parse(await this.adapter.read(p));
-      if (!Number.isSafeInteger(m.size) || m.size < 0 || m.size > MAX_BLOB_BYTES) throw Error("Invalid cache quota metadata");
-      bytes += m.size;
-      count++;
-    }
-    if (count >= MAX_DISK_OBJECTS || bytes + ref.size > MAX_DISK_BYTES) throw Error("Local cache quota reached; retained recovery blobs are included");
-    await this.mkdir(base);
-    await this.adapter.write(base + "/state.json", JSON.stringify({ size: ref.size, offset: 0, complete: false }));
+    const job = this.reservations.then(async () => {
+      const base = this.base(ref);
+      if (!this.quota) this.quota = await this.scanQuota();
+      if (await this.io("exists", base + "/state.json")) return;
+      const q = this.quota;
+      if (q.count >= MAX_DISK_OBJECTS || q.bytes + ref.size > MAX_DISK_BYTES) throw Error("Local cache quota reached; retained recovery blobs are included");
+      await this.mkdir(base);
+      await this.io("write", base + "/state.json", JSON.stringify({ size: ref.size, offset: 0, complete: false }));
+      q.bytes += ref.size;
+      q.count++;
+      this.metrics.reservations++;
+    });
+    this.reservations = job.catch(() => {
+      this.invalidateQuota();
+    });
+    return job;
   }
   async append(ref, p, bytes) {
     await this.reserve(ref);
@@ -9812,8 +9870,8 @@ var ObsidianBlobCache = class {
     if (p !== s.offset || bytes.length !== Math.min(CHUNK_BYTES, ref.size - p)) throw Error("Invalid cache chunk offset");
     await this.mkdir(ROOT);
     await this.mkdir(this.base(ref));
-    await this.adapter.writeBinary(this.base(ref) + "/" + p + ".bin", bytes.slice().buffer);
-    await this.adapter.write(this.base(ref) + "/state.json", JSON.stringify({ size: ref.size, offset: p + bytes.length, complete: false }));
+    await this.io("writeBinary", this.base(ref) + "/" + p + ".bin", bytes.slice().buffer);
+    await this.io("write", this.base(ref) + "/state.json", JSON.stringify({ size: ref.size, offset: p + bytes.length, complete: false }));
   }
   async finish(ref) {
     await this.reserve(ref);
@@ -9821,7 +9879,7 @@ var ObsidianBlobCache = class {
     if (await hashSource(this.source(ref)) !== ref.hash) throw Error("Cache hash mismatch");
     await this.mkdir(ROOT);
     await this.mkdir(this.base(ref));
-    await this.adapter.write(this.base(ref) + "/state.json", JSON.stringify({ size: ref.size, offset: ref.size, complete: true }));
+    await this.io("write", this.base(ref) + "/state.json", JSON.stringify({ size: ref.size, offset: ref.size, complete: true }));
   }
   source(ref) {
     this.check(ref);
@@ -9875,6 +9933,12 @@ function transientTransferFailure(error) {
   if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
   return /failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
 }
+function transientFilesystemFailure(error) {
+  return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
+}
+function recoverableSyncFailure(error) {
+  return transientFilesystemFailure(error) || transientTransferFailure(error);
+}
 
 function changedPaths(doc2, transaction) {
   const paths = /* @__PURE__ */ new Set();
@@ -9912,9 +9976,6 @@ function textDifference(a, b) {
   return { removed: removed.slice(0, 100).map((s) => "\u2212 " + s).join("\n"), added: added.slice(0, 100).map((s) => "+ " + s).join("\n"), truncated: a.length > 2e4 || b.length > 2e4 || removed.length > 100 || added.length > 100, equal: a === b };
 }
 
-function supported2(p) {
-  return supported(p) || typeof p === "string" && /\.pdf$/i.test(p) && supported(p.slice(0, -4) + ".png");
-}
 var markdown = (p) => /\.md$/i.test(p);
 function content(doc2, p) {
   const m = doc2.getMap("files").get(p);
@@ -9930,7 +9991,7 @@ function entries(doc2) {
   return out;
 }
 function put(doc2, p, c, origin) {
-  if (!supported2(p)) throw Error("Unsupported path");
+  if (!supportedFile(p)) throw Error("Unsupported path");
   if (c.kind !== "text" && c.version && doc2.getMap("blobVersions").has(c.version)) {
     const v = doc2.getMap("blobVersions").get(c.version);
     if (v.path !== p) c = { ...c, version: crypto.randomUUID() };
@@ -9952,7 +10013,7 @@ function put(doc2, p, c, origin) {
       const version = c.version || crypto.randomUUID(), v = { path: p, hash: c.hash, size: c.size };
       validateRef(v);
       const kind = c.kind === "image" ? "image" : "file";
-      if (markdown(p) && kind !== "file" || !markdown(p) && !/\.pdf$/i.test(p) && kind !== "image" || /\.pdf$/i.test(p) && kind !== "file") throw Error("File kind/path mismatch");
+      if (markdown(p) && kind !== "file" || imagePath(p) && kind !== "image" || !imagePath(p) && kind !== "file") throw Error("File kind/path mismatch");
       doc2.getMap("blobVersions").set(version, v);
       files.set(p, { kind, hash: c.hash, size: c.size, version, deleted: false });
       if (markdown(p)) {
@@ -9963,20 +10024,20 @@ function put(doc2, p, c, origin) {
   }, origin);
 }
 function remove(doc2, p, origin) {
-  if (!supported2(p)) throw Error("Unsupported path");
+  if (!supportedFile(p)) throw Error("Unsupported path");
   doc2.transact(() => {
     doc2.getMap("deleted").set(p, true);
-    doc2.getMap("files").set(p, { kind: doc2.getMap("files").get(p)?.kind || (markdown(p) ? "text" : /\.pdf$/i.test(p) ? "file" : "image"), deleted: true });
+    doc2.getMap("files").set(p, { kind: doc2.getMap("files").get(p)?.kind || (markdown(p) ? "text" : imagePath(p) ? "image" : "file"), deleted: true });
   }, origin);
 }
 function validateRef(v) {
-  if (!v || !supported2(v.path) || !/^[a-f0-9]{64}$/.test(v.hash) || !Number.isSafeInteger(v.size) || v.size < 0 || v.size > (markdown(v.path) ? MAX_FILE_TEXT : MAX_BINARY) || Object.keys(v).some((k) => !["path", "hash", "size"].includes(k))) throw Error("Invalid blob reference or per-file size limit");
+  if (!v || !supportedFile(v.path) || !/^[a-f0-9]{64}$/.test(v.hash) || !Number.isSafeInteger(v.size) || v.size < 0 || v.size > maxFileSize(v.path) || Object.keys(v).some((k) => !["path", "hash", "size"].includes(k))) throw Error("Invalid blob reference or per-file size limit");
 }
 function validate(doc2, hasBlob) {
   let total = 0, count = 0, active = 0, inline = 0;
   const names = /* @__PURE__ */ new Set();
   for (const name of doc2.share.keys()) {
-    if (!["files", "deleted", "blobVersions"].includes(name) && !(name.startsWith("text:") && supported2(name.slice(5)) && markdown(name))) throw Error("Invalid V3 document root");
+    if (!["files", "deleted", "blobVersions"].includes(name) && !(name.startsWith("text:") && supportedFile(name.slice(5)) && markdown(name))) throw Error("Invalid V3 document root");
     if (name.startsWith("text:")) {
       const n = new TextEncoder().encode(doc2.getText(name).toString()).length;
       if (n > MAX_INLINE_NOTE) throw Error("Inline note exceeds 16 KiB; explicit whole-file mode required");
@@ -9989,16 +10050,16 @@ function validate(doc2, hasBlob) {
     validateRef(v);
     if (hasBlob && !hasBlob(v.hash, v.size)) throw Error("Referenced blob is not durably uploaded");
   }
-  if (doc2.getMap("deleted").size > MAX_PATHS) throw Error("Tombstone limit 4096");
-  for (const [p, v] of doc2.getMap("deleted")) if (!supported2(p) || v !== true) throw Error("Invalid tombstone");
+  if (doc2.getMap("deleted").size > MAX_PATHS) throw Error("Tombstone limit 8192");
+  for (const [p, v] of doc2.getMap("deleted")) if (!supportedFile(p) || v !== true) throw Error("Invalid tombstone");
   for (const [p, m] of doc2.getMap("files")) {
-    if (!supported2(p) || !m || !["text", "image", "file"].includes(m.kind) || typeof m.deleted !== "boolean" || m.kind === "text" && !markdown(p) || m.kind === "image" && (markdown(p) || /\.pdf$/i.test(p)) || m.kind === "file" && !markdown(p) && !/\.pdf$/i.test(p) || Object.keys(m).some((k) => !["kind", "deleted", "hash", "size", "version"].includes(k))) throw Error("Invalid V3 file metadata");
+    if (!supportedFile(p) || !m || !["text", "image", "file"].includes(m.kind) || typeof m.deleted !== "boolean" || m.kind === "text" && !markdown(p) || m.kind === "image" && !imagePath(p) || m.kind === "file" && imagePath(p) || Object.keys(m).some((k) => !["kind", "deleted", "hash", "size", "version"].includes(k))) throw Error("Invalid V3 file metadata");
     const canonical = p.toLowerCase();
     if (names.has(canonical)) throw Error("Case-insensitive path collision");
     names.add(canonical);
-    if (++count > MAX_PATHS) throw Error("Tracked path limit 4096 including tombstones");
+    if (++count > MAX_PATHS) throw Error("Tracked path limit 8192 including tombstones");
     if (m.deleted || doc2.getMap("deleted").has(p)) continue;
-    if (++active > MAX_ACTIVE_PATHS) throw Error("Active path limit 3000");
+    if (++active > MAX_ACTIVE_PATHS) throw Error("Active path limit 6000");
     if (m.kind === "text") total += new TextEncoder().encode(doc2.getText("text:" + p).toString()).length;
     else {
       validateRef({ path: p, hash: m.hash, size: m.size });
@@ -10006,7 +10067,7 @@ function validate(doc2, hasBlob) {
       if (!v || v.path !== p || v.hash !== m.hash || v.size !== m.size) throw Error("Missing immutable blob version");
       total += m.size;
     }
-    if (total > MAX_LIVE_BYTES) throw Error("Active logical content exceeds 128 MiB; server/cache disk also capped");
+    if (total > MAX_LIVE_BYTES) throw Error("Active logical content exceeds 256 MiB; server/cache disk also capped");
   }
   if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata/text state exceeds 2 MiB");
   return total;
@@ -10018,10 +10079,10 @@ function validatePathOperation(op) {
   if (!op || !UUID.test(op.id) || !["delete", "rename"].includes(op.kind) || Object.keys(op).some((k) => !["id", "kind", "entries"].includes(k)) || !Array.isArray(op.entries) || !op.entries.length || op.entries.length > 3e3 || new TextEncoder().encode(JSON.stringify(op)).length > 2 * 1024 * 1024) throw Error("Invalid protected path operation");
   const sources = /* @__PURE__ */ new Set(), targets = /* @__PURE__ */ new Set();
   for (const e of op.entries) {
-    if (!e || !supported2(e.from) || sources.has(e.from) || Object.keys(e).some((k) => !["from", "to", "base", "target"].includes(k)) || !e.base || !["text", "image", "file"].includes(e.base.kind)) throw Error("Invalid protected source");
+    if (!e || !supportedFile(e.from) || sources.has(e.from) || Object.keys(e).some((k) => !["from", "to", "base", "target"].includes(k)) || !e.base || !["text", "image", "file"].includes(e.base.kind)) throw Error("Invalid protected source");
     sources.add(e.from);
     if (op.kind === "rename") {
-      if (!supported2(e.to) || e.to.toLowerCase() === e.from.toLowerCase() || targets.has(e.to.toLowerCase())) throw Error("Invalid or case-only rename target");
+      if (!supportedFile(e.to) || e.to.toLowerCase() === e.from.toLowerCase() || targets.has(e.to.toLowerCase())) throw Error("Invalid or case-only rename target");
       targets.add(e.to.toLowerCase());
     } else if (e.to !== void 0) throw Error("Delete cannot have target");
   }
@@ -10502,7 +10563,7 @@ var BlobTransfer = class {
 
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
-    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY], beforeUpload: async () => {
+    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], beforeUpload: async () => {
       await options.beforeUpload?.();
       if (this.pending.length) {
         if (!this.blobCache) throw Error("Pending file cache required");
@@ -10517,7 +10578,7 @@ var VaultClientV3 = class extends VaultClient {
     this.onPending = options.onPending;
     this.pending = options.pending?.items || [];
     if (options.pending && (options.pending.protocol !== 3 || options.pending.serverId !== this.serverId || !this.serverId)) throw Error("Pending uploads require matching verified server identity");
-    if (this.pending.length > 3e3) throw Error("Pending reference limit");
+    if (this.pending.length > 6e3) throw Error("Pending reference limit");
     for (const p of this.pending) this.checkPending(p);
     this.binaryBusy = false;
     this.binaryAbort = new AbortController();
@@ -10527,7 +10588,7 @@ var VaultClientV3 = class extends VaultClient {
     this.localSequence = 0;
     this.localOutbox = /* @__PURE__ */ new Map();
     const restored = options.outbox ?? (options.state ? ["*"] : []);
-    if (!Array.isArray(restored) || restored.length > 8192 || restored.some((p) => p !== "*" && !supported2(p))) throw Error("Invalid local outbox");
+    if (!Array.isArray(restored) || restored.length > 8192 || restored.some((p) => p !== "*" && !supportedFile(p))) throw Error("Invalid local outbox");
     for (const p of restored) this.localOutbox.set(p, ++this.localSequence);
     const status = this.onStatus;
     this.onStatus = (s) => {
@@ -10640,10 +10701,10 @@ var VaultClientV3 = class extends VaultClient {
     }
   }
   checkPending(p) {
-    if (!p || !p.version || !/^[a-f0-9-]{36}$/.test(p.version) || !supported2(p.path) || !/^[a-f0-9]{64}$/.test(p.hash) || !Number.isSafeInteger(p.size) || p.size < 0 || p.size > (/\.md$/i.test(p.path) ? MAX_FILE_TEXT : MAX_BINARY)) throw Error("Invalid pending image reference");
+    if (!p || !p.version || !/^[a-f0-9-]{36}$/.test(p.version) || !supportedFile(p.path) || !/^[a-f0-9]{64}$/.test(p.hash) || !Number.isSafeInteger(p.size) || p.size < 0 || p.size > maxFileSize(p.path)) throw Error("Invalid pending image reference");
   }
   async putFile(path, source, options = {}) {
-    if (!supported2(path) || source.size > (/\.md$/i.test(path) ? MAX_FILE_TEXT : MAX_BINARY)) throw Error("Unsupported file or per-type size limit");
+    if (!supportedFile(path) || source.size > maxFileSize(path)) throw Error("Unsupported file or per-type size limit");
     const base = Object.hasOwn(options, "base") ? options.base : content(this.doc, path), version = options.version || crypto.randomUUID();
     const ref = await this.blobs.upload(source, { signal: this.binaryAbort.signal, ...options });
     if (this.stopped) throw Error("Client closed; cached source retained");
@@ -10655,7 +10716,7 @@ var VaultClientV3 = class extends VaultClient {
     }
     this.doc.transact(() => {
       const deleted = options.preserveDeleted && this.doc.getMap("deleted").has(path);
-      put(this.doc, path, { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", ...ref, version });
+      put(this.doc, path, { kind: fileKind(path), ...ref, version });
       if (deleted) remove(this.doc, path);
     });
     return ref;
@@ -10681,11 +10742,11 @@ var VaultClientV3 = class extends VaultClient {
   async stageFile(path, source, options) {
     if (this.binaryBusy) throw Error("Binary operation busy");
     if (!this.serverId || !this.blobCache || !this.onPending) throw Error("Verified identity, durable blob cache and pending persistence required");
-    if (!supported2(path) || source.size > (/\.md$/i.test(path) ? MAX_FILE_TEXT : MAX_BINARY)) throw Error("Unsupported file or per-type size limit");
-    if (this.pending.length >= 3e3) throw Error("Pending reference limit");
+    if (!supportedFile(path) || source.size > maxFileSize(path)) throw Error("Unsupported file or per-type size limit");
+    if (this.pending.length >= 6e3) throw Error("Pending reference limit");
     this.binaryBusy = true;
     try {
-      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), base: previous ? { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", hash: previous.hash, size: previous.size, version: previous.version } : options && Object.hasOwn(options, "base") ? options.base : content(this.doc, path) };
+      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), base: previous ? { kind: fileKind(path), hash: previous.hash, size: previous.size, version: previous.version } : options && Object.hasOwn(options, "base") ? options.base : content(this.doc, path) };
       if (previous?.hash === ref.hash && previous?.size === ref.size) return ref;
       const next = [...this.pending, item];
       await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
@@ -10747,6 +10808,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   recoveryBusy = false;
   recoveryAttempts = 0;
   retryAfter = 0;
+  prepareConnection;
   localOperations = 0;
   diagnosticBusy = false;
   diagnosticLastSent = 0;
@@ -10790,7 +10852,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   fingerprints = /* @__PURE__ */ new Map();
   configWrites = Promise.resolve();
   pendingRows() {
-    const rows = new Map(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [...this.downloadPaths] }).map((r2) => [r2.path, r2]));
+    const rows = new Map(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [.../* @__PURE__ */ new Set([...this.downloadPaths, ...this.settings.receivePending?.paths || []])] }).map((r2) => [r2.path, r2]));
     for (const i of this.settings.pathSafety?.items || []) for (const path of operationPaths(i.op)) rows.set(path, { path, state: i.error ? "\u8DEF\u5F84\u64CD\u4F5C\u5F85\u590D\u6838\uFF1A" + i.error : "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u4F20\u64AD/\u786E\u8BA4" });
     for (const path of this.settings.remoteDeleteReview?.paths || []) rows.set(path, { path, state: "\u8FDC\u7AEF\u6279\u91CF\u5220\u9664\u5F85\u786E\u8BA4" });
     return [...rows.values()];
@@ -10834,7 +10896,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A" + this.conflicts.length });
     if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
-    if ([this.operationError, ...this.fileFailures.values()].some(transientTransferFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u8BF7\u4FDD\u6301 Obsidian \u5728\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
+    if ([this.operationError, ...this.fileFailures.values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u8BF7\u4FDD\u6301 Obsidian \u5728\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
     if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
     for (const row of rows.slice(0, 50)) e.createEl("p", { text: (row.path === "*" ? "\u672C\u5730\u79BB\u7EBF\u5FEB\u7167\u5F85\u6838\u5BF9" : row.path) + " \xB7 " + row.state + (row.error ? " \xB7 " + this.safeError(row.error) : "") });
@@ -10843,7 +10905,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client;
     if (!c || this.stopping || c.stopped || c.transportBlocked || !c.ready || this.initializing || this.recoveryBusy || Date.now() < this.retryAfter) return;
     const errors = [this.operationError, ...this.fileFailures.values()].filter(Boolean);
-    if (!errors.length || !errors.every(transientTransferFailure)) return;
+    if (!errors.length || !errors.every(recoverableSyncFailure)) return;
     this.recoveryBusy = true;
     this.retryAfter = Date.now() + Math.min(6e4, 2e3 * 2 ** Math.min(this.recoveryAttempts++, 5));
     try {
@@ -10869,6 +10931,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       return;
     }
     this.enqueue(async () => {
+      if (!this.syncedOnce && this.prepareConnection) {
+        await this.prepareConnection();
+        return;
+      }
       await this.flushLocalFiles();
       if (c.pending.length) await c.flushPending();
       await this.flushPathSafety();
@@ -10903,7 +10969,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const seen = /* @__PURE__ */ new Set(), model = this.badgeModel(), signature = JSON.stringify(model);
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (!(view instanceof import_obsidian.MarkdownView) || !view.file || !supported2(view.file.path) || mobile && view !== active) continue;
+      if (!(view instanceof import_obsidian.MarkdownView) || !view.file || !supportedFile(view.file.path) || mobile && view !== active) continue;
       seen.add(view);
       let badge = this.badges.get(view);
       if (badge && !badge.el.isConnected) {
@@ -10985,7 +11051,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.15", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.17", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -11021,7 +11087,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   pathBase(path) {
     const pending = [...this.client?.pending || []].reverse().find((p) => p.path === path);
-    if (pending) return { kind: /\.md$|\.pdf$/i.test(path) ? "file" : "image", hash: pending.hash, size: pending.size, version: pending.version };
+    if (pending) return { kind: fileKind(path), hash: pending.hash, size: pending.size, version: pending.version };
     const live = this.client ? content(this.client.doc, path) : null;
     if (live) return live;
     for (const i of [...this.settings.pathSafety?.items || []].reverse()) for (const e of i.op.entries) if (e.to === path) return e.target || e.base;
@@ -11156,7 +11222,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }
     const signature = this.reviewDigest(), prior = this.settings.remoteDeleteReview;
     if (prior?.signature === signature) return;
-    if (bulkDeletion(paths.length, this.app.vault.getFiles().filter((f) => supported2(f.path)).length) || prior) {
+    if (bulkDeletion(paths.length, this.app.vault.getFiles().filter((f) => supportedFile(f.path)).length) || prior) {
       this.settings.remoteDeleteReview = { signature, paths, approved: false };
       await this.persistConfig();
       new import_obsidian.Notice("\u68C0\u6D4B\u5230" + paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\uFF0C\u5DF2\u4FDD\u7559\u672C\u673A\u6587\u4EF6\uFF1B\u8BF7\u6253\u5F00\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4\u786E\u8BA4\u3002");
@@ -11306,12 +11372,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       if (event === "delete") {
         if (this.writing.has(f.path)) return;
         const paths = f instanceof import_obsidian.TFile ? [f.path] : [...this.client.doc.getMap("files").keys()].filter((p) => p.startsWith(f.path + "/"));
-        this.queuePathSafety("delete", paths.filter(supported2).map((from2) => ({ from: from2, base: this.pathBase(from2) })).filter((e) => e.base));
+        this.queuePathSafety("delete", paths.filter(supportedFile).map((from2) => ({ from: from2, base: this.pathBase(from2) })).filter((e) => e.base));
         return;
       }
-      if (!(f instanceof import_obsidian.TFile) || !supported2(f.path) || this.writing.has(f.path)) return;
-      if (this.dirtyFiles.size >= 3e3 && !this.dirtyFiles.has(f.path)) {
-        new import_obsidian.Notice("\u672C\u5730\u5F85\u540C\u6B65\u8DEF\u5F84\u8D85\u8FC73000\uFF0C\u672A\u4E22\u5F03\u539F\u6587\u4EF6\uFF1B\u8BF7\u68C0\u67E5\u5BB9\u91CF\u3002");
+      if (!(f instanceof import_obsidian.TFile) || !supportedFile(f.path) || this.writing.has(f.path)) return;
+      if (this.dirtyFiles.size >= 6e3 && !this.dirtyFiles.has(f.path)) {
+        new import_obsidian.Notice("\u672C\u5730\u5F85\u540C\u6B65\u8DEF\u5F84\u8D85\u8FC76000\uFF0C\u672A\u4E22\u5F03\u539F\u6587\u4EF6\uFF1B\u8BF7\u68C0\u67E5\u5BB9\u91CF\u3002");
         return;
       }
       this.dirtyFiles.set(f.path, f);
@@ -11325,10 +11391,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.fingerprints.delete(from2);
         this.fingerprints.delete(file.path);
         this.dirtyFiles.delete(from2);
-        if (supported2(file.path)) this.dirtyFiles.set(file.path, file);
+        if (supportedFile(file.path)) this.dirtyFiles.set(file.path, file);
       }
-      const plans = moved.filter(({ from: from2 }) => supported2(from2)).map(({ file, from: from2 }) => ({ from: from2, to: file.path, base: this.pathBase(from2) })).filter((e) => e.base);
-      if (plans.every((e) => supported2(e.to))) this.queuePathSafety("rename", plans);
+      const plans = moved.filter(({ from: from2 }) => supportedFile(from2)).map(({ file, from: from2 }) => ({ from: from2, to: file.path, base: this.pathBase(from2) })).filter((e) => e.base);
+      if (plans.every((e) => supportedFile(e.to))) this.queuePathSafety("rename", plans);
       else {
         this.queuePathSafety("delete", plans.map(({ from: from2, base }) => ({ from: from2, base })), true);
         new import_obsidian.Notice("\u6587\u4EF6\u5DF2\u79FB\u51FA\u540C\u6B65\u8303\u56F4\uFF1B\u8FDC\u7AEF\u5220\u9664\u5DF2\u6682\u505C\uFF0C\u8BF7\u67E5\u770B\u8DEF\u5F84\u4FDD\u62A4\u3002");
@@ -11336,7 +11402,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }));
     this.registerEvent(this.app.workspace.on("editor-change", (editor, view) => {
       const c = this.client, p = view.file?.path;
-      if (!c || this.stopping || !this.syncedOnce || !p || this.writing.has(p) || !supported2(p) || content(c.doc, p)?.kind !== "text") return;
+      if (!c || this.stopping || !this.syncedOnce || !p || this.writing.has(p) || !supportedFile(p) || content(c.doc, p)?.kind !== "text") return;
       const data = editor.getValue();
       if (new TextEncoder().encode(data).length > MAX_INLINE_NOTE) return;
       if (c.doc.getText("text:" + p).toString() === data) return;
@@ -11454,13 +11520,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const md = /\.md$/i.test(f.path), known = this.client ? content(this.client.doc, f.path) : null;
     const inline = md && known?.kind !== "file" && (known?.kind === "text" || f.path === "\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md") && f.stat.size <= MAX_INLINE_NOTE;
     if (inline) return { kind: "text", data: await this.app.vault.read(f) };
-    const limit = md ? MAX_FILE_TEXT : MAX_BINARY;
+    const limit = maxFileSize(f.path);
     if (f.stat.size > limit) throw Error("\u6587\u4EF6\u8D85\u8FC7\u5F53\u524D\u7C7B\u578B\u4E0A\u9650\uFF0C\u672A\u8BFB\u53D6\u6216\u4E0A\u4F20\uFF1A" + f.path);
     const key = f.stat.size + ":" + f.stat.mtime, prior = this.fingerprints.get(f.path);
     if (prior?.key === key) return prior.item;
     const bytes = new Uint8Array(await this.app.vault.readBinary(f));
     if (bytes.length > limit) throw Error("\u6587\u4EF6\u8BFB\u53D6\u671F\u95F4\u8D85\u51FA\u4E0A\u9650\uFF1A" + f.path);
-    const ref = await this.cache.stage({ size: bytes.length, read: async (p, n) => bytes.subarray(p, p + n) }), item = { kind: md || /\.pdf$/i.test(f.path) ? "file" : "image", ...ref };
+    const ref = await this.cache.stage({ size: bytes.length, read: async (p, n) => bytes.subarray(p, p + n) }), item = { kind: fileKind(f.path), ...ref };
     this.fingerprints.set(f.path, { key, item });
     return item;
   }
@@ -11505,7 +11571,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     let used = 0;
     for (const f of list.files) used += (await this.app.vault.adapter.stat(f))?.size || 0;
     const size2 = c.kind === "text" ? new TextEncoder().encode(c.data).length : c.size;
-    if (list.files.length >= MAX_DISK_OBJECTS || used + size2 > MAX_DISK_BYTES) throw Error("\u672C\u5730\u6062\u590D\u526F\u672C\u8FBE\u5230256 MiB/4096\u9879\u4E0A\u9650\uFF1B\u4FDD\u7559\u5F53\u524D\u6587\u4EF6\uFF0C\u672A\u8986\u76D6\uFF0C\u8BF7\u5148\u5BFC\u51FA\u6062\u590D\u526F\u672C\u3002");
+    if (list.files.length >= MAX_DISK_OBJECTS || used + size2 > MAX_DISK_BYTES) throw Error("\u672C\u5730\u6062\u590D\u526F\u672C\u8FBE\u5230512 MiB/8192\u9879\u4E0A\u9650\uFF1B\u4FDD\u7559\u5F53\u524D\u6587\u4EF6\uFF0C\u672A\u8986\u76D6\uFF0C\u8BF7\u5148\u5BFC\u51FA\u6062\u590D\u526F\u672C\u3002");
     if (c.kind === "text") await this.app.vault.adapter.write(name, c.data);
     else await this.app.vault.adapter.writeBinary(name, await this.cache.materialize(c));
   }
@@ -11592,47 +11658,48 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
     }, onReady: () => {
-      this.enqueue(async () => {
-        if (this.client !== c) return;
-        this.initializing = true;
-        try {
-          await this.flushLocalFiles();
-          if (c.pending.length) await c.flushPending();
-          await this.flushPathSafety();
-          if (first) {
-            new import_obsidian.Notice("\u6587\u4EF6\u6A21\u5F0F\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md\uFF08\u226416 KiB\uFF09\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59\u65B0 Markdown \u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\u3002");
-            const remote = entries(c.doc);
-            await c.batchFiles(async () => {
-              for (const f of this.app.vault.getFiles().filter((f2) => supported2(f2.path))) {
-                if (this.pathBlocked(f.path)) continue;
-                const local = await this.read(f), r2 = remote[f.path];
-                const meta = c.doc.getMap("files").get(f.path);
-                if (r2) {
-                  if (!equal(local, r2)) await this.backup(f.path, local);
-                } else if (meta?.deleted || c.doc.getMap("deleted").has(f.path)) {
-                  await this.backup(f.path, local);
-                } else if (!hadState || !meta) await this.upload(f);
-              }
-            });
-            first = false;
-          }
-          this.syncedOnce = true;
-          await this.refreshConflicts();
-          await this.reflect();
-          this.refresh();
-          const confirmed = await c.confirmUploads();
-          if (c.ready && !this.stopping) {
-            this.setConnectionStatus(confirmed && !this.pendingRows().length ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
-            if (confirmed && !this.fileFailures.size && !this.pendingRows().length) {
-              if (transientTransferFailure(this.operationError)) this.operationError = "";
-              new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
-            }
-          }
-        } finally {
-          this.initializing = false;
-        }
-      });
+      this.enqueue(this.prepareConnection);
     } });
+    this.prepareConnection = async () => {
+      if (this.client !== c) return;
+      this.initializing = true;
+      try {
+        await this.flushLocalFiles();
+        if (c.pending.length) await c.flushPending();
+        await this.flushPathSafety();
+        if (first) {
+          new import_obsidian.Notice("\u6587\u4EF6\u6A21\u5F0F\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md\uFF08\u226416 KiB\uFF09\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59\u65B0 Markdown \u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\u3002");
+          const remote = entries(c.doc);
+          await c.batchFiles(async () => {
+            for (const f of this.app.vault.getFiles().filter((f2) => supportedFile(f2.path))) {
+              if (this.pathBlocked(f.path)) continue;
+              const local = await this.read(f), r2 = remote[f.path];
+              const meta = c.doc.getMap("files").get(f.path);
+              if (r2) {
+                if (!equal(local, r2)) await this.backup(f.path, local);
+              } else if (meta?.deleted || c.doc.getMap("deleted").has(f.path)) {
+                await this.backup(f.path, local);
+              } else if (!hadState || !meta) await this.upload(f);
+            }
+          });
+          first = false;
+        }
+        this.syncedOnce = true;
+        await this.refreshConflicts();
+        await this.reflect();
+        this.refresh();
+        const confirmed = await c.confirmUploads();
+        if (c.ready && !this.stopping) {
+          this.setConnectionStatus(confirmed && !this.pendingRows().length ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
+          if (confirmed && !this.fileFailures.size && !this.pendingRows().length) {
+            if (recoverableSyncFailure(this.operationError)) this.operationError = "";
+            new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
+          }
+        }
+      } finally {
+        this.initializing = false;
+      }
+    };
     this.client = c;
     c.doc.on("update", (_u, origin) => {
       this.digestCache = void 0;
@@ -11643,7 +11710,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
     });
     if (hadState) {
-      const missing = [.../* @__PURE__ */ new Set([...Object.keys(entries(c.doc)), ...c.pending.map((p) => p.path)])].filter((p) => !this.app.vault.getAbstractFileByPath(p) && !this.pathBlocked(p));
+      const missing = [.../* @__PURE__ */ new Set([...Object.keys(entries(c.doc)), ...c.pending.map((p) => p.path)])].filter((p) => !this.app.vault.getAbstractFileByPath(p) && !this.pathBlocked(p) && !(this.settings.receivePending?.serverId === c.serverId && this.settings.receivePending?.paths.includes(p)));
       if (missing.length) {
         const choice = await this.resolveMissing(missing);
         if (choice === "cancel") {
@@ -11652,7 +11719,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         }
         if (choice === "delete") this.queuePathSafety("delete", missing.map((from2) => ({ from: from2, base: this.pathBase(from2) })).filter((e) => e.base), false, true);
       }
-      for (const f of this.app.vault.getFiles().filter((f2) => supported2(f2.path))) {
+      for (const f of this.app.vault.getFiles().filter((f2) => supportedFile(f2.path))) {
         if (this.pathBlocked(f.path)) continue;
         const local = await this.read(f), known = content(c.doc, f.path), meta = c.doc.getMap("files").get(f.path);
         if (meta?.deleted || c.doc.getMap("deleted").has(f.path)) {
@@ -11672,10 +11739,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client;
     if (!c?.ready || this.stopping) return;
     const files = c.doc.getMap("files");
+    await this.checkpointReceives();
     await this.prepareRemoteDeletes();
     for (const [p, m] of [...files].sort((a, b) => Number(!!(a[1].deleted || c.doc.getMap("deleted").has(a[0]))) - Number(!!(b[1].deleted || c.doc.getMap("deleted").has(b[0]))))) {
       if (this.stopping || this.client !== c) return;
-      if (!supported2(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
+      if (!supportedFile(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
       try {
         const f = this.app.vault.getAbstractFileByPath(p);
         if (m.deleted || c.doc.getMap("deleted").has(p)) {
@@ -11706,7 +11774,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         if (bound && item.kind === "text") continue;
         if (f instanceof import_obsidian.TFile) {
           const old = await this.read(f);
-          if (equal(old, item)) continue;
+          if (equal(old, item)) {
+            await this.received(p);
+            this.fileFailures.delete(p);
+            continue;
+          }
           await this.backup(p, old);
         }
         await this.parents(p);
@@ -11749,10 +11821,15 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           const written = this.app.vault.getAbstractFileByPath(p);
           if (written instanceof import_obsidian.TFile) this.fingerprints.set(p, { key: written.stat.size + ":" + written.stat.mtime, item });
         }
+        await this.received(p);
         this.fileFailures.delete(p);
       } catch (e) {
         this.fileFailures.set(p, this.safeError(e));
         this.updateProgress();
+        if (transientFilesystemFailure(e)) {
+          this.cache.invalidateQuota();
+          break;
+        }
       }
     }
     if (this.settings.remoteDeleteReview?.approved && this.settings.remoteDeleteReview.paths.every((p) => !this.app.vault.getAbstractFileByPath(p))) {
@@ -11761,6 +11838,33 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }
     this.refresh();
     this.updateProgress();
+  }
+  // Record receive intent before any file mutation. Only these never-present
+  // paths may resume without interpreting a genuine local deletion as a download.
+  async checkpointReceives() {
+    const c = this.client;
+    if (!c?.serverId) return;
+    const prior = this.settings.receivePending;
+    if (prior && prior.serverId !== c.serverId) throw Error("\u63A5\u6536\u8BA1\u5212\u7ED1\u5B9A\u5176\u4ED6\u670D\u52A1\u5668\uFF0C\u672A\u5E94\u7528");
+    if (prior && (!Array.isArray(prior.paths) || prior.paths.length > 6e3 || prior.paths.some((p) => !supportedFile(p)))) throw Error("Invalid receive checkpoint");
+    const paths = new Set((prior?.paths || []).filter((p) => content(c.doc, p)));
+    for (const p of Object.keys(entries(c.doc))) if (!this.app.vault.getAbstractFileByPath(p) && !this.pathBlocked(p) && !c.pending.some((x) => x.path === p)) paths.add(p);
+    if (paths.size !== prior?.paths.length || prior?.paths.some((p) => !paths.has(p))) {
+      this.settings.receivePending = { serverId: c.serverId, paths: [...paths] };
+      await this.persistConfig();
+    }
+  }
+  async received(path) {
+    const plan = this.settings.receivePending;
+    if (plan?.serverId !== this.client?.serverId || !plan?.paths.includes(path)) return;
+    const next = { serverId: plan.serverId, paths: plan.paths.filter((p) => p !== path) };
+    this.settings.receivePending = next;
+    try {
+      await this.persistConfig();
+    } catch (e) {
+      this.settings.receivePending = plan;
+      throw e;
+    }
   }
   async parents(p) {
     const parts = p.split("/");
@@ -11779,7 +11883,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       const view = leaf.view;
       if (!(view instanceof import_obsidian.MarkdownView)) continue;
       const cm = view.editor.cm, p = view.file?.path;
-      if (!cm || !p || !supported2(p) || content(c.doc, p)?.kind !== "text") continue;
+      if (!cm || !p || !supportedFile(p) || content(c.doc, p)?.kind !== "text") continue;
       seen.add(cm);
       const prior = this.bindings.get(cm);
       if (prior?.path === p) continue;
@@ -11841,12 +11945,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     m.titleEl.setText("\u53EA\u8BFB\u8FC1\u79FB\u9884\u89C8\uFF08\u4E0D\u6267\u884C\u590D\u5236\uFF09");
     m.open();
     try {
-      const files = this.app.vault.getFiles(), accepted = files.filter((f) => supported2(f.path) && f.stat.size <= (/\.md$/i.test(f.path) ? MAX_FILE_TEXT : MAX_BINARY)), excluded = files.filter((f) => !accepted.includes(f)).map((f) => ({ path: f.path, size: f.stat.size, reason: "\u4E0D\u652F\u6301\u7C7B\u578B\u3001\u63A7\u5236/\u9690\u85CF\u6587\u4EF6\u6216\u8D85\u8FC7\u5355\u6587\u4EF6\u4E0A\u9650\uFF1B\u4EC5\u5217\u5143\u6570\u636E\uFF0C\u672A\u8BFB\u53D6\u6B63\u6587" }));
+      const files = this.app.vault.getFiles(), accepted = files.filter((f) => supportedFile(f.path) && f.stat.size <= maxFileSize(f.path)), excluded = files.filter((f) => !accepted.includes(f)).map((f) => ({ path: f.path, size: f.stat.size, reason: "\u4E0D\u652F\u6301\u7C7B\u578B\u3001\u63A7\u5236/\u9690\u85CF\u6587\u4EF6\u6216\u8D85\u8FC7\u5355\u6587\u4EF6\u4E0A\u9650\uFF1B\u4EC5\u5217\u5143\u6570\u636E\uFF0C\u672A\u8BFB\u53D6\u6B63\u6587" }));
       const result = await inventory(accepted.map((f) => ({ path: f.path, size: f.stat.size })), async (p) => {
         const f = this.app.vault.getAbstractFileByPath(p);
         if (!(f instanceof import_obsidian.TFile)) throw Error("\u6587\u4EF6\u5DF2\u53D8\u5316\uFF1A" + p);
         return this.app.vault.readBinary(f);
-      });
+      }, { supported: supportedFile, maxFileSize });
       let remoteReport;
       const remote = this.client?.ready ? entries(this.client.doc) : void 0;
       if (remote) m.contentEl.createEl("pre", { text: JSON.stringify({ remoteReferences: remote }, null, 2) });
@@ -12044,14 +12148,17 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       else if (v.kind === "text") m.contentEl.createEl("pre", { cls: "rl-history-preview", text: v.data });
       else {
         m.contentEl.createEl("p", { text: "\u6587\u4EF6\u5927\u5C0F\uFF1A" + v.size + " \u5B57\u8282" });
-        if (/\.md$|\.(png|jpe?g|gif|webp)$/i.test(path)) {
+        if (textPreviewPath(path) || /\.(png|jpe?g|gif|webp)$/i.test(path)) {
           if (!await this.cache.has(v)) await c.blobs.download(v, this.cache.sink(v));
           if (closed) return;
           const bytes = await this.cache.materialize(v);
-          if (/\.md$/i.test(path)) {
-            const text2 = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-            m.contentEl.createEl("pre", { cls: "rl-history-preview", text: text2.slice(0, 2e4) });
-            if (text2.length > 2e4) m.contentEl.createEl("p", { text: "\u9884\u89C8\u4EC5\u663E\u793A\u524D20000\u5B57\u7B26\uFF0C\u6062\u590D\u4F7F\u7528\u5B8C\u6574\u7248\u672C\u3002" });
+          if (textPreviewPath(path)) {
+            const text2 = decodeTextPreview(bytes);
+            if (text2 === null) m.contentEl.createEl("p", { text: "\u6B64\u6587\u4EF6\u4E0D\u662F UTF-8 \u6587\u672C\uFF1B\u4ECD\u53EF\u6309\u539F\u59CB\u5B57\u8282\u6062\u590D\uFF0C\u4E0D\u8F6C\u6362\u7F16\u7801\u3002" });
+            else {
+              m.contentEl.createEl("pre", { cls: "rl-history-preview", text: text2.slice(0, 2e4) });
+              if (text2.length > 2e4) m.contentEl.createEl("p", { text: "\u9884\u89C8\u4EC5\u663E\u793A\u524D20000\u5B57\u7B26\uFF0C\u6062\u590D\u4F7F\u7528\u5B8C\u6574\u7248\u672C\u3002" });
+            }
           } else {
             imageURL = URL.createObjectURL(new Blob([bytes], { type: /\.png$/i.test(path) ? "image/png" : /\.jpe?g$/i.test(path) ? "image/jpeg" : /\.gif$/i.test(path) ? "image/gif" : "image/webp" }));
             m.contentEl.createEl("img", { cls: "rl-history-image", attr: { src: imageURL, alt: "\u5386\u53F2\u56FE\u7247\u9884\u89C8" } });
@@ -12189,7 +12296,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     this.p.renderProgress();
     new import_obsidian.Setting(e).addButton((b) => b.setButtonText("\u5237\u65B0\u72B6\u6001").onClick(() => this.p.renderProgress())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.p.retryQueue()));
     new import_obsidian.Setting(e).setName("\u8BEF\u7F6E\u65E7\u534F\u8BAE\u8BBE\u7F6E").addButton((b) => b.setButtonText("\u5907\u4EFD\u5E76\u6E05\u7A7A\u65E7\u72B6\u6001").onClick(() => void this.p.backupRejectedState()));
-    e.createEl("p", { text: "\u4EC5 Realtime-Lab-V3-Files- \u72EC\u7ACB\u6D4B\u8BD5\u5E93\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u548C PDF\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u6D3B\u52A8\u5185\u5BB9\u2264128 MiB\u3001\u6700\u591A3000\u6D3B\u52A8\u8DEF\u5F84/4096\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264256 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
+    e.createEl("p", { text: "\u4EC5 Realtime-Lab-V3-Files- \u72EC\u7ACB\u6D4B\u8BD5\u5E93\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u6D3B\u52A8\u5185\u5BB9\u2264256 MiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264512 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
     new import_obsidian.Setting(e).setName("\u521B\u5EFA\u6216\u52A0\u5165\u5411\u5BFC").addButton((b) => b.setButtonText("\u914D\u7F6E\u8FDE\u63A5").onClick(() => void this.p.setupConnection()));
     new import_obsidian.Setting(e).setName("\u53EA\u8BFB\u6587\u4EF6\u53CA\u9644\u4EF6\u6E05\u5355").addButton((b) => b.setButtonText("\u9884\u89C8\uFF0C\u4E0D\u8FC1\u79FB").onClick(() => void this.p.previewInventory()));
     new import_obsidian.Setting(e).setName("\u521D\u59CB\u5316\u72EC\u7ACB\u6D4B\u8BD5\u5E93").addButton((b) => b.setButtonText("\u521D\u59CB\u5316").onClick(() => void this.p.initialize()));

@@ -1,11 +1,20 @@
-# Realtime Lab Files 0.5.0-alpha.15
+# Realtime Lab Files 0.5.0-alpha.17
 
-新增删除与重命名保护：计划先绑定原服务器并持久化，备份后才传播。服务器整组校验源内容/整文件版本及目标占用；任一失败整组拒绝。目录改名原子提交；确认丢失后重试使用原计划回执，不重复生成版本或备份。
+BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Isolated initialized Realtime-Lab-V3-Files- vaults only. Update without resetting notes, cache, pending uploads, snapshots, URL, token or server identity.
 
-5个文件，或至少3个且占活动文件25%的删除会暂停确认；5个及以上路径的目录改名、移出支持范围也需审核。远端批量删除保留本机文件等待批准，删除代次或文档变化使旧批准失效，未展示的新操作不会自动获批。新文件先写入，备份和本机状态检查后才删除源；备份失败或接收失败保留文件。取消传播时不同内容另存可见恢复副本，不覆盖远端同名目标。
+## Important server compatibility
+Requires versioned-files-v1 AND general-files-v1 on the isolated server (alpha.16 or newer). The old alpha.15 public test service is NOT compatible. An incompatible connection is rejected before metadata exchange; do not clear state or replace the endpoint on an existing mobile vault. Use a separate empty mobile rehearsal vault for the large-vault exercise; retain the old test vault unchanged. This release does not upgrade or expose a server.
 
-命令/设置/同步详情：查看删除与重命名保护。批准不强行覆盖已变化版本；受阻操作可取消并保留双方。新服务器不支持时不退回直接删除。仅大小写改名暂需临时名；内部链接由Obsidian自动更新，本插件同步已保存结果，不批量改写其他笔记。保护需两端升级alpha.15；旧客户端保持协议兼容但仍是旧删除行为。
+## Changes
+Removes quadratic full-cache quota scans: rebuild private accounting once on open/error, then serialize and account new reservations incrementally. Partial and historical blobs remain included; no cache/history eviction. Recognized temporary filesystem errors retry through bounded backoff and reconciliation, rather than blindly repeating native mutations. Durable, server-bound receive checkpoints resume unfinished downloads after reopening; previously completed missing files still require explicit restore/delete direction. Pending paths include unfinished receives.
 
-205项完整测试、类型检查、构建通过。隔离测试覆盖停用/离线操作、插件重启、上传中断32KiB续传、丢失确认重试、整组目标冲突、过期批准、恢复副本和队列保留；已有SIGKILL用例只针对隔离进程的持久化队列。公网软件V15操作端与现有Mac V14接收端合成联调通过，原有26个文件、历史和连接状态保留。V15原生界面及iPhone真机异常场景待更新后验收，未强退实际Obsidian。
+Includes alpha.16 opaque JSON/CSV/JSONL/HTML/Python/TXT/LOG/ZIP/backup transfer and safe plain-text previews. Files are never executed or unzipped. Active data <=256 MiB/6000 paths, tracked paths <=8192, metadata <=2 MiB, cache <=512 MiB/8192 objects; Markdown/general data <=16 MiB, images/PDF <=5 MiB. Hidden/configuration/recovery paths remain excluded. Never enable LiveSync in the same rehearsal vault.
 
-只在已初始化Realtime-Lab-V3-Files-独立测试库使用。服务已备份更新；原地址/令牌/隧道路由不变，插件仅发布，不重置现有测试库。手机与Mac可原地更新，无需初始化或重复输入。容量/备份及回执上限、构建命令见source.zip中的V3-FILES.md。
+## Validation and limits
+220 serial automated tests, typecheck and build passed. A legacy 4-second convergence test exceeded its deadline under full parallel suite load; isolated and bounded full reruns passed without changing that test. Native Mac Obsidian received and verified all 2,944 real rehearsal files (119,752,446 bytes), then reopened without changing original file bytes, modification times or connection settings. 320 additional synthetic files verified; 20 unfinished attachments, including a 32 KiB partial cache, automatically completed after a scoped service pause and vault close/reopen. Final pending/failed/conflicts all zero. Production files and old rehearsal content remained unchanged.
+
+Physical iPhone large-vault first-sync and restart acceptance is pending after this release. This does not establish iOS background execution, unsaved-keystroke durability, power-loss recovery or production migration readiness. The exact historical alpha.16 stalled native operation was not recorded; cache amplification and missing filesystem retry support are confirmed fixes, and that native timeout did not recur in this run.
+
+## Source and build
+source.zip is an allowlisted source snapshot without notes, configs, credentials, runtime data or node_modules. npm ci; npm run typecheck; node --test --test-concurrency=1 test/*.test.mjs; npm run build:v3-files. Use manifest.v3-files.json.
+Source commit: f0abd5cbbe74e0eb9f008fec9134bd8fe508d717

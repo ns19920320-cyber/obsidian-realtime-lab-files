@@ -9894,6 +9894,52 @@ function queueRows({ metadata = [], files = [], dirty = [], failures = [], downl
   return [...rows.values()];
 }
 
+function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0 }) {
+  let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
+  if (error) {
+    tone = "error";
+    icon = "alert-circle";
+    label = "\u9700\u5904\u7406";
+  } else if (!ready && connecting) {
+    tone = "busy";
+    icon = "refresh-cw";
+    label = "\u8FDE\u63A5\u4E2D";
+    busy = true;
+  } else if (ready && (preparing || receiving || uploads || downloads || unknown)) {
+    tone = "busy";
+    icon = "refresh-cw";
+    label = preparing ? "\u51C6\u5907\u4E2D" : receiving ? "\u63A5\u6536\u4E2D" : "\u540C\u6B65\u4E2D";
+    busy = true;
+  } else if (ready && !confirmed) {
+    tone = "waiting";
+    icon = "clock";
+    label = "\u5F85\u786E\u8BA4";
+  } else if (ready) {
+    tone = "confirmed";
+    icon = "check";
+    label = "\u5DF2\u786E\u8BA4";
+  }
+  const counts = tone === "confirmed" ? known + "\u9879" : uploads || downloads || unknown ? "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads : "";
+  return { tone, icon, label, busy, counts, description: label + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
+}
+var badgeCSS = `
+.view-header .rl-sync-badge{display:inline-flex!important;align-items:center;gap:5px;width:auto;height:auto;flex-shrink:0;max-width:190px;min-height:28px;margin-inline-end:5px;padding:4px 9px;border:1px solid var(--background-modifier-border);border-radius:999px;background:var(--background-secondary);color:var(--text-muted);font-size:11px;font-weight:550;line-height:1.2;white-space:nowrap;cursor:pointer;box-shadow:0 1px 2px rgb(0 0 0 / 3%);transition:background .15s,border-color .15s}
+.rl-sync-badge .rl-sync-icon{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.rl-sync-badge .rl-sync-icon svg{width:14px;height:14px;stroke-width:1.8}
+.rl-sync-badge .rl-sync-label{overflow:hidden;text-overflow:ellipsis}
+.rl-sync-badge .rl-sync-counts{padding-inline-start:5px;border-inline-start:1px solid var(--background-modifier-border);color:var(--text-muted);font-size:10px;font-variant-numeric:tabular-nums;letter-spacing:.2px}
+.view-header .rl-sync-badge[data-tone=confirmed]{color:var(--color-green,#38966d);background:color-mix(in srgb,var(--color-green,#38966d) 7%,var(--background-primary))}
+.view-header .rl-sync-badge[data-tone=busy]{color:var(--interactive-accent);background:color-mix(in srgb,var(--interactive-accent) 7%,var(--background-primary))}
+.view-header .rl-sync-badge[data-tone=error]{color:var(--text-error);background:color-mix(in srgb,var(--text-error) 7%,var(--background-primary))}
+.view-header .rl-sync-badge:hover{border-color:var(--interactive-accent);background:var(--background-modifier-hover)}
+.view-header .rl-sync-badge:focus-visible{outline:2px solid var(--interactive-accent);outline-offset:2px}
+.rl-sync-badge[data-busy=true] .rl-sync-icon svg{animation:rl-sync-spin 1.5s linear infinite}
+body.is-mobile .view-header .rl-sync-badge{min-height:32px;padding:5px 8px;gap:4px;margin-inline-end:3px;max-width:170px}
+.rl-sync-details-note{color:var(--text-muted);font-size:var(--font-ui-small);line-height:1.6}
+@keyframes rl-sync-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.rl-sync-badge .rl-sync-icon svg{animation:none!important}.view-header .rl-sync-badge{transition:none}}
+`;
+
 var SnapshotScheduler = class {
   constructor({ capture, persist, delayMs = 0, lastState = "", onError = () => {
   } }) {
@@ -10631,6 +10677,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.statusDetail?.setText(s);
     this.updateProgress();
   }
+  badges = /* @__PURE__ */ new Map();
+  badgeStyle;
+  detailPanels = /* @__PURE__ */ new Set();
+  detailModals = /* @__PURE__ */ new Set();
   cache;
   legacyConfig = null;
   fingerprints = /* @__PURE__ */ new Map();
@@ -10658,8 +10708,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   renderProgress() {
     const headline = this.summaryStatus();
     this.status?.setText("Realtime Lab V3\uFF1A" + headline);
-    const e = this.syncPanel;
-    if (!e) return;
+    this.syncBadges();
+    for (const e of [...this.syncPanel ? [this.syncPanel] : [], ...this.detailPanels]) this.renderPanel(e, headline);
+  }
+  renderPanel(e, headline) {
     e.empty();
     const c = this.client, rows = this.pendingRows();
     e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
@@ -10689,6 +10741,71 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.updateProgress();
     });
   }
+  badgeModel() {
+    const c = this.client, uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
+    const unknown = uploads.delete("*");
+    return badgeState({ ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size, unknown, known: c ? Object.keys(entries(c.doc)).length : 0 });
+  }
+  syncBadges() {
+    if (!this.app.vault.getName().startsWith("Realtime-Lab-V3-Files-")) return;
+    const seen = /* @__PURE__ */ new Set(), model = this.badgeModel(), signature = JSON.stringify(model);
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!(view instanceof import_obsidian.MarkdownView) || !view.file || !supported2(view.file.path)) continue;
+      seen.add(view);
+      let badge = this.badges.get(view);
+      if (badge && !badge.el.isConnected) {
+        badge.el.remove();
+        this.badges.delete(view);
+        badge = void 0;
+      }
+      if (!badge) {
+        const el = view.addAction("refresh-cw", "\u540C\u6B65\u72B6\u6001", () => this.openSyncDetails());
+        el.empty();
+        el.addClass("rl-sync-badge");
+        el.setAttribute("role", "button");
+        el.tabIndex = 0;
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            el.click();
+          }
+        });
+        badge = { el, icon: el.createSpan({ cls: "rl-sync-icon" }), label: el.createSpan({ cls: "rl-sync-label" }), counts: el.createSpan({ cls: "rl-sync-counts" }), signature: "" };
+        this.badges.set(view, badge);
+      }
+      if (badge.signature !== signature) {
+        (0, import_obsidian.setIcon)(badge.icon, model.icon);
+        badge.label.setText(model.label);
+        badge.counts.setText(model.counts);
+        badge.counts.hidden = !model.counts;
+        badge.el.dataset.tone = model.tone;
+        badge.el.dataset.busy = String(model.busy);
+        badge.el.setAttribute("aria-label", model.description);
+        badge.el.setAttribute("title", model.description);
+        badge.signature = signature;
+      }
+    }
+    for (const [view, badge] of this.badges) if (!seen.has(view)) {
+      badge.el.remove();
+      this.badges.delete(view);
+    }
+  }
+  openSyncDetails() {
+    const m = new import_obsidian.Modal(this.app);
+    m.titleEl.setText("\u540C\u6B65\u72B6\u6001");
+    const panel = m.contentEl.createDiv();
+    this.detailPanels.add(panel);
+    this.detailModals.add(m);
+    m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u2191 \u5F85\u4E0A\u4F20\u6216\u7B49\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF1B\u2193 \u5F53\u524D\u63A5\u6536\u4E2D\u7684\u8DEF\u5F84\u6570\u3002\u201C\u5DF2\u786E\u8BA4 N\u9879\u201D\u8868\u793A\u5F53\u524D\u5E93\u4E2D\u670D\u52A1\u5668\u5DF2\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF0C\u4E0D\u662F\u6240\u6709\u8BBE\u5907\u7684\u56DE\u6267\uFF1B\u4E0D\u663E\u793A\u4F30\u7B97\u767E\u5206\u6BD4\u3002" });
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    m.onClose = () => {
+      this.detailPanels.delete(panel);
+      this.detailModals.delete(m);
+    };
+    m.open();
+    this.renderProgress();
+  }
   async persistConfig() {
     if (this.legacyConfig) throw Error("\u65E7\u8BBE\u7F6E\u5C1A\u672A\u5907\u4EFD\uFF1B\u62D2\u7EDD\u8986\u76D6");
     const snapshot = structuredClone(this.settings);
@@ -10697,6 +10814,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     await this.configWrites;
   }
   async onload() {
+    if (document.head) {
+      this.badgeStyle = document.createElement("style");
+      this.badgeStyle.textContent = badgeCSS;
+      document.head.appendChild(this.badgeStyle);
+    }
     const loaded = await this.loadData();
     if (loaded && (loaded.protocol !== 3 || loaded.capability !== FILE_REFS_CAPABILITY)) this.legacyConfig = loaded;
     else this.settings = { ...this.settings, ...loaded };
@@ -10760,8 +10882,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }));
     this.registerEvent(this.app.workspace.on("layout-change", () => {
       this.refresh();
+      this.updateProgress();
       if (this.client?.ready) this.reflection.request();
     }));
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.updateProgress()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.updateProgress()));
     this.registerDomEvent(document, "visibilitychange", () => {
       if (!document.hidden) this.client?.resume();
     });
@@ -11294,6 +11419,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.stop();
     window.clearTimeout(this.progressTimer);
     this.syncPanel = void 0;
+    for (const m of [...this.detailModals]) m.close();
+    for (const b of this.badges.values()) b.el.remove();
+    this.badges.clear();
+    this.badgeStyle?.remove();
   }
 };
 var Settings = class extends import_obsidian.PluginSettingTab {

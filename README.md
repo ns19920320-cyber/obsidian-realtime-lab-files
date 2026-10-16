@@ -1,22 +1,24 @@
-# Realtime Lab Files 0.5.0-alpha.22
+# Realtime Lab Files 0.5.0-alpha.23
 
 BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Isolated initialized Realtime-Lab-V3-Files- vaults only.
 
-## Small-file batches and download/write pipeline
-When a verified server advertises small-blob-batch-v1, receive up to 16 blobs of at most 32 KiB each in one authenticated GET, with a 256 KiB total response limit. Every response must match the verified metadata server identity; every file hash and exact response length is checked before exposing any bytes to the cache. The server accepts only bounded references to committed blobs. Large files keep the existing bounded frame path. Old servers automatically use the previous per-file path.
+## Optional remote transfer counters
+On servers advertising device-transfer-counters-v1, device reports now include strictly validated numeric batch request/file/byte/error counts, large-range request/byte/error counts, and ordinary chunk request/byte/error counts. Counters are in memory since plugin load. Batch file counts mean verified receive events, can include repeats, and do NOT mean unique files written to the vault. Request errors are historical totals, separate from the current retry queue. No paths, names, URLs, note text or credentials are reported. Older device reports and older servers remain compatible.
 
-One request ahead overlaps the next batch download with current cache and native vault writes. At most two batch payloads (512 KiB) are retained, plus existing bounded transfer/cache overhead; writes remain serial. Durable receive intent is retained until each file is actually written and checkpointed. Stopping drains pending native HTTP requests, and cached verified files can be reused after reconnect or restart. Existing pending uploads, notes, history, server/device identities, endpoint and token are preserved. Identity/authentication/hash failures are never bypassed. A local file newly marked dirty during download is not overwritten.
+## Bounded large-file downloads
+Phone alpha.22 timing showed roughly 17.4 MiB received over 100 seconds, with about 92.6 seconds of native HTTP waiting and 0.19 seconds of vault writing in that interval. This points to request overhead, not file writes, as the dominant measured cost. Native HTTP timing includes the bridge, network and response processing, not pure wire latency.
 
-## Same-file controlled benchmark
-The SAME 96 synthetic small files were tested against an isolated loopback server with injected 40 ms/request latency and 8 ms/native write delay. Previous single-file path: 6756 ms / 96 requests. Batch only: 2806 ms / 6 requests. Batch pipeline: 2711 ms / 6 requests. Interrupted after 21 files and reopened the same cache: all 96 files finished with matching bytes, 8 total requests and no pending files. This is a controlled synthetic comparison, NOT a physical iPhone speed claim or comparison with LiveSync. Physical iPhone acceptance follows a BRAT update in the existing rehearsal vault.
+When bounded-blob-range-v1 is advertised and response identity verification is supported, large downloads request up to 256 KiB at a time, with at most two ranges in flight. The response is split into original 32 KiB cache writes, preserving existing partial-cache offsets, final hashes and ordered writes. Every response remains tied to the verified server identity. Uploads, cache format and durable queues are unchanged. Old servers fall back to the prior small-frame path. Native HTTP remains uncancellable; shutdown drains bounded in-flight work before releasing its lane.
 
-## Validation
-252 automated tests, typecheck and build passed. Coverage includes bounded batches, unauthenticated rejection, wrong identity and corrupt response rejection, exact lengths, cache reuse on restart, native response limits, prefetch while native writes are blocked, durable receive checkpoints, failed batch recovery and previous single-file compatibility/recovery tests.
+## Same-file validation
+The SAME three synthetic large files (6291505 bytes total) were compared on an isolated loopback server with 40 ms/request and 3 ms/cache-write delay. Alpha.22-sized frames: 2472 ms / 195 requests. Alpha.23 bounded ranges: 1098 ms / 27 requests. Interrupted after three original-size cache chunks and resumed at the retained 98304-byte offset: 1101 ms / 28 requests, all file bytes verified. This controlled result is NOT a physical iPhone speed claim or a LiveSync comparison.
 
-## Safe update
-Only the isolated rehearsal backend is enhanced; existing data is backed up and checked unchanged, old clients remain compatible. Update through BRAT in the SAME isolated rehearsal vault. Do not reinitialize, clear state, change endpoint/token, or retype test notes. Keep LiveSync disabled in the rehearsal vault. Production vaults and other server routes are untouched.
+260 automated tests, typecheck and build passed, including range bounds, original-size cache writes, identity/length rejection, preserved resume offsets, capability fallback, numeric diagnostic privacy and real-server report round trips. All previous batch, conflict, history, queue and recovery tests are retained.
+
+## Preserve the completed rehearsal
+Before this update, the phone reported all 3287 files complete with no queued receives/uploads, failures or conflicts. Only the isolated rehearsal backend is upgraded after backup, with snapshot bytes, server identity and token checked unchanged. Production notes and other routes are untouched. Update through BRAT in the SAME rehearsal vault. Do not reinitialize, clear cache/queues, change endpoint/token, or retype test notes. A completed vault may correctly show zero new transfer counters after update; files are not forced to download again merely to increase counters. Phone alpha.23 acceptance follows the update.
 
 ## Source
 source.zip contains allowlisted source, tests and build files only. Notes, settings, credentials, runtime data, private diagnostics and node_modules are excluded. Build: npm ci; npm run typecheck; node --test --test-concurrency=1 test/*.test.mjs; npm run build:v3-files.
 
-Source commit: 2875f908b5ff34700153b3d2404637ea14b88a1a
+Source commit: f1ebe0dbe2469f31d43d02cb7549fcebd6e6de0b

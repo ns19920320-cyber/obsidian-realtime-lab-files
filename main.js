@@ -33,6 +33,27 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var TRANSFER_COUNTERS_CAPABILITY = "device-transfer-counters-v1";
+var RANGE_CAPABILITY = "bounded-blob-range-v1";
+var RANGE_BYTES = 256 * 1024;
+var kinds = ["batch", "range", "chunk"];
+var fields = ["batchRequests", "batchFiles", "batchBytes", "batchErrors", "rangeRequests", "rangeBytes", "rangeErrors", "chunkRequests", "chunkBytes", "chunkErrors"];
+var TransferCounters = class {
+  constructor() {
+    this.data = Object.fromEntries(fields.map((k) => [k, 0]));
+  }
+  record(kind, bytes = 0, failed = false, files = 0) {
+    if (!kinds.includes(kind)) return;
+    this.data[kind + "Requests"]++;
+    this.data[kind + "Bytes"] += bytes;
+    if (failed) this.data[kind + "Errors"]++;
+    else if (kind === "batch") this.data.batchFiles += files;
+  }
+  snapshot() {
+    return { ...this.data };
+  }
+};
+
 var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
 var r = (v, n) => v >>> n | v << 32 - n;
 var Sha256 = class {
@@ -10077,7 +10098,8 @@ function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
       options.signal?.throwIfAborted();
       bytes = r2.arrayBuffer.byteLength;
       if (r2.status >= 400) failed = true;
-      const limit = (options.method || "GET") === "GET" && new URL(String(url)).pathname.endsWith("/v3/batch") ? BATCH_BYTES : CHUNK_BYTES;
+      const endpoint = new URL(String(url)), get = (options.method || "GET") === "GET", rangeLength = Number(endpoint.searchParams.get("length")), range = get && /\/v3\/blobs\/[a-f0-9]{64}$/.test(endpoint.pathname) && Number.isSafeInteger(rangeLength) && rangeLength >= CHUNK_BYTES && rangeLength <= RANGE_BYTES && rangeLength % CHUNK_BYTES === 0;
+      const limit = get && endpoint.pathname.endsWith("/v3/batch") ? BATCH_BYTES : range ? rangeLength : CHUNK_BYTES;
       if (r2.arrayBuffer.byteLength > limit) throw Error("Native response frame exceeds 32 KiB");
       return new Response(r2.status === 204 ? null : r2.arrayBuffer, { status: r2.status, headers: r2.headers });
     } catch (e) {
@@ -10668,8 +10690,9 @@ function checkStatus(s, size2) {
 }
 var BlobTransfer = class {
   constructor({ url, token, fetchImpl = globalThis.fetch, serverId, onIdentity = async () => {
-  }, verifyIdentity, responseIdentity = () => false }) {
-    Object.assign(this, { url: url.replace(/\/$/, ""), token, fetch: fetchImpl, serverId, onIdentity, verifyIdentity, responseIdentity });
+  }, verifyIdentity, responseIdentity = () => false, rangeReads = () => false, onTransfer = () => {
+  } }) {
+    Object.assign(this, { url: url.replace(/\/$/, ""), token, fetch: fetchImpl, serverId, onIdentity, verifyIdentity, responseIdentity, rangeReads, onTransfer });
     this.busy = false;
   }
   async identity(signal) {
@@ -10718,17 +10741,24 @@ var BlobTransfer = class {
   async downloadBatch(refs, { signal } = {}) {
     if (this.busy) throw Error("Transfer busy");
     this.busy = true;
+    let received = 0, failed = true, attempted = false;
     try {
       batchRefs(refs);
       if (!this.responseIdentity() || !this.verifyIdentity) throw Error("Verified batch capability required");
       const expected = await this.verifyIdentity(signal);
       signal?.throwIfAborted();
       const query = refs.map((r3) => r3.hash + ":" + r3.size).join(",");
+      attempted = true;
       const r2 = await this.fetch(this.url + "/v3/batch?refs=" + encodeURIComponent(query), { signal, headers: { Authorization: "Bearer " + this.token } });
       if (!r2.ok) throw Error("Blob request failed (" + r2.status + ")");
       if (!expected || r2.headers.get("X-Realtime-Lab-Server") !== expected) throw Error("Server identity mismatch in batch response");
-      return await verifyBatch(refs, await boundedBytes(r2, BATCH_BYTES), signal);
+      const bytes = await boundedBytes(r2, BATCH_BYTES);
+      received = bytes.length;
+      const verified = await verifyBatch(refs, bytes, signal);
+      failed = false;
+      return verified;
     } finally {
+      if (attempted) this.onTransfer("batch", received, failed, failed ? 0 : refs.length);
       this.busy = false;
     }
   }
@@ -10744,7 +10774,7 @@ var BlobTransfer = class {
         this.expectedResponseIdentity = await this.verifyIdentity(signal);
         if (typeof this.expectedResponseIdentity !== "string" || !this.expectedResponseIdentity) throw Error("Verified metadata identity required");
       } else await this.identity(signal);
-      const window2 = bound ? 4 : 2;
+      const range = !!bound && this.rangeReads() && ref.size > CHUNK_BYTES, frameBytes = range ? RANGE_BYTES : CHUNK_BYTES, window2 = range ? 2 : bound ? 4 : 2;
       if (!ref.size) {
         const s = checkStatus(await boundedJson(await this.call(ref.hash, { status: "1", size: 0 }, { signal })), 0);
         if (!s.complete) throw Error("Remote blob incomplete");
@@ -10756,14 +10786,19 @@ var BlobTransfer = class {
         while (pending.size < window2 && next < ref.size) {
           signal?.throwIfAborted();
           const p = next;
-          next += CHUNK_BYTES;
+          next += frameBytes;
           pending.set(p, (async () => {
+            let received = 0, failed = true;
             try {
-              const r2 = await this.call(ref.hash, { offset: p }, { signal }), bytes = await boundedBytes(r2, CHUNK_BYTES);
-              if (bytes.length !== Math.min(CHUNK_BYTES, ref.size - p)) throw Error("Short download frame");
+              const r2 = await this.call(ref.hash, { offset: p, ...range ? { length: frameBytes } : {} }, { signal }), bytes = await boundedBytes(r2, frameBytes);
+              received = bytes.length;
+              if (bytes.length !== Math.min(frameBytes, ref.size - p)) throw Error("Short download frame");
+              failed = false;
               return { bytes };
             } catch (error) {
               return { error };
+            } finally {
+              this.onTransfer(range ? "range" : "chunk", received, failed);
             }
           })());
         }
@@ -10774,10 +10809,15 @@ var BlobTransfer = class {
         const result = await pending.get(offset);
         if (result.error) throw result.error;
         signal?.throwIfAborted();
-        await sink.write(offset, result.bytes);
-        pending.delete(offset);
-        offset += result.bytes.length;
-        onProgress(offset);
+        const start = offset;
+        for (let i = 0; i < result.bytes.length; i += CHUNK_BYTES) {
+          signal?.throwIfAborted();
+          const bytes = result.bytes.subarray(i, i + CHUNK_BYTES);
+          await sink.write(offset, bytes);
+          offset += bytes.length;
+          onProgress(offset);
+        }
+        pending.delete(start);
         fill();
       }
       if (await hashSource({ size: ref.size, read: (p, n) => sink.read(p, n) }, signal) !== ref.hash) throw Error("Downloaded blob hash mismatch; discard partial and retry");
@@ -10800,7 +10840,7 @@ var VaultClientV3 = class extends VaultClient {
         for (const p of this.pending) await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
       }
     }, maxBufferedBytes: 4 * 1024 * 1024, maxInboxBytes: 8 * 1024 * 1024 });
-    this.blobs = new BlobTransfer({ url: options.url.replace(/^ws/, "http"), token: options.token, fetchImpl: options.fetchImpl, responseIdentity: () => this.serverCapabilities?.includes(BLOB_RESPONSE_IDENTITY_CAPABILITY), verifyIdentity: async () => {
+    this.blobs = new BlobTransfer({ url: options.url.replace(/^ws/, "http"), token: options.token, fetchImpl: options.fetchImpl, onTransfer: options.onTransfer, rangeReads: () => this.serverCapabilities?.includes(RANGE_CAPABILITY), responseIdentity: () => this.serverCapabilities?.includes(BLOB_RESPONSE_IDENTITY_CAPABILITY), verifyIdentity: async () => {
       if (!this.ready && !this.metadataVerified || !this.serverId) throw Error("Connect verified V3 metadata before transferring blobs");
       return this.serverId;
     } });
@@ -11085,6 +11125,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   diagnosticTimer;
   diagnosticError = "";
   uiUnloaded = false;
+  transfers = new TransferCounters();
   connectionStatus = "\u672A\u8FDE\u63A5";
   operationError = "";
   statusDetail;
@@ -11329,7 +11370,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.22", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -11356,6 +11397,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         for (const d of result.devices) if (d.performance) {
           const p = d.performance;
           panel.createEl("p", { text: d.platform + " \u5206\u9636\u6BB5\u7D2F\u8BA1\uFF1A\u7F51\u7EDC/\u539F\u751F\u8BF7\u6C42\u7B49\u5F85 " + p.network.wallMs + "ms\uFF08" + p.network.count + "\u6B21\uFF09\uFF1B\u7F13\u5B58\u8BFB\u5199 " + p.cache.wallMs + "ms\uFF1B\u6587\u4EF6\u5199\u5165 " + p.vault.wallMs + "ms\uFF1B\u914D\u7F6E\u4FDD\u5B58 " + p.config.wallMs + "ms\u3002\u8BA1\u65F6\u81EA\u672C\u6B21\u63D2\u4EF6\u542F\u52A8\uFF0C\u90E8\u5206\u9636\u6BB5\u91CD\u53E0\uFF0C\u4E0D\u80FD\u76F8\u52A0\u4F5C\u4E3A\u603B\u8017\u65F6\u3002" });
+        }
+        for (const d of result.devices) if (d.transfers) {
+          const t = d.transfers;
+          panel.createEl("p", { text: d.platform + " \u4F20\u8F93\u7D2F\u8BA1\uFF1A\u6279\u91CF\u8BF7\u6C42 " + t.batchRequests + " \u6B21\uFF08\u5931\u8D25 " + t.batchErrors + "\uFF09\uFF0C\u6279\u91CF\u6821\u9A8C\u63A5\u6536 " + t.batchFiles + " \u4E2A\u6587\u4EF6\uFF1B\u5927\u5757\u8BF7\u6C42 " + t.rangeRequests + " \u6B21\uFF08\u5931\u8D25 " + t.rangeErrors + "\uFF09\uFF0C\u666E\u901A\u5206\u5757 " + t.chunkRequests + " \u6B21\u3002\u6279\u91CF\u63A5\u6536\u6570\u4E0D\u4EE3\u8868\u5DF2\u5199\u5165\u5B8C\u6210\uFF1B\u8BA1\u6570\u81EA\u63D2\u4EF6\u542F\u52A8\u3002" });
         }
         if (result.unreportedConnections) panel.createEl("p", { text: result.unreportedConnections + "\u4E2A\u8FDE\u63A5\u672A\u4E0A\u62A5\uFF0C\u53EF\u80FD\u662F\u65E7\u7248\u6216\u8F6F\u4EF6\u68C0\u67E5\u7AEF\uFF0C\u4E0D\u80FD\u636E\u6B64\u5224\u5B9A\u5176\u961F\u5217\u3002" });
         if (this.diagnosticError) panel.createEl("p", { text: this.diagnosticError });
@@ -11924,7 +11969,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.syncedOnce = false;
     const hadState = !!this.settings.state;
     let first = true;
-    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl, void 0, () => this.performance.begin("network")), mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, pending: this.settings.pending, outbox: this.settings.outbox, onSyncState: () => this.updateProgress(), onOutbox: async (outbox) => {
+    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl, void 0, () => this.performance.begin("network")), onTransfer: (kind, bytes, failed, files) => this.transfers.record(kind, bytes, failed, files), mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, pending: this.settings.pending, outbox: this.settings.outbox, onSyncState: () => this.updateProgress(), onOutbox: async (outbox) => {
       this.settings.outbox = outbox;
       await this.persistConfig();
     }, onPending: async (pending) => {

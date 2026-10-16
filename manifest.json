@@ -1,7 +1,7 @@
 {
   "id": "realtime-lab-v3-files",
   "name": "Realtime Lab V3 Files (Isolated Test)",
-  "version": "0.5.0-alpha.12",
+  "version": "0.5.0-alpha.13",
   "minAppVersion": "1.7.2",
   "description": "Capability versioned-files-v1: isolated Markdown, image and PDF version sync. Realtime-Lab-V3-Files vaults only.",
   "author": "Local development",

@@ -10703,6 +10703,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   recoveryBusy = false;
   recoveryAttempts = 0;
   retryAfter = 0;
+  uiUnloaded = false;
   connectionStatus = "\u672A\u8FDE\u63A5";
   operationError = "";
   statusDetail;
@@ -10711,6 +10712,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   downloadPaths = /* @__PURE__ */ new Set();
   progressTimer;
   setConnectionStatus(s) {
+    if (this.uiUnloaded) return;
     this.connectionStatus = s;
     this.status?.setText("Realtime Lab V3\uFF1A" + s);
     this.statusDetail?.setText(s);
@@ -10718,6 +10720,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   badges = /* @__PURE__ */ new Map();
   badgeStyle;
+  badgeObserver;
   detailPanels = /* @__PURE__ */ new Set();
   detailModals = /* @__PURE__ */ new Set();
   cache;
@@ -10731,6 +10734,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     return String(error || "").replaceAll(this.settings.token || "__no_token__", "[\u4EE4\u724C\u5DF2\u9690\u85CF]").slice(0, 240);
   }
   updateProgress() {
+    if (this.uiUnloaded) return;
     window.clearTimeout(this.progressTimer);
     this.progressTimer = window.setTimeout(() => this.renderProgress(), 100);
   }
@@ -10747,6 +10751,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     return "\u5DF2\u63D0\u4EA4\u670D\u52A1\u5668";
   }
   renderProgress() {
+    if (this.uiUnloaded) return;
     const headline = this.summaryStatus();
     this.status?.setText("Realtime Lab V3\uFF1A" + headline);
     this.syncBadges();
@@ -10808,8 +10813,21 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const unknown = uploads.delete("*");
     return badgeState({ ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size, unknown, conflicts: this.conflicts.length, known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
+  clearOrphanBadges() {
+    const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
+    for (const row of document.querySelectorAll?.(".rl-sync-row") || []) if (!owned.has(row)) row.remove();
+  }
   syncBadges() {
+    if (this.uiUnloaded) return;
     if (!this.app.vault.getName().startsWith("Realtime-Lab-V3-Files-")) return;
+    this.clearOrphanBadges();
+    const Observer = document.defaultView?.MutationObserver;
+    if (!this.badgeObserver && Observer && document.body) {
+      this.badgeObserver = new Observer((records) => {
+        if (!this.uiUnloaded && records.some((r2) => [...r2.addedNodes].some((n) => n.matches?.(".rl-sync-row")))) this.clearOrphanBadges();
+      });
+      this.badgeObserver.observe(document.body, { childList: true, subtree: true });
+    }
     const mobile = document.body?.classList.contains("is-mobile");
     const active = mobile ? this.app.workspace.getActiveViewOfType?.(import_obsidian.MarkdownView) : null;
     const seen = /* @__PURE__ */ new Set(), model = this.badgeModel(), signature = JSON.stringify(model);
@@ -11776,6 +11794,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     return saved;
   }
   onunload() {
+    this.uiUnloaded = true;
+    this.badgeObserver?.disconnect();
     this.stop();
     window.clearTimeout(this.progressTimer);
     this.syncPanel = void 0;

@@ -9870,6 +9870,12 @@ function requestFetch(requestUrl2) {
   };
 }
 
+function transientTransferFailure(error) {
+  const s = String(error?.message || error);
+  if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
+  return /failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
+}
+
 function changedPaths(doc2, transaction) {
   const paths = /* @__PURE__ */ new Set();
   for (const [name, type] of doc2.share) {
@@ -9887,10 +9893,10 @@ function changedPaths(doc2, transaction) {
 function queueRows({ metadata = [], files = [], dirty = [], failures = [], downloads = [] }) {
   const rows = /* @__PURE__ */ new Map();
   for (const path of metadata) rows.set(path, { path, state: "\u7B49\u5F85\u670D\u52A1\u5668\u786E\u8BA4" });
-  for (const p of files) rows.set(p.path, { path: p.path, state: "\u9644\u4EF6\u5F85\u4F20", bytes: p.size });
+  for (const p of files) rows.set(p.path, { path: p.path, state: "\u6587\u4EF6\u5F85\u4F20", bytes: p.size });
   for (const path of dirty) rows.set(path, { path, state: "\u7B49\u5F85\u4E0A\u4F20" });
   for (const path of downloads) rows.set(path, { path, state: "\u63A5\u6536\u5904\u7406\u4E2D" });
-  for (const [path, error] of failures) rows.set(path, { path, state: "\u5931\u8D25\uFF0C\u53EF\u91CD\u8BD5", error });
+  for (const [path, error] of failures) rows.set(path, { path, state: transientTransferFailure(error) ? "\u7F51\u7EDC\u4E2D\u65AD\uFF0C\u7B49\u5F85\u81EA\u52A8\u91CD\u8BD5" : "\u5931\u8D25\uFF0C\u53EF\u91CD\u8BD5", error });
   return [...rows.values()];
 }
 
@@ -10032,12 +10038,12 @@ var NO_PERSIST = (_state) => {
 };
 var VaultClient = class {
   constructor({ url, token, state, mode, room = "realtime-lab-v2", expectedProtocol = void 0, capabilities = [], beforeUpload = async () => {
-  }, persistDelayMs = 0, maxBufferedBytes = 32 * 1024 * 1024, maxInboxBytes = 32 * 1024 * 1024, serverId, onIdentity = (_id, _mode) => {
+  }, retryPreparation = () => false, persistDelayMs = 0, maxBufferedBytes = 32 * 1024 * 1024, maxInboxBytes = 32 * 1024 * 1024, serverId, onIdentity = (_id, _mode) => {
   }, WebSocketImpl = globalThis.WebSocket, onStatus = (_s) => {
   }, onReady = () => {
   }, onPersist = NO_PERSIST }) {
     if (state && !serverId) throw Error("Saved state requires verified server identity");
-    Object.assign(this, { url, token, WS: WebSocketImpl, onStatus, onReady, onPersist, mode, serverId, onIdentity, maxBufferedBytes, maxInboxBytes, room, expectedProtocol, capabilities, beforeUpload });
+    Object.assign(this, { url, token, WS: WebSocketImpl, onStatus, onReady, onPersist, mode, serverId, onIdentity, maxBufferedBytes, maxInboxBytes, room, expectedProtocol, capabilities, beforeUpload, retryPreparation });
     this.doc = new Doc();
     if (state) applyUpdate(this.doc, decode(state));
     this.ready = false;
@@ -10156,9 +10162,14 @@ var VaultClient = class {
             try {
               await this.beforeUpload();
             } catch (error) {
-              this.onStatus("\u540C\u6B65\u524D\u9644\u4EF6\u51C6\u5907\u5931\u8D25\uFF0C\u4FDD\u7559\u672C\u5730\u5185\u5BB9\u540E\u91CD\u8BD5\uFF1A" + String(error?.message || error));
-              this.stopped = true;
-              ws.close(4404, "Pre-upload preparation failed");
+              if (this.retryPreparation(error)) {
+                this.onStatus("\u9644\u4EF6\u7F51\u7EDC\u6682\u4E0D\u53EF\u7528\uFF0C\u4FDD\u7559\u5F85\u4F20\u961F\u5217\u5E76\u81EA\u52A8\u91CD\u8FDE\uFF1A" + String(error?.message || error));
+                ws.close(1012, "Retry cached upload");
+              } else {
+                this.onStatus("\u540C\u6B65\u524D\u9644\u4EF6\u51C6\u5907\u5931\u8D25\uFF0C\u4FDD\u7559\u672C\u5730\u5185\u5BB9\u540E\u91CD\u8BD5\uFF1A" + String(error?.message || error));
+                this.stopped = true;
+                ws.close(4404, "Pre-upload preparation failed");
+              }
               return;
             }
             if (this.stopped || this.ws !== ws || ws.readyState !== 1) return;
@@ -10259,7 +10270,7 @@ var BlobTransfer = class {
     if (!this.serverId && !this.verifyIdentity) throw Error("Verified metadata identity required");
     const expected = this.verifyIdentity ? await this.verifyIdentity(signal) : this.serverId;
     const r2 = await this.fetch(this.url + "/v3/identity", { signal, headers: { Authorization: "Bearer " + this.token } });
-    if (!r2.ok) throw Error("Identity request failed");
+    if (!r2.ok) throw Error("Identity request failed (" + r2.status + ")");
     const m = await boundedJson(r2);
     if (m.protocol !== 3 || !m.serverId || m.serverId !== expected || this.serverId && m.serverId !== this.serverId) throw Error("Server identity mismatch before blob transfer");
     if (!this.serverId) {
@@ -10428,7 +10439,7 @@ function validate(doc2, hasBlob) {
 
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
-    super({ ...options, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY], beforeUpload: async () => {
+    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY], beforeUpload: async () => {
       await options.beforeUpload?.();
       if (this.pending.length) {
         if (!this.blobCache) throw Error("Pending file cache required");
@@ -10661,6 +10672,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   dirtyFiles = /* @__PURE__ */ new Map();
   fileUploads = coalescedTask((fn) => this.enqueue(fn), () => this.flushLocalFiles(), () => !!this.client && !this.stopping);
   reflection = coalescedTask((fn) => this.enqueue(fn), () => this.reflect(), () => !!this.client?.ready && !this.stopping);
+  recoveryBusy = false;
+  recoveryAttempts = 0;
+  retryAfter = 0;
   connectionStatus = "\u672A\u8FDE\u63A5";
   operationError = "";
   statusDetail;
@@ -10715,9 +10729,28 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
+    if ([this.operationError, ...this.fileFailures.values()].some(transientTransferFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u8BF7\u4FDD\u6301 Obsidian \u5728\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
     if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
     for (const row of rows.slice(0, 50)) e.createEl("p", { text: (row.path === "*" ? "\u672C\u5730\u79BB\u7EBF\u5FEB\u7167\u5F85\u6838\u5BF9" : row.path) + " \xB7 " + row.state + (row.error ? " \xB7 " + this.safeError(row.error) : "") });
+  }
+  async recoverQueue() {
+    const c = this.client;
+    if (!c || this.stopping || c.stopped || c.transportBlocked || !c.ready || this.initializing || this.recoveryBusy || Date.now() < this.retryAfter) return;
+    const errors = [this.operationError, ...this.fileFailures.values()].filter(Boolean);
+    if (!errors.length || !errors.every(transientTransferFailure)) return;
+    this.recoveryBusy = true;
+    this.retryAfter = Date.now() + Math.min(6e4, 2e3 * 2 ** Math.min(this.recoveryAttempts++, 5));
+    try {
+      await this.retryQueue();
+      await this.queue;
+      if (!this.operationError && !this.fileFailures.size) {
+        this.recoveryAttempts = 0;
+        this.retryAfter = 0;
+      }
+    } finally {
+      this.recoveryBusy = false;
+    }
   }
   async retryQueue() {
     this.operationError = "";
@@ -10899,11 +10932,20 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.updateProgress()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.updateProgress()));
     this.registerDomEvent(window, "resize", () => this.updateProgress());
+    this.registerDomEvent(window, "online", () => {
+      if (!this.client || this.stopping || this.client.stopped || this.client.transportBlocked) return;
+      this.retryAfter = 0;
+      if (!this.client.ready) this.client.resume();
+      else void this.recoverQueue();
+    });
     this.registerDomEvent(document, "visibilitychange", () => {
       if (!document.hidden) this.client?.resume();
     });
     this.registerInterval(window.setInterval(() => {
-      if (!document.hidden) void this.client?.checkConnection();
+      if (!document.hidden) {
+        void this.client?.checkConnection();
+        void this.recoverQueue();
+      }
     }, 1e4));
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.enabled) void this.start();
@@ -11102,6 +11144,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         if (this.client !== c) return;
         this.initializing = true;
         try {
+          await this.flushLocalFiles();
           if (c.pending.length) await c.flushPending();
           if (first) {
             new import_obsidian.Notice("\u6587\u4EF6\u6A21\u5F0F\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md\uFF08\u226416 KiB\uFF09\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59\u65B0 Markdown \u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\u3002");
@@ -11125,7 +11168,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           const confirmed = await c.confirmUploads();
           if (c.ready && !this.stopping) {
             this.setConnectionStatus(confirmed ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
-            if (confirmed) new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
+            if (confirmed && !this.fileFailures.size) {
+              if (transientTransferFailure(this.operationError)) this.operationError = "";
+              new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
+            }
           }
         } finally {
           this.initializing = false;

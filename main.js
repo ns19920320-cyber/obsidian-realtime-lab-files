@@ -10534,6 +10534,26 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.refresh();
       });
     }));
+    this.registerEvent(this.app.workspace.on("editor-change", (editor, view) => {
+      const c = this.client, p = view.file?.path;
+      if (!c || this.stopping || !this.syncedOnce || !p || this.writing.has(p) || !supported2(p) || content(c.doc, p)?.kind !== "text") return;
+      const data = editor.getValue();
+      if (new TextEncoder().encode(data).length > MAX_INLINE_NOTE) return;
+      if (c.doc.getText("text:" + p).toString() === data) return;
+      try {
+        const trial = new Doc();
+        try {
+          applyUpdate(trial, encodeStateAsUpdate(c.doc));
+          patchText(trial, p, data, "editor-fallback");
+          validate(trial);
+        } finally {
+          trial.destroy();
+        }
+        patchText(c.doc, p, data, "editor-fallback");
+      } catch (e) {
+        new import_obsidian.Notice("\u7F16\u8F91\u540C\u6B65\u5931\u8D25\uFF0C\u539F\u6587\u4ECD\u4FDD\u7559\u5728\u7F16\u8F91\u5668\uFF1A" + String(e));
+      }
+    }));
     this.registerEvent(this.app.workspace.on("layout-change", () => {
       this.refresh();
       if (this.client?.ready) this.reflection.request();
@@ -10714,7 +10734,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.settings.mode = "join";
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
-    }, state: this.settings.state || void 0, onStatus: (s) => this.status.setText("Realtime Lab V3\uFF1A" + s), persistDelayMs: 200, onPersist: async (s) => {
+    }, state: this.settings.state || void 0, onStatus: (s) => this.status.setText("Realtime Lab V3\uFF1A" + ((s === "\u5DF2\u8FDE\u63A5" || s === "\u5DF2\u540C\u6B65") && (!this.syncedOnce || this.initializing) ? "\u5DF2\u9274\u6743\uFF0C\u6B63\u5728\u51C6\u5907\u6D4B\u8BD5\u6587\u4EF6" : s)), persistDelayMs: 200, onPersist: async (s) => {
       this.settings.state = s;
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
@@ -10743,6 +10763,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.syncedOnce = true;
           await this.reflect();
           this.refresh();
+          this.status.setText("Realtime Lab V3\uFF1A\u6587\u4EF6\u5DF2\u5C31\u7EEA");
+          new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
         } finally {
           this.initializing = false;
         }

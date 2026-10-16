@@ -10738,8 +10738,20 @@ var VaultClientV3 = class extends VaultClient {
   }
   // iOS can retain an OPEN WebSocket after its network connection is gone.
   // Keep the Y.Doc, verified identity and pending blobs; replace only transport.
+  connect() {
+    const previous = this.ws;
+    super.connect();
+    if (!this.ws || this.ws === previous) return;
+    this.connectionStartedAt = Date.now();
+    this.terminalCloseCode = void 0;
+    const ws = this.ws, closed = ws.onclose;
+    ws.onclose = (e) => {
+      if (this.ws === ws && [4400, 4401, 4403].includes(e.code)) this.terminalCloseCode = e.code;
+      closed?.(e);
+    };
+  }
   resume() {
-    if (this.stopped || this.transportBlocked) return false;
+    if (this.stopped || this.transportBlocked || this.terminalCloseCode) return false;
     clearTimeout(this.timer);
     this.timer = void 0;
     const old = this.ws;
@@ -10807,7 +10819,31 @@ var VaultClientV3 = class extends VaultClient {
     return this.confirmation;
   }
   async checkConnection() {
-    return this.confirmUploads();
+    if (this.stopped || this.transportBlocked || this.terminalCloseCode) return false;
+    if (!this.ready) {
+      if (!this.ws || Date.now() - (this.connectionStartedAt || 0) >= 3e4) this.resume();
+      return false;
+    }
+    if (this.healthCheck) return this.healthCheck;
+    const ws = this.ws;
+    const job = this.request("barrier").then(() => {
+      if (this.ws !== ws || !this.ready) return false;
+      this.queueConfirmation();
+      return true;
+    }).catch((e) => {
+      if (this.ws === ws && !this.stopped && !this.transportBlocked) {
+        this.lastError = String(e.message || e);
+        this.onSyncState();
+        this.resume();
+      }
+      return false;
+    });
+    this.healthCheck = job;
+    try {
+      return await job;
+    } finally {
+      if (this.healthCheck === job) this.healthCheck = null;
+    }
   }
   get pendingPaths() {
     return [...this.localOutbox.keys()];
@@ -11187,7 +11223,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.20", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.21", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";

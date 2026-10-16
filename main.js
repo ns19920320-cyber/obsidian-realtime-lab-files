@@ -9870,6 +9870,30 @@ function requestFetch(requestUrl2) {
   };
 }
 
+function changedPaths(doc2, transaction) {
+  const paths = /* @__PURE__ */ new Set();
+  for (const [name, type] of doc2.share) {
+    if (!transaction.changed.has(type)) continue;
+    if (name.startsWith("text:")) paths.add(name.slice(5));
+    else if (name === "files" || name === "deleted") {
+      for (const key of transaction.changed.get(type)) if (typeof key === "string") paths.add(key);
+    } else if (name === "blobVersions") for (const key of transaction.changed.get(type)) {
+      const v = type.get(key);
+      if (v?.path) paths.add(v.path);
+    }
+  }
+  return [...paths];
+}
+function queueRows({ metadata = [], files = [], dirty = [], failures = [], downloads = [] }) {
+  const rows = /* @__PURE__ */ new Map();
+  for (const path of metadata) rows.set(path, { path, state: "\u7B49\u5F85\u670D\u52A1\u5668\u786E\u8BA4" });
+  for (const p of files) rows.set(p.path, { path: p.path, state: "\u9644\u4EF6\u5F85\u4F20", bytes: p.size });
+  for (const path of dirty) rows.set(path, { path, state: "\u7B49\u5F85\u4E0A\u4F20" });
+  for (const path of downloads) rows.set(path, { path, state: "\u63A5\u6536\u5904\u7406\u4E2D" });
+  for (const [path, error] of failures) rows.set(path, { path, state: "\u5931\u8D25\uFF0C\u53EF\u91CD\u8BD5", error });
+  return [...rows.values()];
+}
+
 var SnapshotScheduler = class {
   constructor({ capture, persist, delayMs = 0, lastState = "", onError = () => {
   } }) {
@@ -10380,6 +10404,35 @@ var VaultClientV3 = class extends VaultClient {
     for (const p of this.pending) this.checkPending(p);
     this.binaryBusy = false;
     this.binaryAbort = new AbortController();
+    this.onSyncState = options.onSyncState || (() => {
+    });
+    this.onOutbox = options.onOutbox;
+    this.localSequence = 0;
+    this.localOutbox = /* @__PURE__ */ new Map();
+    const restored = options.outbox ?? (options.state ? ["*"] : []);
+    if (!Array.isArray(restored) || restored.length > 8192 || restored.some((p) => p !== "*" && !supported2(p))) throw Error("Invalid local outbox");
+    for (const p of restored) this.localOutbox.set(p, ++this.localSequence);
+    const status = this.onStatus;
+    this.onStatus = (s) => {
+      this.syncStatus = s;
+      if (/错误|失败|拒绝|阻止|暂停/.test(s)) this.lastError = s;
+      status(s);
+      this.onSyncState();
+    };
+    const ready = this.onReady;
+    this.onReady = () => {
+      ready();
+      this.queueConfirmation();
+    };
+    this.progressListener = (tx) => {
+      if (tx.origin === "remote") return;
+      const paths = changedPaths(this.doc, tx);
+      if (!paths.length) return;
+      for (const p of paths) this.localOutbox.set(p, ++this.localSequence);
+      this.onSyncState();
+      this.queueConfirmation();
+    };
+    this.doc.on("afterTransaction", this.progressListener);
   }
   // iOS can retain an OPEN WebSocket after its network connection is gone.
   // Keep the Y.Doc, verified identity and pending blobs; replace only transport.
@@ -10409,18 +10462,53 @@ var VaultClientV3 = class extends VaultClient {
     this.connect();
     return true;
   }
-  async checkConnection() {
-    if (!this.ready || this.stopped || this.transportBlocked || this.checkingConnection) return;
-    this.checkingConnection = true;
-    const ws = this.ws;
-    try {
+  queueConfirmation() {
+    clearTimeout(this.confirmTimer);
+    if (this.ready && !this.stopped) this.confirmTimer = setTimeout(() => void this.confirmUploads().catch(() => {
+    }), 250);
+  }
+  async confirmUploads() {
+    if (!this.ready || this.stopped || this.transportBlocked || this.metadataBatch) return false;
+    if (this.confirmation) return this.confirmation;
+    const ws = this.ws, boundary = this.localSequence;
+    this.confirmation = (async () => {
       await this.request("barrier");
+      if (this.ws !== ws || !this.ready || this.stopped) return false;
+      if (this.persistence.persist && (this.localOutbox.size || this.persistence.dirty || this.persistence.inFlight)) {
+        this.flushPersist(!!this.localOutbox.size);
+        if (!await this.persistence.wait()) throw Error("Local snapshot save failed; outbox retained");
+      }
+      const cleared = [];
+      for (const [p, n] of this.localOutbox) if (n <= boundary) {
+        cleared.push([p, n]);
+        this.localOutbox.delete(p);
+      }
+      try {
+        if (cleared.length) await this.onOutbox?.([...this.localOutbox.keys()]);
+      } catch (e) {
+        for (const [p, n] of cleared) if (!this.localOutbox.has(p)) this.localOutbox.set(p, n);
+        throw e;
+      }
       this.lastConfirmedAt = Date.now();
-    } catch {
-      if (this.ws === ws && !this.stopped && !this.transportBlocked) this.resume();
-    } finally {
-      this.checkingConnection = false;
-    }
+      this.lastError = "";
+      this.onSyncState();
+      return true;
+    })().catch((e) => {
+      this.lastError = String(e.message || e);
+      this.onSyncState();
+      if (this.ws === ws && !this.stopped && !this.transportBlocked && this.lastError !== "Local snapshot save failed; outbox retained") this.resume();
+      return false;
+    }).finally(() => {
+      this.confirmation = null;
+      if (this.localSequence > boundary) this.queueConfirmation();
+    });
+    return this.confirmation;
+  }
+  async checkConnection() {
+    return this.confirmUploads();
+  }
+  get pendingPaths() {
+    return [...this.localOutbox.keys()];
   }
   async batchFiles(fn) {
     if (this.metadataBatch) throw Error("Metadata batch already active");
@@ -10431,6 +10519,7 @@ var VaultClientV3 = class extends VaultClient {
     } finally {
       this.metadataBatch = false;
       if (this.ready && !this.stopped) this.send({ type: "update", update: encode(encodeStateAsUpdate(this.doc, vector)) });
+      this.queueConfirmation();
     }
   }
   checkPending(p) {
@@ -10472,9 +10561,12 @@ var VaultClientV3 = class extends VaultClient {
     if (this.pending.length >= 3e3) throw Error("Pending reference limit");
     this.binaryBusy = true;
     try {
-      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), item = { path, ...ref, version: crypto.randomUUID() }, next = [...this.pending, item];
+      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), item = { path, ...ref, version: crypto.randomUUID() }, previous = [...this.pending].reverse().find((p) => p.path === path);
+      if (previous?.hash === ref.hash && previous?.size === ref.size) return ref;
+      const next = [...this.pending, item];
       await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
       this.pending = next;
+      this.onSyncState();
       return ref;
     } finally {
       this.binaryBusy = false;
@@ -10494,12 +10586,15 @@ var VaultClientV3 = class extends VaultClient {
         const next = this.pending.slice(1);
         await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
         this.pending = next;
+        this.onSyncState();
       }
     } finally {
       this.binaryBusy = false;
     }
   }
   close() {
+    clearTimeout(this.confirmTimer);
+    this.doc.off("afterTransaction", this.progressListener);
     this.binaryAbort.abort();
     return super.close();
   }
@@ -10524,16 +10619,76 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   fileUploads = coalescedTask((fn) => this.enqueue(fn), () => this.flushLocalFiles(), () => !!this.client && !this.stopping);
   reflection = coalescedTask((fn) => this.enqueue(fn), () => this.reflect(), () => !!this.client?.ready && !this.stopping);
   connectionStatus = "\u672A\u8FDE\u63A5";
+  operationError = "";
   statusDetail;
+  syncPanel;
+  fileFailures = /* @__PURE__ */ new Map();
+  downloadPaths = /* @__PURE__ */ new Set();
+  progressTimer;
   setConnectionStatus(s) {
     this.connectionStatus = s;
     this.status?.setText("Realtime Lab V3\uFF1A" + s);
     this.statusDetail?.setText(s);
+    this.updateProgress();
   }
   cache;
   legacyConfig = null;
   fingerprints = /* @__PURE__ */ new Map();
   configWrites = Promise.resolve();
+  pendingRows() {
+    return queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [...this.downloadPaths] });
+  }
+  safeError(error) {
+    return String(error || "").replaceAll(this.settings.token || "__no_token__", "[\u4EE4\u724C\u5DF2\u9690\u85CF]").slice(0, 240);
+  }
+  updateProgress() {
+    window.clearTimeout(this.progressTimer);
+    this.progressTimer = window.setTimeout(() => this.renderProgress(), 100);
+  }
+  summaryStatus() {
+    const c = this.client;
+    if (!c?.ready) return this.connectionStatus;
+    if (c.lastError || this.fileFailures.size || this.operationError) return "\u5DF2\u8FDE\u63A5\uFF0C\u6709\u5931\u8D25\u9879\u76EE\uFF0C\u5185\u5BB9\u4FDD\u7559";
+    if (!this.syncedOnce || this.initializing) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u51C6\u5907\u6587\u4EF6";
+    if (this.reflection.queued || this.downloadPaths.size) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u63A5\u6536\u6587\u4EF6";
+    if (this.pendingRows().length) return "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4";
+    if (!c.lastConfirmedAt) return "\u5DF2\u8FDE\u63A5\uFF0C\u7B49\u5F85\u670D\u52A1\u5668\u786E\u8BA4";
+    return "\u5DF2\u63D0\u4EA4\u670D\u52A1\u5668";
+  }
+  renderProgress() {
+    const headline = this.summaryStatus();
+    this.status?.setText("Realtime Lab V3\uFF1A" + headline);
+    const e = this.syncPanel;
+    if (!e) return;
+    e.empty();
+    const c = this.client, rows = this.pendingRows();
+    e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
+    e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
+    e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
+    e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
+    if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
+    if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
+    for (const row of rows.slice(0, 50)) e.createEl("p", { text: (row.path === "*" ? "\u672C\u5730\u79BB\u7EBF\u5FEB\u7167\u5F85\u6838\u5BF9" : row.path) + " \xB7 " + row.state + (row.error ? " \xB7 " + this.safeError(row.error) : "") });
+  }
+  async retryQueue() {
+    this.operationError = "";
+    if (!this.client || this.client.stopped || this.client.transportBlocked) {
+      await this.start();
+      return;
+    }
+    const c = this.client;
+    if (!c.ready) {
+      c.resume();
+      return;
+    }
+    this.enqueue(async () => {
+      await this.flushLocalFiles();
+      if (c.pending.length) await c.flushPending();
+      await c.confirmUploads();
+      await this.reflect();
+      this.updateProgress();
+    });
+  }
   async persistConfig() {
     if (this.legacyConfig) throw Error("\u65E7\u8BBE\u7F6E\u5C1A\u672A\u5907\u4EFD\uFF1B\u62D2\u7EDD\u8986\u76D6");
     const snapshot = structuredClone(this.settings);
@@ -10567,6 +10722,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         return;
       }
       this.dirtyFiles.set(f.path, f);
+      this.updateProgress();
       this.fileUploads.request();
     }));
     this.registerEvent(this.app.vault.on("rename", (f, old) => {
@@ -10614,12 +10770,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }, 1e4));
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.enabled) void this.start();
+      else this.setConnectionStatus("\u672A\u8FDE\u63A5\uFF08\u81EA\u52A8\u8FDE\u63A5\u5DF2\u5173\u95ED\uFF09");
     });
   }
   enqueue(fn) {
     this.queue = this.queue.then(fn).catch((e) => {
       new import_obsidian.Notice("\u6D4B\u8BD5\u5E93\u540C\u6B65\uFF1A" + String(e.message || e));
-      this.status.setText("Realtime Lab V3\uFF1A\u64CD\u4F5C\u5931\u8D25");
+      this.operationError = this.safeError(e.message || e);
+      this.setConnectionStatus("\u64CD\u4F5C\u5931\u8D25\uFF1A" + this.operationError);
     });
   }
   async flushLocalFiles() {
@@ -10627,8 +10785,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       const f = this.dirtyFiles.get(p);
       this.dirtyFiles.delete(p);
       if (!f || !this.client || this.stopping) return;
-      await this.upload(f);
+      try {
+        await this.upload(f);
+        this.fileFailures.delete(p);
+      } catch (e) {
+        this.dirtyFiles.set(p, f);
+        this.fileFailures.set(p, this.safeError(e));
+        this.setConnectionStatus("\u6709\u6587\u4EF6\u4E0A\u4F20\u5931\u8D25\uFF0C\u5185\u5BB9\u4FDD\u7559\uFF0C\u53EF\u91CD\u8BD5");
+      }
     }
+    this.updateProgress();
   }
   async allowed() {
     return allowedV3(this.app.vault);
@@ -10687,8 +10853,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (equal(old, item)) return;
     if (item.kind !== "text") {
       const source = this.cache.source(item);
-      if (c.ready) await c.putFile(f.path, source);
-      else await c.stageFile(f.path, source);
+      await c.stageFile(f.path, source);
+      if (c.ready) await c.flushPending();
       return;
     }
     const trial = new Doc();
@@ -10773,11 +10939,15 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       return;
     }
     const activeOrigin = canonicalEndpoint(this.settings.url);
+    this.operationError = "";
     this.stopping = false;
     this.syncedOnce = false;
     const hadState = !!this.settings.state;
     let first = true;
-    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl), mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, pending: this.settings.pending, onPending: async (pending) => {
+    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl), mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, pending: this.settings.pending, outbox: this.settings.outbox, onSyncState: () => this.updateProgress(), onOutbox: async (outbox) => {
+      this.settings.outbox = outbox;
+      await this.persistConfig();
+    }, onPending: async (pending) => {
       this.settings.pending = pending;
       await this.persistConfig();
     }, onIdentity: async (id2) => {
@@ -10787,6 +10957,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       await this.persistConfig();
     }, state: this.settings.state || void 0, onStatus: (s) => this.setConnectionStatus((s === "\u5DF2\u8FDE\u63A5" || s === "\u5DF2\u540C\u6B65") && (!this.syncedOnce || this.initializing) ? "\u5DF2\u9274\u6743\uFF0C\u6B63\u5728\u51C6\u5907\u6D4B\u8BD5\u6587\u4EF6" : s), persistDelayMs: 200, onPersist: async (s) => {
       this.settings.state = s;
+      this.settings.outbox = c.pendingPaths;
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
     }, onReady: () => {
@@ -10814,9 +10985,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.syncedOnce = true;
           await this.reflect();
           this.refresh();
+          const confirmed = await c.confirmUploads();
           if (c.ready && !this.stopping) {
-            this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
-            new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
+            this.setConnectionStatus(confirmed ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
+            if (confirmed) new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
           }
         } finally {
           this.initializing = false;
@@ -10825,7 +10997,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     } });
     this.client = c;
     c.doc.on("update", (_u, origin) => {
-      if (origin === "remote" && c.ready) this.reflection.request();
+      if (origin === "remote" && c.ready) {
+        this.reflection.request();
+        this.updateProgress();
+      }
     });
     if (hadState) {
       const missing = [.../* @__PURE__ */ new Set([...Object.keys(entries(c.doc)), ...c.pending.map((p) => p.path)])].filter((p) => !this.app.vault.getAbstractFileByPath(p));
@@ -10900,7 +11075,20 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, item.data);
           else await this.app.vault.create(p, item.data);
         } else {
-          if (!await this.cache.has(item)) await c.blobs.download(item, this.cache.sink(item));
+          if (!await this.cache.has(item)) {
+            this.downloadPaths.add(p);
+            this.updateProgress();
+            try {
+              await c.blobs.download(item, this.cache.sink(item));
+              this.fileFailures.delete(p);
+            } catch (e) {
+              this.fileFailures.set(p, this.safeError(e));
+              throw e;
+            } finally {
+              this.downloadPaths.delete(p);
+              this.updateProgress();
+            }
+          }
           if (content(c.doc, p)?.hash !== item.hash) {
             this.reflection.request();
             continue;
@@ -10922,6 +11110,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
     }
     this.refresh();
+    this.updateProgress();
   }
   async parents(p) {
     const parts = p.split("/");
@@ -10968,20 +11157,21 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }
     const modal = new import_obsidian.Modal(this.app);
     modal.titleEl.setText("\u521B\u5EFA\u6216\u52A0\u5165\u72EC\u7ACB\u540C\u6B65\u5E93");
-    let url = this.settings.url, token = this.settings.token;
-    modal.contentEl.createEl("p", { text: "\u521B\u5EFA\uFF1A\u4EC5\u5EFA\u7ACB\u7A7A\u540C\u6B65\u7A7A\u95F4\uFF0C\u670D\u52A1\u5668\u5FC5\u987B\u4E3A\u7A7A\uFF1B\u52A0\u5165\uFF1A\u4ECE\u5DF2\u6709\u670D\u52A1\u5668\u63A5\u6536\u5185\u5BB9\u3002\u9996\u6B21\u64CD\u4F5C\u8981\u6C42\u672C\u5730\u7A7A\u5E93\u3002\u65E7\u72B6\u6001\u4E0D\u8DE8\u670D\u52A1\u5668\u590D\u5236\uFF0C\u539F\u5E93\u548C\u5FEB\u7167\u59CB\u7EC8\u4FDD\u7559\u3002\u6B64\u5411\u5BFC\u4E0D\u4F1A\u521B\u5EFA\u670D\u52A1\u5668\u6216\u751F\u6210\u51ED\u636E\u3002" });
+    let url = this.settings.url, token = this.settings.token, autoConnect = this.settings.serverId ? this.settings.enabled : true;
+    modal.contentEl.createEl("p", { text: "\u521B\u5EFA\uFF1A\u4EC5\u5EFA\u7ACB\u7A7A\u540C\u6B65\u7A7A\u95F4\uFF0C\u670D\u52A1\u5668\u5FC5\u987B\u4E3A\u7A7A\uFF1B\u52A0\u5165\uFF1A\u4ECE\u5DF2\u6709\u670D\u52A1\u5668\u63A5\u6536\u5185\u5BB9\u3002\u9996\u6B21\u64CD\u4F5C\u8981\u6C42\u672C\u5730\u7A7A\u5E93\u3002\u65E7\u72B6\u6001\u4E0D\u8DE8\u670D\u52A1\u5668\u590D\u5236\uFF0C\u539F\u5E93\u548C\u5FEB\u7167\u59CB\u7EC8\u4FDD\u7559\u3002\u6B64\u5411\u5BFC\u4E0D\u4F1A\u521B\u5EFA\u670D\u52A1\u5668\u6216\u751F\u6210\u51ED\u636E\u3002\u81EA\u52A8\u8FDE\u63A5\u53EF\u5728\u4E0B\u65B9\u9009\u62E9\uFF1B\u5DF2\u6709\u5185\u5BB9\u548C\u72B6\u6001\u4E0D\u4F1A\u91CD\u7F6E\u3002" });
     new import_obsidian.Setting(modal.contentEl).setName("\u6D4B\u8BD5\u670D\u52A1\u5668\u5730\u5740").addText((t) => t.setValue(url).onChange((v) => url = v));
     new import_obsidian.Setting(modal.contentEl).setName("\u6D4B\u8BD5\u8BBF\u95EE\u4EE4\u724C").addText((t) => {
       t.inputEl.type = "password";
       t.setValue(token).onChange((v) => token = v);
     });
+    new import_obsidian.Setting(modal.contentEl).setName("\u52A0\u5165\u540E\u6253\u5F00\u6D4B\u8BD5\u5E93\u81EA\u52A8\u8FDE\u63A5").addToggle((t) => t.setValue(autoConnect).onChange((v) => autoConnect = v));
     const use = async (mode) => {
       try {
         const files = this.app.vault.getFiles().filter((f) => f.path !== "realtime-lab-v3-files.json" && !f.path.startsWith("."));
         if (await this.stop() === false) throw Error("\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF0C\u672A\u5207\u6362\u8FDE\u63A5");
         await this.queue;
         const next = planConnection(this.settings, { url, token, mode }, files);
-        this.settings = { ...next, protocol: 3, capability: FILE_REFS_CAPABILITY };
+        this.settings = { ...next, protocol: 3, capability: FILE_REFS_CAPABILITY, enabled: autoConnect };
         await this.persistConfig();
         modal.close();
         await this.start();
@@ -11102,6 +11292,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   onunload() {
     this.stop();
+    window.clearTimeout(this.progressTimer);
+    this.syncPanel = void 0;
   }
 };
 var Settings = class extends import_obsidian.PluginSettingTab {
@@ -11113,7 +11305,9 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     const e = this.containerEl;
     e.empty();
     e.createEl("h2", { text: "Realtime Lab V3 \xB7 \u6574\u5E93\u6D4B\u8BD5" });
-    this.p.statusDetail = e.createEl("p", { text: this.p.connectionStatus });
+    this.p.syncPanel = e.createDiv();
+    this.p.renderProgress();
+    new import_obsidian.Setting(e).addButton((b) => b.setButtonText("\u5237\u65B0\u72B6\u6001").onClick(() => this.p.renderProgress())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.p.retryQueue()));
     new import_obsidian.Setting(e).setName("\u8BEF\u7F6E\u65E7\u534F\u8BAE\u8BBE\u7F6E").addButton((b) => b.setButtonText("\u5907\u4EFD\u5E76\u6E05\u7A7A\u65E7\u72B6\u6001").onClick(() => void this.p.backupRejectedState()));
     e.createEl("p", { text: "\u4EC5 Realtime-Lab-V3-Files- \u72EC\u7ACB\u6D4B\u8BD5\u5E93\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u548C PDF\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u6D3B\u52A8\u5185\u5BB9\u2264128 MiB\u3001\u6700\u591A3000\u6D3B\u52A8\u8DEF\u5F84/4096\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264256 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
     new import_obsidian.Setting(e).setName("\u521B\u5EFA\u6216\u52A0\u5165\u5411\u5BFC").addButton((b) => b.setButtonText("\u914D\u7F6E\u8FDE\u63A5").onClick(() => void this.p.setupConnection()));
@@ -11134,6 +11328,8 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(e).setName("\u6253\u5F00\u65F6\u81EA\u52A8\u8FDE\u63A5").addToggle((t) => t.setValue(this.p.settings.enabled).onChange(async (v) => {
       this.p.settings.enabled = v;
       await this.p.persistConfig();
+      this.p.renderProgress();
+      if (v && !this.p.client) await this.p.start();
     }));
     new import_obsidian.Setting(e).setName("\u8FDE\u63A5\u6574\u4E2A\u6D4B\u8BD5\u5E93").addButton((b) => b.setButtonText("\u8FDE\u63A5").onClick(() => void this.p.start()));
     new import_obsidian.Setting(e).setName("\u5386\u53F2\u7248\u672C\uFF08\u542B\u5DF2\u5220\u9664\u6587\u4EF6\uFF09").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u6062\u590D").onClick(() => void this.p.history()));

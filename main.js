@@ -9963,6 +9963,17 @@ function queueRows({ metadata = [], files = [], dirty = [], failures = [], downl
   for (const [path, error] of failures) rows.set(path, { path, state: transientTransferFailure(error) ? "\u7F51\u7EDC\u4E2D\u65AD\uFF0C\u7B49\u5F85\u81EA\u52A8\u91CD\u8BD5" : "\u5931\u8D25\uFF0C\u53EF\u91CD\u8BD5", error });
   return [...rows.values()];
 }
+function fileProgress({ known = [], pending = [], failures = [], active = 0, ready = false }) {
+  const paths = new Set(known), waiting = new Set(pending.filter((p) => p !== "*"));
+  for (const p of waiting) paths.add(p);
+  const retry = new Set(failures.filter((p) => p !== "*"));
+  for (const p of retry) {
+    paths.add(p);
+    waiting.add(p);
+  }
+  const total = paths.size, remaining = waiting.size;
+  return { available: ready && !pending.includes("*"), total, completed: Math.max(0, total - remaining), remaining, retry: retry.size, active };
+}
 
 var CONFLICT_CAPABILITY = "conflict-review-v1";
 var fingerprint = (c) => JSON.stringify(c ? c.kind === "text" ? { kind: "text", data: c.data } : { kind: c.kind, hash: c.hash, size: c.size } : null);
@@ -10111,7 +10122,7 @@ function documentDigest(doc2) {
   return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
 }
 
-function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0 }) {
+function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
     tone = "error";
@@ -10121,6 +10132,11 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     tone = "waiting";
     icon = "alert-circle";
     label = "\u8DEF\u5F84\u64CD\u4F5C\u5F85\u786E\u8BA4";
+  } else if (error && retrying && ready) {
+    tone = "busy";
+    icon = "refresh-cw";
+    label = "\u6062\u590D\u4E2D";
+    busy = true;
   } else if (error) {
     tone = "error";
     icon = "alert-circle";
@@ -10144,13 +10160,17 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     icon = "check";
     label = "\u5DF2\u786E\u8BA4";
   }
-  const counts = "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads;
-  const display = "Sync: " + (ready && conflicts ? "\u26A0 \u51B2\u7A81" + conflicts : ready && protectedCount ? "\u26A0 \u5F85\u786E\u8BA4" + protectedCount : tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
-  return { tone, icon, label, display, busy, counts, description: label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
+  const legacyCounts = "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads;
+  let display = "Sync: " + (ready && conflicts ? "\u26A0 \u51B2\u7A81" + conflicts : ready && protectedCount ? "\u26A0 \u5F85\u786E\u8BA4" + protectedCount : tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
+  const counts = progress?.available ? "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : progress ? "\u8FDB\u5EA6\u5F85\u6838\u5BF9" : legacyCounts;
+  if (progress && !conflicts && !protectedCount) {
+    display = "Sync: " + (label === "\u6062\u590D\u4E2D" ? "\u6062\u590D\u4E2D" : tone === "busy" ? "\u540C\u6B65\u4E2D" : tone === "confirmed" ? "\u2713" : tone === "error" ? "\u26A0 \u9700\u5904\u7406" : label);
+  }
+  return { tone, icon, label, display, busy, counts, description: (progress?.available ? counts + "\uFF1B\u5F53\u524D\u63A5\u6536\u5E76\u53D1" + progress.active + "\uFF1B\u5F85\u91CD\u8BD5\u5305\u542B\u5728\u5269\u4F59\u4E2D\uFF1B" : "\u8FDB\u5EA6\u5C1A\u672A\u6838\u5BF9\uFF1B") + label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
 var badgeCSS = `
 .rl-sync-row{display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
-.rl-sync-row .rl-sync-badge{display:inline-flex;align-items:center;gap:7px;width:max-content;max-width:100%;min-height:24px;padding:0;border:0;border-radius:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:400;line-height:24px;white-space:nowrap;cursor:pointer;box-shadow:none;font-variant-numeric:tabular-nums}
+.rl-sync-row .rl-sync-badge{display:inline-flex;align-items:center;gap:7px;width:max-content;max-width:100%;flex-wrap:wrap;justify-content:flex-end;min-height:24px;padding:0;border:0;border-radius:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:400;line-height:24px;white-space:nowrap;cursor:pointer;box-shadow:none;font-variant-numeric:tabular-nums}
 .rl-sync-badge .rl-sync-icon{display:none}
 .rl-sync-badge .rl-sync-label,.rl-sync-badge .rl-sync-counts{white-space:nowrap}
 .rl-sync-badge[data-tone=error]{color:var(--text-error)}
@@ -10158,7 +10178,7 @@ var badgeCSS = `
 .rl-sync-badge:focus-visible{outline:2px solid var(--interactive-accent);outline-offset:3px}
 body.is-mobile .rl-sync-row{padding:0 20px 2px;min-height:28px;z-index:5;background:transparent;pointer-events:none}
 body.is-mobile .rl-sync-row .rl-sync-badge{pointer-events:auto}
-body.is-mobile .rl-sync-row .rl-sync-badge{font-size:12px;min-height:28px;line-height:28px}
+body.is-mobile .rl-sync-row .rl-sync-badge{font-size:11px;min-height:28px;line-height:18px;column-gap:6px;row-gap:0}
 .rl-history-modal .setting-item-control{flex-wrap:wrap;gap:8px}
 .rl-history-modal .modal-title{overflow-wrap:anywhere}
 .rl-history-preview{white-space:pre-wrap;overflow-wrap:anywhere;max-height:45vh;overflow:auto;padding:12px;background:var(--background-secondary);font-size:var(--font-smaller)}
@@ -10872,6 +10892,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.settings.remoteDeleteReview) return "\u6709" + this.settings.remoteDeleteReview.paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\u7B49\u5F85\u786E\u8BA4";
     if (this.conflicts.length) return "\u6709" + this.conflicts.length + "\u9879\u51B2\u7A81\u5F85\u5904\u7406\uFF0C\u53CC\u65B9\u7248\u672C\u5DF2\u4FDD\u7559";
     if (this.conflictError) return "\u5DF2\u8FDE\u63A5\uFF0C\u51B2\u7A81\u72B6\u6001\u5C1A\u672A\u786E\u8BA4";
+    if (this.fileFailures.size && this.downloadPaths.size && [...this.fileFailures.values()].every(recoverableSyncFailure) && !c.lastError && !this.operationError) return "\u6B63\u5728\u6062\u590D\u540C\u6B65\uFF0C\u5931\u8D25\u9879\u76EE\u9010\u9879\u91CD\u8BD5";
     if (c.lastError || this.fileFailures.size || this.operationError) return "\u5DF2\u8FDE\u63A5\uFF0C\u6709\u5931\u8D25\u9879\u76EE\uFF0C\u5185\u5BB9\u4FDD\u7559";
     if (!this.syncedOnce || this.initializing) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u51C6\u5907\u6587\u4EF6";
     if (this.reflection.queued || this.downloadPaths.size) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u63A5\u6536\u6587\u4EF6";
@@ -10889,7 +10910,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   renderPanel(e, headline) {
     e.empty();
-    const c = this.client, rows = this.pendingRows();
+    const c = this.client, rows = this.pendingRows(), progress = this.progressModel();
+    e.createEl("p", { text: progress.available ? "\u6587\u4EF6\u8FDB\u5EA6\uFF1A\u5DF2\u5B8C\u6210 " + progress.completed + " / " + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : "\u6587\u4EF6\u8FDB\u5EA6\uFF1A\u6B63\u5728\u6838\u5BF9\uFF0C\u5C1A\u4E0D\u80FD\u786E\u8BA4\u5DF2\u5B8C\u6210\u6570\u91CF" });
+    e.createEl("p", { text: "\u5F53\u524D\u63A5\u6536\u5E76\u53D1\uFF1A" + progress.active + "\uFF08\u4E0D\u662F\u5269\u4F59\u6587\u4EF6\u6570\uFF09\uFF1B\u5F85\u91CD\u8BD5\u5305\u542B\u5728\u5269\u4F59\u4E2D\uFF0C\u4E0D\u91CD\u590D\u76F8\u52A0\u3002" });
     e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
@@ -10943,11 +10966,15 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.updateProgress();
     });
   }
+  progressModel() {
+    const c = this.client;
+    return fileProgress({ known: c ? Object.keys(entries(c.doc)) : [], pending: this.pendingRows().map((r2) => r2.path), failures: [...this.fileFailures.keys()], active: this.downloadPaths.size, ready: !!c?.ready && this.settings.receivePending?.serverId === c.serverId });
+  }
   badgeModel() {
-    const c = this.client, uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
+    const c = this.client, progress = this.progressModel(), uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
-    return badgeState({ ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ progress, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -11029,7 +11056,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const panel = m.contentEl.createDiv();
     this.detailPanels.add(panel);
     this.detailModals.add(m);
-    m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u2191 \u5F85\u4E0A\u4F20\u6216\u7B49\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u6570\uFF1B\u2193 \u5F53\u524D\u63A5\u6536\u4E2D\u7684\u8DEF\u5F84\u6570\u3002\u26A1 \u8868\u793A\u8FDE\u63A5\u4E14\u5DF2\u83B7\u670D\u52A1\u5668\u786E\u8BA4\uFF1B\u65F6\u949F\u8868\u793A\u7B49\u5F85\u786E\u8BA4\uFF1B\u79BB\u7EBF\u4E0E\u5F02\u5E38\u4F1A\u76F4\u63A5\u6807\u660E\u3002\u786E\u8BA4\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
+    m.contentEl.createEl("p", { cls: "rl-sync-details-note", text: "\u8FDB\u5EA6\u6309\u552F\u4E00\u6587\u4EF6\u8DEF\u5F84\u7EDF\u8BA1\uFF0C\u5305\u542B\u4E0A\u4F20\u3001\u63A5\u6536\u53CA\u5F85\u786E\u8BA4\uFF1B\u5F85\u91CD\u8BD5\u662F\u5269\u4F59\u4E2D\u7684\u4E00\u90E8\u5206\u3002\u5F53\u524D\u63A5\u6536\u6570\u662F\u5E76\u53D1\u6570\u3002\u5DF2\u5B8C\u6210\u8868\u793A\u672C\u673A\u6587\u4EF6\u5904\u7406\u53CA\u670D\u52A1\u5668\u786E\u8BA4\u961F\u5217\u5DF2\u6E05\u9664\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002\u79BB\u7EBF\u65F6\u6570\u91CF\u4EC5\u4F9B\u53C2\u8003\u3002" });
     new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4").onClick(() => void this.openPathSafety())).addButton((b) => b.setButtonText("\u8BBE\u5907\u8FDC\u7A0B\u8BCA\u65AD").onClick(() => void this.openDeviceDiagnostics())).addButton((b) => b.setButtonText("\u67E5\u770B\u540C\u6B65\u51B2\u7A81").onClick(() => void this.openConflicts())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.retryQueue())).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
     m.onClose = () => {
       this.detailPanels.delete(panel);
@@ -11051,7 +11078,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.17", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.18", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest() } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";

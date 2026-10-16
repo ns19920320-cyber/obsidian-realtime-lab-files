@@ -1,20 +1,19 @@
-# Realtime Lab Files 0.5.0-alpha.17
+# Realtime Lab Files 0.5.0-alpha.18
 
-BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Isolated initialized Realtime-Lab-V3-Files- vaults only. Update without resetting notes, cache, pending uploads, snapshots, URL, token or server identity.
+BRAT: ns19920320-cyber/obsidian-realtime-lab-files. Isolated initialized Realtime-Lab-V3-Files- vaults only.
 
-## Important server compatibility
-Requires versioned-files-v1 AND general-files-v1 on the isolated server (alpha.16 or newer). The old alpha.15 public test service is NOT compatible. An incompatible connection is rejected before metadata exchange; do not clear state or replace the endpoint on an existing mobile vault. Use a separate empty mobile rehearsal vault for the large-vault exercise; retain the old test vault unchanged. This release does not upgrade or expose a server.
+## File progress
+The reading/editing header now shows completed / total files, remaining paths, and paths awaiting retry. Retry paths are included in remaining, never added twice. Active download concurrency is explained separately in the detail panel. Progress is measured in unique file paths, not bytes or HTTP requests. During initial identity/checkpoint reconciliation, progress is marked as unverified rather than displaying a false 100%. Uploads and acknowledgements are included. A cleared local queue does not prove that another device has received the files.
 
-## Changes
-Removes quadratic full-cache quota scans: rebuild private accounting once on open/error, then serialize and account new reservations incrementally. Partial and historical blobs remain included; no cache/history eviction. Recognized temporary filesystem errors retry through bounded backoff and reconciliation, rather than blindly repeating native mutations. Durable, server-bound receive checkpoints resume unfinished downloads after reopening; previously completed missing files still require explicit restore/delete direction. Pending paths include unfinished receives.
+Recognized recoverable failures show recovery in progress while receives are actively retrying; conflicts, protected path operations and blocking errors remain visible. A failure counter is not a count of lost files. The new display reads existing queues and durable receive checkpoints without resetting them.
 
-Includes alpha.16 opaque JSON/CSV/JSONL/HTML/Python/TXT/LOG/ZIP/backup transfer and safe plain-text previews. Files are never executed or unzipped. Active data <=256 MiB/6000 paths, tracked paths <=8192, metadata <=2 MiB, cache <=512 MiB/8192 objects; Markdown/general data <=16 MiB, images/PDF <=5 MiB. Hidden/configuration/recovery paths remain excluded. Never enable LiveSync in the same rehearsal vault.
+## Update and compatibility
+Update the existing isolated rehearsal vault through BRAT. Retain notes, settings, identity, URL, token, cache, history and pending receive/upload state. No server upgrade or protocol change is required from alpha.17. Requires versioned-files-v1 and general-files-v1 (alpha.16+ server). The old alpha.15 service is incompatible. Do not enable LiveSync in the same rehearsal vault. Production migration is not approved.
 
-## Validation and limits
-220 serial automated tests, typecheck and build passed. A legacy 4-second convergence test exceeded its deadline under full parallel suite load; isolated and bounded full reruns passed without changing that test. Native Mac Obsidian received and verified all 2,944 real rehearsal files (119,752,446 bytes), then reopened without changing original file bytes, modification times or connection settings. 320 additional synthetic files verified; 20 unfinished attachments, including a 32 KiB partial cache, automatically completed after a scoped service pause and vault close/reopen. Final pending/failed/conflicts all zero. Production files and old rehearsal content remained unchanged.
+## Validation
+223 automated tests passed, typecheck and build passed; 52 focused tests passed after the final adjustment. Tests cover unique-path progress accounting, retry recovery to zero, unchanged saved settings during progress reads, header ownership/position, conflicts and protected operations. Layout was inspected at a 390 px content width with synthetic counters. This release has not yet been visually accepted on a physical iPhone; large mobile first-sync remains in progress. Validation uses isolated synthetic fixtures; no production notes or connection settings are changed.
 
-Physical iPhone large-vault first-sync and restart acceptance is pending after this release. This does not establish iOS background execution, unsaved-keystroke durability, power-loss recovery or production migration readiness. The exact historical alpha.16 stalled native operation was not recorded; cache amplification and missing filesystem retry support are confirmed fixes, and that native timeout did not recur in this run.
+## Source
+source.zip contains allowlisted source/tests/build manifests only. It excludes notes, settings, tokens, runtime snapshots and node_modules. Build: npm ci; npm run typecheck; node --test --test-concurrency=1 test/*.test.mjs; npm run build:v3-files.
 
-## Source and build
-source.zip is an allowlisted source snapshot without notes, configs, credentials, runtime data or node_modules. npm ci; npm run typecheck; node --test --test-concurrency=1 test/*.test.mjs; npm run build:v3-files. Use manifest.v3-files.json.
-Source commit: f0abd5cbbe74e0eb9f008fec9134bd8fe508d717
+Source commit: 6f0da6df1145eb88d7046fdcf399cbc48eaf68c7

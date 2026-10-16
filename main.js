@@ -11549,7 +11549,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     m.contentEl.createEl("p", { text: "\u9010\u5B57\u534F\u4F5C\u7B14\u8BB0\u81EA\u52A8\u5408\u5E76\uFF1B\u8FD9\u91CC\u5217\u51FA\u6574\u6587\u4EF6\u7684\u7248\u672C\u5206\u53C9\u3002\u5904\u7406\u4E0D\u4F1A\u4E22\u5F03\u5386\u53F2\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u4F1A\u53E6\u5B58\u5230\u201C\u51B2\u7A81\u526F\u672C\u201D\u3002" });
     if (this.conflictError) m.contentEl.createEl("p", { text: "\u51B2\u7A81\u5217\u8868\u5C1A\u672A\u786E\u8BA4\uFF1A" + this.conflictError });
     if (!this.conflicts.length && !this.conflictError) m.contentEl.createEl("p", { text: this.client?.ready ? "\u5F53\u524D\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6574\u6587\u4EF6\u51B2\u7A81\u3002" : "\u5F53\u524D\u672A\u8FDE\u63A5\uFF0C\u8BF7\u8FDE\u63A5\u540E\u5237\u65B0\u51B2\u7A81\u5217\u8868\u3002" });
-    for (const r2 of this.conflicts) new import_obsidian.Setting(m.contentEl).setName(r2.path).setDesc(r2.reason + " \xB7 " + r2.versions.length + " \u4E2A\u4FDD\u7559\u7248\u672C").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => void this.showConflict(r2)));
+    for (const r2 of this.conflicts) new import_obsidian.Setting(m.contentEl).setName(r2.path).setDesc(r2.reason + " \xB7 " + r2.versions.length + " \u4E2A\u4FDD\u7559\u7248\u672C").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => {
+      m.close();
+      void this.showConflict(r2);
+    }));
     m.open();
   }
   async showConflict(review) {

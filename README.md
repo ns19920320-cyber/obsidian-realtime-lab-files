@@ -14,4 +14,4 @@ Limits unchanged: named inline collaboration note ≤16 KiB, other Markdown ≤1
 
 ## Build
 source.zip is frozen source. npm install; npm run typecheck; npm test (or node --test --test-concurrency=2 test/*.test.mjs); npm run build:v3-files. Use manifest.v3-files.json, not legacy root manifests.
-Source commit: 8244b82f781d226bba737b22e294a977e67120ff
+Source commit: 5c7ce27c349e759538efb4bee2bc9618c483d659

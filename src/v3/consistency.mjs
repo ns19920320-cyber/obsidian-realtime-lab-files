@@ -8,11 +8,11 @@ export function connectionIdentity({vaultName,basePath,url,serverId,deviceId,dev
 }
 // Read bytes directly, never through the fingerprint/cache writer. No vault, cache,
 // document, settings or queue mutation is permitted during an audit.
-export async function auditFiles({files,remote,read,queued=/** @type {string[]} */([]),maxPaths=8192}){
+export async function auditFiles({files,remote,read,queued=/** @type {string[]} */([]),maxPaths=8192,shouldContinue=()=>true}){
  const local=new Map(files.map(f=>[f.path,f])),paths=[...new Set([...local.keys(),...Object.keys(remote)])].sort();
  if(paths.length>maxPaths)throw Error('Audit path capacity exceeded');
  const pending=new Set(queued),rows=[];
- for(const path of paths){const f=local.get(path),r=remote[path];let row={path,status:'equal',localHash:null,remoteHash:r?referenceDigest(r):null};
+ for(const path of paths){if(!shouldContinue())throw Error('Audit interrupted; files preserved');if(rows.length%8===0)await new Promise(resolve=>setTimeout(resolve,0));const f=local.get(path),r=remote[path];let row={path,status:'equal',localHash:null,remoteHash:r?referenceDigest(r):null};
   if(!supported(path)||(f&&f.size>maxFileSize(path))){row.status='excluded';rows.push(row);continue;}
   try{if(f){const bytes=new Uint8Array(await read(path));if(bytes.length>maxFileSize(path))throw Error('File grew beyond limit');row.localHash=byteDigest(bytes);row.status=r?(row.localHash===row.remoteHash?'equal':'different'):'local-only';}else row.status='missing';}catch{row.status='read-error';}
   if(pending.has('*')||pending.has(path))row.status='queued';rows.push(row);
@@ -22,4 +22,13 @@ export async function auditFiles({files,remote,read,queued=/** @type {string[]} 
 }
 export function assertRepairSnapshot(row,{localHash,remoteHash,queued=false,stable=true}){
  if(!stable||!['missing','different'].includes(row.status)||queued||localHash!==row.localHash||remoteHash!==row.remoteHash)throw Error('文件或同步状态已变化，请重新核验；未替换文件');
+}
+
+// An additive server capability: automatic orphan uploads must never fall back
+// to ordinary last-writer publication on an older server.
+export const SAFE_PUBLISH_CAPABILITY='publish-absent-only-v1';
+export function safeConsistencyPlan(report,{deleted=/** @type {string[]} */([]),conflicts=/** @type {string[]} */([]),seen=/** @type {string[]} */([])}={}){
+ if(!report.stable)return [];
+ const blocked=new Set([...deleted,...conflicts]),prior=new Set(seen);
+ return report.rows.filter(r=>!blocked.has(r.path)&&['missing','local-only'].includes(r.status)&&(r.status!=='missing'||seen.length<8192&&!prior.has(byteDigest(new TextEncoder().encode(r.path))))).map(r=>({path:r.path,action:r.status==='missing'?'download-missing':'upload-absent',row:r}));
 }

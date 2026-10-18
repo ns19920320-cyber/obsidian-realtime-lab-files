@@ -27,3 +27,36 @@ jobs:
             work/v3-files-plugin/main.js
             work/v3-files-plugin/manifest.json
           if-no-files-found: error
+  publish:
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: realtime-lab-files-candidate
+          path: work/v3-files-plugin
+      - name: Publish validated BRAT assets when the version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "JSON.parse(require('fs').readFileSync('manifest.v3-files.json','utf8')).version")
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "Version already published; leaving its release unchanged."
+            exit 0
+          fi
+          cmp work/v3-files-plugin/main.js main.js
+          cmp work/v3-files-plugin/manifest.json manifest.json
+          mkdir -p work/release
+          cp work/v3-files-plugin/main.js work/v3-files-plugin/manifest.json work/release/
+          cp versions.json README.md work/release/
+          (cd work/release && zip -q plugin.zip main.js manifest.json)
+          git archive --format=zip --output=work/release/source.zip HEAD
+          (cd work/release && sha256sum main.js manifest.json plugin.zip README.md source.zip versions.json > SHA256SUMS)
+          gh release create "$version" work/release/* --target "$GITHUB_SHA" --latest --title "$version" --notes-file RELEASE-NOTES-alpha28.md

@@ -2,7 +2,7 @@
 
 Obsidian sync for Markdown, images, PDF, DOCX and supported opaque files. Install through BRAT using `ns19920320-cyber/obsidian-realtime-lab-files`. Each vault requires its own authenticated server space. Keep LiveSync disabled in a vault using this plugin. Existing nonempty uninitialized vaults are not automatically adopted or overwritten.
 
-The Files plugin entry point is `src/v3/plugin.ts`, its manifest is `manifest.v3-files.json`, and its build command is `npm run build:v3-files`. Root `manifest.json` and `src/plugin.ts` are retained legacy V2 sources and must not be used to build the Files release.
+The Files plugin entry point is `src/v3/plugin.ts`, its manifest is `manifest.v3-files.json`, and its build command is `npm run build:v3-files`. Use the Files build explicitly. `src/plugin.ts`, `build.mjs` and the generic `npm run build` belong to the legacy V2 implementation; do not use them to build Files. Root installation assets can lag an unreleased source branch.
 
 ## Development
 

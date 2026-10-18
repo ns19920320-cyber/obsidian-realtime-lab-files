@@ -11308,6 +11308,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.pendingRows().length) return "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4";
     if (this.receiveAcks.size || this.receiptFlush) return "\u6B63\u5728\u4FDD\u5B58\u63A5\u6536\u8FDB\u5EA6";
     if (!c.lastConfirmedAt) return "\u5DF2\u8FDE\u63A5\uFF0C\u7B49\u5F85\u670D\u52A1\u5668\u786E\u8BA4";
+    if (this.settings.consistencyHolds?.length) return "\u4E00\u81F4\u6027\u4FDD\u62A4\u6682\u505C" + this.settings.consistencyHolds.length + "\u6761\u8DEF\u5F84\uFF0C\u8BF7\u6838\u5BF9\u53CC\u65B9\u6B63\u6587";
     if (this.consistencyIssues()) return "\u4E0A\u6B21\u4E00\u81F4\u6027\u6838\u5BF9\u6709" + this.consistencyIssues() + "\u9879\u9700\u590D\u6838\uFF0C\u672A\u81EA\u52A8\u8986\u76D6";
     return "\u5DF2\u63D0\u4EA4\u670D\u52A1\u5668";
   }
@@ -11331,6 +11332,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
+    e.createEl("p", { text: "\u4E00\u81F4\u6027\u4FDD\u62A4\u8DEF\u5F84\uFF1A" + (this.settings.consistencyHolds?.length || 0) + "\uFF1B\u9047\u5230\u7ADE\u4E89\u65F6\u4FDD\u7559\u672C\u673A\u6B63\u6587\uFF0C\u91CD\u542F\u540E\u7EE7\u7EED\u4FDD\u62A4\u3002\u8BF7\u901A\u8FC7\u9010\u6587\u4EF6\u6838\u9A8C\u9884\u89C8\uFF0C\u518D\u660E\u786E\u9009\u62E9\u4FDD\u7559\u526F\u672C\u5E76\u4FEE\u590D\u3002" });
     e.createEl("p", { text: "\u4E00\u81F4\u6027\u6838\u5BF9\uFF1A" + this.consistencyStatus + "\uFF1B\u81EA\u52A8\u6838\u5BF9\u4E0E\u5B89\u5168\u8865\u4F20\uFF1A" + (this.settings.autoConsistency ? "\u5DF2\u5F00\u542F" : "\u672A\u5F00\u542F") });
     e.createEl("p", { text: "\u5F85\u4E0A\u4F20\u6587\u4EF6\u7248\u672C\uFF1A" + (c?.pending || this.settings.pending?.items || []).length + "\uFF1B\u540C\u4E00\u8DEF\u5F84\u53EF\u4EE5\u6709\u591A\u4E2A\u7248\u672C\uFF0C\u66F4\u65B0\u4E0E\u91CD\u8FDE\u4E0D\u4F1A\u81EA\u52A8\u6E05\u7A7A\u3002" });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A" + this.conflicts.length });
@@ -11408,6 +11410,15 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.consistencyReport = report;
       if (!report.stable || !idle()) throw Error("\u6838\u5BF9\u671F\u95F4\u6587\u4EF6\u6216\u961F\u5217\u53D8\u5316\uFF0C\u7B49\u5F85\u4E0B\u6B21\u6838\u5BF9");
       if (this.settings.consistencySeen && (!Array.isArray(this.settings.consistencySeen) || this.settings.consistencySeen.length > 8192 || this.settings.consistencySeen.some((v) => !/^[a-f0-9]{64}$/.test(v)))) throw Error("\u4E00\u81F4\u6027\u57FA\u7EBF\u65E0\u6548\uFF0C\u672A\u6267\u884C\u8865\u4F20");
+      const confirmedHolds = /* @__PURE__ */ new Set();
+      for (const row of report.rows.filter((r2) => r2.status === "equal" && (this.settings.consistencyHolds || []).includes(r2.path) && !this.conflicts.some((c2) => c2.path === r2.path))) {
+        const f = this.app.vault.getAbstractFileByPath(row.path);
+        if (f instanceof import_obsidian.TFile && idle() && referenceDigest(content(c.doc, row.path)) === row.remoteHash && byteDigest(new Uint8Array(await this.app.vault.readBinary(f))) === row.localHash && idle()) confirmedHolds.add(row.path);
+      }
+      if (confirmedHolds.size) {
+        this.settings.consistencyHolds = (this.settings.consistencyHolds || []).filter((p) => !confirmedHolds.has(p));
+        await this.persistConfig();
+      }
       if (!this.settings.consistencySeen) {
         for (const f of this.app.vault.getFiles()) this.noteConsistencyPath(f.path);
         for (const path of Object.keys(entries(c.doc))) this.noteConsistencyPath(path);
@@ -11426,7 +11437,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
             if (!c.serverCapabilities?.includes(SAFE_PUBLISH_CAPABILITY)) throw Error("\u670D\u52A1\u5668\u672A\u652F\u6301\u5B89\u5168\u8865\u4F20\uFF0C\u4FDD\u7559\u672C\u5730\u6587\u4EF6");
             const job = this.queue.then(async () => {
               const check = async () => {
-                if (!idle() || this.liveSync() || this.pathBlocked(item.path) || this.writing.has(item.path) || this.conflicts.some((r2) => r2.path === item.path) || c.doc.getMap("files").has(item.path) || c.doc.getMap("deleted").has(item.path)) throw Error("\u8DEF\u5F84\u6216\u961F\u5217\u5DF2\u53D8\u5316\uFF0C\u4FDD\u7559\u672C\u5730\u6587\u4EF6");
+                if (!idle() || this.liveSync() || this.pathSafetyBlocked(item.path) || this.writing.has(item.path) || this.conflicts.some((r2) => r2.path === item.path) || c.doc.getMap("files").has(item.path) || c.doc.getMap("deleted").has(item.path)) throw Error("\u8DEF\u5F84\u6216\u961F\u5217\u5DF2\u53D8\u5316\uFF0C\u4FDD\u7559\u672C\u5730\u6587\u4EF6");
                 const f = this.app.vault.getAbstractFileByPath(item.path);
                 if (!(f instanceof import_obsidian.TFile)) throw Error("\u672C\u5730\u6587\u4EF6\u5DF2\u53D8\u5316");
                 const bytes2 = new Uint8Array(await this.app.vault.readBinary(f));
@@ -11434,10 +11445,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
                 return bytes2;
               };
               const bytes = await check();
+              this.settings.consistencyHolds = [.../* @__PURE__ */ new Set([...this.settings.consistencyHolds || [], item.path])];
+              await this.persistConfig();
               await c.putFile(item.path, { size: bytes.length, read: async (p, n) => bytes.subarray(p, p + n) }, { base: null, ifAbsent: true, beforePublish: async () => {
                 await check();
               } });
               await c.confirmUploads();
+              this.settings.consistencyHolds = (this.settings.consistencyHolds || []).filter((p) => p !== item.path);
+              await this.persistConfig();
             });
             this.queue = job.catch(() => {
             });
@@ -11463,14 +11478,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.updateProgress();
     }
   }
-  async repairConsistency(row, report) {
+  async repairConsistency(row, report, releaseHold = false) {
     const c = this.client;
     if (!c?.ready || c.serverId !== report.serverId || !report.stable) throw Error("\u8FDE\u63A5\u6216\u62A5\u544A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6838\u9A8C");
     const job = this.queue.then(async () => {
       const check = async () => {
         if (this.client !== c || !c.ready || c.serverId !== report.serverId || this.liveSync()) throw Error("\u8FDE\u63A5\u5DF2\u53D8\u5316");
         const f2 = this.app.vault.getAbstractFileByPath(row.path), localHash = f2 instanceof import_obsidian.TFile ? byteDigest(new Uint8Array(await this.app.vault.readBinary(f2))) : null;
-        assertRepairSnapshot(row, { localHash, remoteHash: referenceDigest(content(c.doc, row.path)), stable: report.stable, queued: this.pathBlocked(row.path) || this.writing.has(row.path) || this.pendingRows().some((r2) => r2.path === "*" || r2.path === row.path) || this.conflicts.some((r2) => r2.path === row.path) || [...this.bindings.values()].some((b) => b.path === row.path) });
+        assertRepairSnapshot(row, { localHash, remoteHash: referenceDigest(content(c.doc, row.path)), stable: report.stable, queued: this.pathSafetyBlocked(row.path) || !releaseHold && (this.settings.consistencyHolds || []).includes(row.path) || this.writing.has(row.path) || this.pendingRows().some((r2) => r2.path === "*" || r2.path === row.path) || this.conflicts.some((r2) => r2.path === row.path) || [...this.bindings.values()].some((b) => b.path === row.path) });
         return f2;
       };
       await check();
@@ -11501,6 +11516,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
       const saved = this.app.vault.getAbstractFileByPath(row.path);
       if (!(saved instanceof import_obsidian.TFile) || byteDigest(new Uint8Array(await this.app.vault.readBinary(saved))) !== row.remoteHash) throw Error("\u4FEE\u590D\u540E\u6821\u9A8C\u672A\u901A\u8FC7\uFF0C\u8BF7\u4FDD\u7559\u6062\u590D\u526F\u672C");
+      if (releaseHold) {
+        this.settings.consistencyHolds = (this.settings.consistencyHolds || []).filter((p) => p !== row.path);
+        await this.persistConfig();
+      }
       return true;
     });
     this.queue = job.then(() => {
@@ -11529,7 +11548,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           ask.contentEl.createEl("p", { text: "\u4EC5\u5904\u7406\u8FD9\u4E2A\u6587\u4EF6\u3002\u672C\u5730\u5DF2\u6709\u5185\u5BB9\u5148\u4FDD\u5B58\u5230\u9690\u85CF\u6062\u590D\u76EE\u5F55\uFF0C\u518D\u4F7F\u7528\u670D\u52A1\u5668\u5F53\u524D\u7248\u672C\uFF1B\u5982\u679C\u6587\u4EF6\u6216\u961F\u5217\u53D1\u751F\u53D8\u5316\u5C06\u62D2\u7EDD\u66FF\u6362\u3002" });
           new import_obsidian.Setting(ask.contentEl).addButton((b2) => b2.setButtonText("\u53D6\u6D88").onClick(() => ask.close())).addButton((b2) => b2.setButtonText("\u4FDD\u7559\u526F\u672C\u5E76\u4FEE\u590D").onClick(async () => {
             try {
-              await this.repairConsistency(row, report);
+              await this.repairConsistency(row, report, true);
               new import_obsidian.Notice("\u5DF2\u4FEE\u590D\u5E76\u6821\u9A8C\uFF1A" + row.path);
               ask.close();
               report = await this.scanConsistency();
@@ -11613,7 +11632,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client, progress = this.progressModel(), uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
-    return badgeState({ progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -11770,8 +11789,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     for (const i of [...this.settings.pathSafety?.items || []].reverse()) for (const e of i.op.entries) if (e.to === path) return e.target || e.base;
     return null;
   }
-  pathBlocked(path) {
+  pathSafetyBlocked(path) {
     return (this.settings.pathSafety?.items || []).some((i) => operationPaths(i.op).includes(path));
+  }
+  pathBlocked(path) {
+    return this.pathSafetyBlocked(path) || (this.settings.consistencyHolds || []).includes(path);
   }
   queuePathSafety(kind, entries2, review = false, approved = false) {
     const c = this.client;
@@ -12088,7 +12110,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.registerEvent(this.app.workspace.on("editor-change", (editor, view) => {
       this.consistencyEpoch++;
       const c = this.client, p = view.file?.path;
-      if (!c || this.stopping || !this.syncedOnce || !p || this.writing.has(p) || !supportedFile(p) || content(c.doc, p)?.kind !== "text") return;
+      if (!c || this.stopping || !this.syncedOnce || !p || this.writing.has(p) || this.pathBlocked(p) || !supportedFile(p) || content(c.doc, p)?.kind !== "text") return;
       const data = editor.getValue();
       if (new TextEncoder().encode(data).length > MAX_INLINE_NOTE) return;
       if (c.doc.getText("text:" + p).toString() === data) return;
@@ -12604,7 +12626,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       const view = leaf.view;
       if (!(view instanceof import_obsidian.MarkdownView)) continue;
       const cm = view.editor.cm, p = view.file?.path;
-      if (!cm || !p || !supportedFile(p) || content(c.doc, p)?.kind !== "text") continue;
+      if (!cm || !p || !supportedFile(p) || this.pathBlocked(p) || content(c.doc, p)?.kind !== "text") continue;
       seen.add(cm);
       const prior = this.bindings.get(cm);
       if (prior?.path === p) continue;

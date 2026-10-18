@@ -18,10 +18,10 @@ export function badgeState({ready=false,preparing=false,receiving=false,connecti
  return {tone,icon,label,display,busy,counts,description:(progress?.available?counts+'；当前接收并发'+progress.active+'；待重试仅统计文件失败，不包含连接错误或冲突；':'进度尚未核对；')+label+'；待处理冲突'+conflicts+'；库内'+known+'个路径；待上传或确认'+(unknown?'数量待核对':uploads)+'；当前接收'+downloads+'。点击查看同步详情。服务器确认不等于其他设备已收到。'};
 }
 export const badgeCSS=`
-.rl-sync-row{display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
-.rl-sync-row .rl-sync-badge{display:inline-flex;align-items:center;gap:7px;width:max-content;max-width:100%;flex-wrap:wrap;justify-content:flex-end;min-height:24px;padding:0;border:0;border-radius:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:400;line-height:24px;white-space:nowrap;cursor:pointer;box-shadow:none;font-variant-numeric:tabular-nums}
+.rl-sync-row{min-width:0;display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
+.rl-sync-row .rl-sync-badge{display:inline-flex;align-items:center;gap:7px;min-width:0;width:max-content;max-width:100%;flex-wrap:wrap;justify-content:flex-end;min-height:24px;padding:0;border:0;border-radius:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:400;line-height:24px;white-space:nowrap;cursor:pointer;box-shadow:none;font-variant-numeric:tabular-nums}
 .rl-sync-badge .rl-sync-icon{display:none}
-.rl-sync-badge .rl-sync-label,.rl-sync-badge .rl-sync-counts{white-space:nowrap}
+.rl-sync-badge .rl-sync-label,.rl-sync-badge .rl-sync-counts{min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;text-align:right}
 .rl-sync-badge[data-tone=error]{color:var(--text-error)}
 .rl-sync-badge:hover{color:var(--text-normal)}
 .rl-sync-badge:focus-visible{outline:2px solid var(--interactive-accent);outline-offset:3px}

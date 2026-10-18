@@ -10424,10 +10424,10 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
   return { tone, icon, label, display, busy, counts, description: (progress?.available ? counts + "\uFF1B\u5F53\u524D\u63A5\u6536\u5E76\u53D1" + progress.active + "\uFF1B\u5F85\u91CD\u8BD5\u4EC5\u7EDF\u8BA1\u6587\u4EF6\u5931\u8D25\uFF0C\u4E0D\u5305\u542B\u8FDE\u63A5\u9519\u8BEF\u6216\u51B2\u7A81\uFF1B" : "\u8FDB\u5EA6\u5C1A\u672A\u6838\u5BF9\uFF1B") + label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
 var badgeCSS = `
-.rl-sync-row{display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
-.rl-sync-row .rl-sync-badge{display:inline-flex;align-items:center;gap:7px;width:max-content;max-width:100%;flex-wrap:wrap;justify-content:flex-end;min-height:24px;padding:0;border:0;border-radius:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:400;line-height:24px;white-space:nowrap;cursor:pointer;box-shadow:none;font-variant-numeric:tabular-nums}
+.rl-sync-row{min-width:0;display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
+.rl-sync-row .rl-sync-badge{display:inline-flex;align-items:center;gap:7px;min-width:0;width:max-content;max-width:100%;flex-wrap:wrap;justify-content:flex-end;min-height:24px;padding:0;border:0;border-radius:0;background:transparent;color:var(--text-muted);font-size:12px;font-weight:400;line-height:24px;white-space:nowrap;cursor:pointer;box-shadow:none;font-variant-numeric:tabular-nums}
 .rl-sync-badge .rl-sync-icon{display:none}
-.rl-sync-badge .rl-sync-label,.rl-sync-badge .rl-sync-counts{white-space:nowrap}
+.rl-sync-badge .rl-sync-label,.rl-sync-badge .rl-sync-counts{min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;text-align:right}
 .rl-sync-badge[data-tone=error]{color:var(--text-error)}
 .rl-sync-badge:hover{color:var(--text-normal)}
 .rl-sync-badge:focus-visible{outline:2px solid var(--interactive-accent);outline-offset:3px}

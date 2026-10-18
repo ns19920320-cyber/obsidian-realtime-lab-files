@@ -10231,6 +10231,7 @@ function textDifference(a, b) {
   const removed = x.slice(start, x.length - end), added = y.slice(start, y.length - end);
   return { removed: removed.slice(0, 100).map((s) => "\u2212 " + s).join("\n"), added: added.slice(0, 100).map((s) => "+ " + s).join("\n"), truncated: a.length > 2e4 || b.length > 2e4 || removed.length > 100 || added.length > 100, equal: a === b };
 }
+var KEEP_CURRENT_CAPABILITY = "conflict-keep-current-history-v1";
 
 var markdown = (p) => /\.md$/i.test(p);
 function content(doc2, p) {
@@ -12592,6 +12593,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     window.clearTimeout(this.conflictTimer);
     this.conflictTimer = window.setTimeout(() => void this.refreshConflicts(), 500);
   }
+  async currentBodyMatches(f, expected) {
+    if (expected?.kind === "text") return await this.app.vault.read(f) === expected.data;
+    if (!expected || f.stat.size > maxFileSize(f.path)) return false;
+    const bytes = new Uint8Array(await this.app.vault.readBinary(f));
+    return bytes.length === expected.size && new Sha256().update(bytes).hex() === expected.hash;
+  }
   async resolveConflict(review, strategy, version, expected) {
     const c = this.client;
     if (!c?.ready) throw Error("\u8BF7\u5148\u8FDE\u63A5\u6D4B\u8BD5\u5E93");
@@ -12599,6 +12606,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       if (c !== this.client || !c.ready) throw Error("\u8FDE\u63A5\u5DF2\u6539\u53D8");
       if (this.dirtyFiles.has(review.path) || c.pending.some((p) => p.path === review.path) || c.pendingPaths.includes(review.path) || c.pendingPaths.includes("*")) throw Error("\u6B64\u6587\u4EF6\u4ECD\u6709\u5F85\u4F20\u4FEE\u6539\uFF0C\u8BF7\u5148\u540C\u6B65");
       if (!sameContent(content(c.doc, review.path), expected)) throw Error("\u5F53\u524D\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u67E5\u770B\u51B2\u7A81");
+      if (strategy === "keep-current-history" && !c.serverCapabilities?.includes(KEEP_CURRENT_CAPABILITY)) throw Error("\u670D\u52A1\u5668\u5C1A\u672A\u652F\u6301\u4EC5\u89E3\u9664\u6807\u8BB0\uFF0C\u8BF7\u5148\u5347\u7EA7\u670D\u52A1\u5668\uFF1B\u672A\u4FEE\u6539\u6B63\u6587\u6216\u51B2\u7A81");
+      if (strategy === "keep-current-history") {
+        const f = this.app.vault.getAbstractFileByPath(review.path);
+        if (!(f instanceof import_obsidian.TFile) || !await this.currentBodyMatches(f, expected)) throw Error("\u672C\u5730\u6B63\u6587\u4E0E\u670D\u52A1\u5668\u5C1A\u672A\u4E00\u81F4\uFF0C\u8BF7\u540C\u6B65\u540E\u91CD\u65B0\u5BA1\u6838");
+      }
       if (strategy === "use-version") {
         const f = this.app.vault.getAbstractFileByPath(review.path);
         if (f instanceof import_obsidian.TFile) {
@@ -12609,7 +12621,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
       if (this.dirtyFiles.has(review.path) || !sameContent(content(c.doc, review.path), expected)) throw Error("\u5F53\u524D\u5185\u5BB9\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u67E5\u770B\u51B2\u7A81");
       await c.request("resolve-conflict", { path: review.path, reviewId: review.id, strategy, version, expected });
-      await this.reflect();
+      if (strategy !== "keep-current-history") await this.reflect();
       await c.confirmUploads();
       await this.refreshConflicts();
     });
@@ -12629,7 +12641,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const m = new import_obsidian.Modal(this.app);
     m.titleEl.setText("\u540C\u6B65\u51B2\u7A81");
     m.modalEl.addClass("rl-history-modal");
-    m.contentEl.createEl("p", { text: "\u9010\u5B57\u534F\u4F5C\u7B14\u8BB0\u81EA\u52A8\u5408\u5E76\uFF1B\u8FD9\u91CC\u5217\u51FA\u6574\u6587\u4EF6\u7684\u7248\u672C\u5206\u53C9\u3002\u5904\u7406\u4E0D\u4F1A\u4E22\u5F03\u5386\u53F2\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u4F1A\u53E6\u5B58\u5230\u201C\u51B2\u7A81\u526F\u672C\u201D\u3002" });
+    m.contentEl.createEl("p", { text: "\u9010\u5B57\u534F\u4F5C\u7B14\u8BB0\u81EA\u52A8\u5408\u5E76\uFF1B\u8FD9\u91CC\u5217\u51FA\u6574\u6587\u4EF6\u7684\u7248\u672C\u5206\u53C9\u3002\u53EF\u4EC5\u786E\u8BA4\u5F53\u524D\u6B63\u6587\u5E76\u4FDD\u7559\u539F\u5386\u53F2\uFF1B\u9009\u62E9\u5176\u4ED6\u7248\u672C\u6216\u4FDD\u7559\u53CC\u65B9\u65F6\u4F1A\u53E6\u5B58\u201C\u51B2\u7A81\u526F\u672C\u201D\u3002" });
     if (this.conflictError) m.contentEl.createEl("p", { text: "\u51B2\u7A81\u5217\u8868\u5C1A\u672A\u786E\u8BA4\uFF1A" + this.conflictError });
     if (!this.conflicts.length && !this.conflictError) m.contentEl.createEl("p", { text: this.client?.ready ? "\u5F53\u524D\u6CA1\u6709\u5F85\u5904\u7406\u7684\u6574\u6587\u4EF6\u51B2\u7A81\u3002" : "\u5F53\u524D\u672A\u8FDE\u63A5\uFF0C\u8BF7\u8FDE\u63A5\u540E\u5237\u65B0\u51B2\u7A81\u5217\u8868\u3002" });
     for (const r2 of this.conflicts) new import_obsidian.Setting(m.contentEl).setName(r2.path).setDesc(r2.reason + " \xB7 " + r2.versions.length + " \u4E2A\u4FDD\u7559\u7248\u672C").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => {
@@ -12650,12 +12662,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       const list = await c.request("history", { path: review.path });
       const confirm = (strategy, version) => {
         const ask = new import_obsidian.Modal(this.app);
-        ask.titleEl.setText(strategy === "keep-both" ? "\u4FDD\u7559\u6240\u6709\u7248\u672C" : "\u786E\u8BA4\u4F7F\u7528\u6B64\u7248\u672C");
-        ask.contentEl.createEl("p", { text: strategy === "keep-both" ? "\u539F\u6587\u4EF6\u4E0D\u53D8\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u53E6\u5B58\u4E3A\u51B2\u7A81\u526F\u672C\u5E76\u6807\u8BB0\u5DF2\u5904\u7406\u3002" : "\u5F53\u524D\u5185\u5BB9\u5148\u5907\u4EFD\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u53E6\u5B58\u4E3A\u51B2\u7A81\u526F\u672C\uFF0C\u518D\u66FF\u6362\u539F\u6587\u4EF6\u5E76\u540C\u6B65\u5230\u6D4B\u8BD5\u8BBE\u5907\u3002" });
+        ask.titleEl.setText(strategy === "keep-current-history" ? "\u4EC5\u89E3\u9664\u51B2\u7A81\u6807\u8BB0" : strategy === "keep-both" ? "\u4FDD\u7559\u6240\u6709\u7248\u672C" : "\u786E\u8BA4\u4F7F\u7528\u6B64\u7248\u672C");
+        ask.contentEl.createEl("p", { text: strategy === "keep-current-history" ? "\u53EA\u89E3\u9664\u6B64\u7BC7\u51B2\u7A81\u6807\u8BB0\uFF0C\u5F53\u524D\u6B63\u6587\u3001\u5386\u53F2\u3001\u7F13\u5B58\u548C\u961F\u5217\u4E0D\u53D8\uFF0C\u4E0D\u751F\u6210\u51B2\u7A81\u526F\u672C\uFF1B\u5982\u6709\u65B0\u7F16\u8F91\u4F1A\u62D2\u7EDD\u5904\u7406\u3002" : strategy === "keep-both" ? "\u539F\u6587\u4EF6\u4E0D\u53D8\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u53E6\u5B58\u4E3A\u51B2\u7A81\u526F\u672C\u5E76\u6807\u8BB0\u5DF2\u5904\u7406\u3002" : "\u5F53\u524D\u5185\u5BB9\u5148\u5907\u4EFD\uFF0C\u6240\u6709\u5019\u9009\u7248\u672C\u53E6\u5B58\u4E3A\u51B2\u7A81\u526F\u672C\uFF0C\u518D\u66FF\u6362\u539F\u6587\u4EF6\u5E76\u540C\u6B65\u5230\u6D4B\u8BD5\u8BBE\u5907\u3002" });
         new import_obsidian.Setting(ask.contentEl).addButton((b) => b.setButtonText("\u53D6\u6D88").onClick(() => ask.close())).addButton((b) => b.setButtonText("\u786E\u8BA4\u5904\u7406").onClick(async () => {
           try {
             await this.resolveConflict(review, strategy, version, expected);
-            new import_obsidian.Notice("\u51B2\u7A81\u5DF2\u5904\u7406\uFF0C\u5019\u9009\u7248\u672C\u526F\u672C\u5DF2\u540C\u6B65");
+            new import_obsidian.Notice(strategy === "keep-current-history" ? "\u51B2\u7A81\u6807\u8BB0\u5DF2\u89E3\u9664\uFF0C\u6B63\u6587\u548C\u5386\u53F2\u4FDD\u6301\u4E0D\u53D8" : "\u51B2\u7A81\u5DF2\u5904\u7406\uFF0C\u5019\u9009\u7248\u672C\u526F\u672C\u5DF2\u540C\u6B65");
             ask.close();
             m.close();
           } catch (e) {
@@ -12664,6 +12676,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         }));
         ask.open();
       };
+      const currentVersion = list.filter((v) => review.versions.includes(v.id) && !v.deleted && sameContent(v, expected)).at(-1), canKeepCurrent = c.serverCapabilities?.includes(KEEP_CURRENT_CAPABILITY) && !!currentVersion;
+      new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u4FDD\u7559\u5F53\u524D\u6B63\u6587\u3001\u4EC5\u89E3\u9664\u51B2\u7A81\u6807\u8BB0").setDisabled(!canKeepCurrent).onClick(() => confirm("keep-current-history", currentVersion?.id)));
+      if (!c.serverCapabilities?.includes(KEEP_CURRENT_CAPABILITY)) m.contentEl.createEl("p", { text: "\u6B64\u670D\u52A1\u5668\u5C1A\u672A\u652F\u6301\u4EC5\u89E3\u9664\u6807\u8BB0\uFF1B\u8BE5\u6309\u94AE\u4E0D\u4F1A\u9000\u56DE\u65E7\u7684\u8986\u76D6\u6216\u526F\u672C\u64CD\u4F5C\u3002" });
       new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u4FDD\u7559\u6240\u6709\u7248\u672C\u4E3A\u526F\u672C").onClick(() => confirm("keep-both")));
       for (const id2 of review.versions) {
         const v = list.find((x) => x.id === id2);

@@ -10172,7 +10172,9 @@ function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
 }
 
 function transientTransferFailure(error) {
+  if (error?.code === "METADATA_NOT_READY") return true;
   const s = String(error?.message || error);
+  if (/^(?:Error: )?Connect verified V3 metadata before transferring blobs$/.test(s)) return true;
   if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
   return /Foreground reconnect; local edits retained|blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
 }
@@ -10365,7 +10367,7 @@ function documentDigest(doc2) {
   return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
 }
 
-function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false }) {
+function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0 }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
     tone = "error";
@@ -10375,6 +10377,11 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     tone = "waiting";
     icon = "alert-circle";
     label = "\u8DEF\u5F84\u64CD\u4F5C\u5F85\u786E\u8BA4";
+  } else if (!ready && reconnecting) {
+    tone = "busy";
+    icon = "refresh-cw";
+    label = "\u91CD\u8FDE\u4E2D";
+    busy = true;
   } else if (error && retrying && ready) {
     tone = "busy";
     icon = "refresh-cw";
@@ -10405,11 +10412,16 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
   }
   const legacyCounts = "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads;
   let display = "Sync: " + (ready && conflicts ? "\u26A0 \u51B2\u7A81" + conflicts : ready && protectedCount ? "\u26A0 \u5F85\u786E\u8BA4" + protectedCount : tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
-  const counts = progress?.available ? (ready ? "" : "\u4E0A\u6B21\u8FDB\u5EA6\uFF1A") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : progress ? "\u8FDB\u5EA6\u5F85\u6838\u5BF9" : legacyCounts;
-  if (progress && !conflicts && !protectedCount) {
-    display = "Sync: " + (label === "\u6062\u590D\u4E2D" ? "\u6062\u590D\u4E2D" : tone === "busy" ? "\u540C\u6B65\u4E2D" : tone === "confirmed" ? "\u2713" : tone === "error" ? "\u26A0 \u9700\u5904\u7406" : label);
+  let counts = progress?.available ? (ready ? "" : "\u4E0A\u6B21\u8FDB\u5EA6\uFF1A") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : progress ? "\u8FDB\u5EA6\u5F85\u6838\u5BF9" : legacyCounts;
+  if (progress) {
+    counts += " \xB7 \u5F85\u4F20/\u786E\u8BA4 " + (unknown ? "\u5F85\u6838\u5BF9" : uploads) + "\u8DEF\u5F84" + (pendingVersions ? "\uFF08" + pendingVersions + "\u7248\u672C\uFF09" : "") + " \xB7 \u51B2\u7A81 " + conflicts;
+    if (!ready) counts += "\uFF08\u5F53\u524D\u672A\u6838\u5BF9\uFF09";
   }
-  return { tone, icon, label, display, busy, counts, description: (progress?.available ? counts + "\uFF1B\u5F53\u524D\u63A5\u6536\u5E76\u53D1" + progress.active + "\uFF1B\u5F85\u91CD\u8BD5\u5305\u542B\u5728\u5269\u4F59\u4E2D\uFF1B" : "\u8FDB\u5EA6\u5C1A\u672A\u6838\u5BF9\uFF1B") + label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
+  if (progress && !conflicts && !protectedCount) {
+    display = "Sync: " + (label === "\u91CD\u8FDE\u4E2D" ? "\u91CD\u8FDE\u4E2D" : label === "\u6062\u590D\u4E2D" ? "\u6062\u590D\u4E2D" : tone === "busy" ? "\u540C\u6B65\u4E2D" : tone === "confirmed" ? "\u2713" : tone === "error" ? "\u26A0 \u9700\u5904\u7406" : label);
+  }
+  if (!ready && reconnecting && conflicts) display = "Sync: \u91CD\u8FDE\u4E2D \xB7 \u51B2\u7A81" + conflicts;
+  return { tone, icon, label, display, busy, counts, description: (progress?.available ? counts + "\uFF1B\u5F53\u524D\u63A5\u6536\u5E76\u53D1" + progress.active + "\uFF1B\u5F85\u91CD\u8BD5\u4EC5\u7EDF\u8BA1\u6587\u4EF6\u5931\u8D25\uFF0C\u4E0D\u5305\u542B\u8FDE\u63A5\u9519\u8BEF\u6216\u51B2\u7A81\uFF1B" : "\u8FDB\u5EA6\u5C1A\u672A\u6838\u5BF9\uFF1B") + label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
 var badgeCSS = `
 .rl-sync-row{display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}
@@ -10637,6 +10649,7 @@ var VaultClient = class {
             try {
               await this.onIdentity(m.serverId, "join");
             } catch (error) {
+              if (this.stopped || this.ws !== ws) return;
               this.onStatus("\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF1A" + String(error?.message || error) + "\u3002\u8BF7\u4FDD\u7559\u672C\u5730\u5185\u5BB9\uFF0C\u68C0\u67E5\u53EF\u7528\u7A7A\u95F4\u548C\u5B58\u50A8\u6743\u9650\u540E\uFF0C\u70B9\u51FB\u8FDE\u63A5\u91CD\u8BD5\u3002");
               this.stopped = true;
               ws.close(4404, "Local identity persistence failed");
@@ -10647,8 +10660,9 @@ var VaultClient = class {
             this.serverCapabilities = m.capabilities || [];
             this.metadataVerified = true;
             try {
-              await this.beforeUpload();
+              await this.beforeUpload({ isCurrent: () => !this.stopped && this.ws === ws && ws.readyState === 1 });
             } catch (error) {
+              if (this.stopped || this.ws !== ws || ws.readyState !== 1) return;
               if (this.retryPreparation(error)) {
                 this.onStatus("\u9644\u4EF6\u7F51\u7EDC\u6682\u4E0D\u53EF\u7528\uFF0C\u4FDD\u7559\u5F85\u4F20\u961F\u5217\u5E76\u81EA\u52A8\u91CD\u8FDE\uFF1A" + String(error?.message || error));
                 ws.close(1012, "Retry cached upload");
@@ -10677,6 +10691,7 @@ var VaultClient = class {
             if (m.type === "error") this.onStatus("\u9519\u8BEF\uFF1A" + m.message);
           }
         } catch {
+          if (this.stopped || this.ws !== ws) return;
           this.onStatus("\u534F\u8BAE\u9519\u8BEF");
           ws.close();
         }
@@ -10892,15 +10907,20 @@ var BlobTransfer = class {
 
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
-    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], beforeUpload: async () => {
-      await options.beforeUpload?.();
+    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], beforeUpload: async (context) => {
+      await options.beforeUpload?.(context);
+      if (!context.isCurrent()) return;
       if (this.pending.length) {
         if (!this.blobCache) throw Error("Pending file cache required");
-        for (const p of this.pending) await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
+        for (const p of this.pending) {
+          if (!context.isCurrent()) return;
+          await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
+        }
       }
     }, maxBufferedBytes: 4 * 1024 * 1024, maxInboxBytes: 8 * 1024 * 1024 });
     this.blobs = new BlobTransfer({ url: options.url.replace(/^ws/, "http"), token: options.token, fetchImpl: options.fetchImpl, onTransfer: options.onTransfer, rangeReads: () => this.serverCapabilities?.includes(RANGE_CAPABILITY), responseIdentity: () => this.serverCapabilities?.includes(BLOB_RESPONSE_IDENTITY_CAPABILITY), verifyIdentity: async () => {
-      if (!this.ready && !this.metadataVerified || !this.serverId) throw Error("Connect verified V3 metadata before transferring blobs");
+      if (!this.serverId) throw Error("Verified server identity missing; transfers blocked");
+      if (!this.ready && !this.metadataVerified) throw Object.assign(Error("Connect verified V3 metadata before transferring blobs"), { code: "METADATA_NOT_READY" });
       return this.serverId;
     } });
     this.blobCache = options.blobCache;
@@ -10928,6 +10948,7 @@ var VaultClientV3 = class extends VaultClient {
     };
     const ready = this.onReady;
     this.onReady = () => {
+      if (transientTransferFailure(this.lastError)) this.lastError = "";
       ready();
       this.queueConfirmation();
     };
@@ -11071,9 +11092,10 @@ var VaultClientV3 = class extends VaultClient {
   }
   async putFile(path, source, options = {}) {
     if (!supportedFile(path) || source.size > maxFileSize(path)) throw Error("Unsupported file or per-type size limit");
-    const base = Object.hasOwn(options, "base") ? options.base : content(this.doc, path), version = options.version || crypto.randomUUID();
+    const transport = this.ws, base = Object.hasOwn(options, "base") ? options.base : content(this.doc, path), version = options.version || crypto.randomUUID();
     const ref = await this.blobs.upload(source, { signal: this.binaryAbort.signal, ...options });
     if (this.stopped) throw Error("Client closed; cached source retained");
+    if (this.ws !== transport || !this.metadataVerified || transport?.readyState !== 1) throw Object.assign(Error("Disconnected before version publication; cached source retained"), { code: "METADATA_NOT_READY" });
     if (options.prepareOnly) return ref;
     if (this.serverCapabilities?.includes(CONFLICT_CAPABILITY) && !this.ready) throw Error("Disconnected before version publication; cached source retained");
     if (this.ready && this.serverCapabilities?.includes(CONFLICT_CAPABILITY)) {
@@ -11240,7 +11262,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   summaryStatus() {
     const c = this.client;
-    if (!c?.ready) return this.connectionStatus;
+    if (!c?.ready) return this.connectionStatus + "\uFF1B\u5F85\u4F20\u6587\u4EF6\u7248\u672C" + (c?.pending.length ?? this.settings.pending?.items?.length ?? 0) + "\uFF1B\u51B2\u7A81" + this.conflicts.length;
     if (this.settings.pathSafety?.items.length) return "\u6709" + this.settings.pathSafety.items.length + "\u9879\u5220\u9664\u6216\u91CD\u547D\u540D\u7B49\u5F85\u786E\u8BA4/\u91CD\u8BD5";
     if (this.settings.remoteDeleteReview) return "\u6709" + this.settings.remoteDeleteReview.paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\u7B49\u5F85\u786E\u8BA4";
     if (this.conflicts.length) return "\u6709" + this.conflicts.length + "\u9879\u51B2\u7A81\u5F85\u5904\u7406\uFF0C\u53CC\u65B9\u7248\u672C\u5DF2\u4FDD\u7559";
@@ -11266,7 +11288,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.empty();
     const c = this.client, rows = this.pendingRows(), progress = this.progressModel();
     e.createEl("p", { text: progress.available ? (c?.ready ? "\u6587\u4EF6\u8FDB\u5EA6\uFF1A" : "\u79BB\u7EBF\u53C2\u8003\u8FDB\u5EA6\uFF08\u91CD\u8FDE\u540E\u6838\u5BF9\uFF09\uFF1A") + "\u5DF2\u5B8C\u6210 " + progress.completed + " / " + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : "\u6587\u4EF6\u8FDB\u5EA6\uFF1A\u6B63\u5728\u6838\u5BF9\uFF0C\u5C1A\u4E0D\u80FD\u786E\u8BA4\u5DF2\u5B8C\u6210\u6570\u91CF" });
-    e.createEl("p", { text: "\u5F53\u524D\u63A5\u6536\u5E76\u53D1\uFF1A" + progress.active + "\uFF08\u4E0D\u662F\u5269\u4F59\u6587\u4EF6\u6570\uFF09\uFF1B\u5F85\u91CD\u8BD5\u5305\u542B\u5728\u5269\u4F59\u4E2D\uFF0C\u4E0D\u91CD\u590D\u76F8\u52A0\u3002" });
+    e.createEl("p", { text: "\u5F53\u524D\u63A5\u6536\u5E76\u53D1\uFF1A" + progress.active + "\uFF08\u4E0D\u662F\u5269\u4F59\u6587\u4EF6\u6570\uFF09\uFF1B\u5F85\u91CD\u8BD5\u4EC5\u7EDF\u8BA1\u6587\u4EF6\u5931\u8D25\uFF0C\u4E0D\u5305\u542B\u8FDE\u63A5\u9519\u8BEF\u6216\u51B2\u7A81\uFF0C\u4E14\u5DF2\u5305\u542B\u5728\u5269\u4F59\u4E2D\u3002" });
     const identity = this.identityDetails();
     e.createEl("p", { text: "\u5F53\u524D\u5E93\uFF1A" + identity.vaultName + " \xB7 " + identity.localPath });
     e.createEl("p", { text: "\u540C\u6B65\u7A7A\u95F4\uFF1A" + identity.endpoint + " \xB7 ID " + identity.serverId });
@@ -11274,6 +11296,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
+    e.createEl("p", { text: "\u5F85\u4E0A\u4F20\u6587\u4EF6\u7248\u672C\uFF1A" + (c?.pending || this.settings.pending?.items || []).length + "\uFF1B\u540C\u4E00\u8DEF\u5F84\u53EF\u4EE5\u6709\u591A\u4E2A\u7248\u672C\uFF0C\u66F4\u65B0\u4E0E\u91CD\u8FDE\u4E0D\u4F1A\u81EA\u52A8\u6E05\u7A7A\u3002" });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A" + this.conflicts.length });
     if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
@@ -11469,7 +11492,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client, progress = this.progressModel(), uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
-    return badgeState({ progress, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));

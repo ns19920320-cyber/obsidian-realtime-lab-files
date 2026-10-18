@@ -1,7 +1,8 @@
-export function badgeState({ready=false,preparing=false,receiving=false,connecting=false,error=false,confirmed=false,uploads=0,downloads=0,unknown=false,known=0,conflicts=0,protectedCount=0,progress, retrying=false}){
+export function badgeState({ready=false,preparing=false,receiving=false,connecting=false,error=false,confirmed=false,uploads=0,downloads=0,unknown=false,known=0,conflicts=0,protectedCount=0,progress, retrying=false,reconnecting=false,pendingVersions=0}){
  let tone='offline',icon='cloud-off',label='离线',busy=false;
  if(ready&&conflicts){tone='error';icon='alert-circle';label='冲突待处理';}
  else if(ready&&protectedCount){tone='waiting';icon='alert-circle';label='路径操作待确认';}
+ else if(!ready&&reconnecting){tone='busy';icon='refresh-cw';label='重连中';busy=true;}
  else if(error&&retrying&&ready){tone='busy';icon='refresh-cw';label='恢复中';busy=true;}
  else if(error){tone='error';icon='alert-circle';label='需处理';}
  else if(!ready&&connecting){tone='busy';icon='refresh-cw';label='连接中';busy=true;}
@@ -10,9 +11,11 @@ export function badgeState({ready=false,preparing=false,receiving=false,connecti
  else if(ready){tone='confirmed';icon='check';label='已确认';}
  const legacyCounts='↑'+(unknown?'?':uploads)+' ↓'+downloads;
  let display='Sync: '+(ready&&conflicts?'⚠ 冲突'+conflicts:ready&&protectedCount?'⚠ 待确认'+protectedCount:tone==='confirmed'?'⚡':tone==='busy'?'↻':tone==='waiting'?'◷':tone==='error'?'⚠ 异常':'○ 离线');
- const counts=progress?.available?(ready?'':'上次进度：')+'已完成 '+progress.completed+'/'+progress.total+' · 剩余 '+progress.remaining+' · 待重试 '+progress.retry:progress?'进度待核对':legacyCounts;
- if(progress&&!conflicts&&!protectedCount){display='Sync: '+(label==='恢复中'?'恢复中':tone==='busy'?'同步中':tone==='confirmed'?'✓':tone==='error'?'⚠ 需处理':label);}
- return {tone,icon,label,display,busy,counts,description:(progress?.available?counts+'；当前接收并发'+progress.active+'；待重试包含在剩余中；':'进度尚未核对；')+label+'；待处理冲突'+conflicts+'；库内'+known+'个路径；待上传或确认'+(unknown?'数量待核对':uploads)+'；当前接收'+downloads+'。点击查看同步详情。服务器确认不等于其他设备已收到。'};
+ let counts=progress?.available?(ready?'':'上次进度：')+'已完成 '+progress.completed+'/'+progress.total+' · 剩余 '+progress.remaining+' · 待重试 '+progress.retry:progress?'进度待核对':legacyCounts;
+ if(progress){counts+=' · 待传/确认 '+(unknown?'待核对':uploads)+'路径'+(pendingVersions?'（'+pendingVersions+'版本）':'')+' · 冲突 '+conflicts;if(!ready)counts+='（当前未核对）';}
+ if(progress&&!conflicts&&!protectedCount){display='Sync: '+(label==='重连中'?'重连中':label==='恢复中'?'恢复中':tone==='busy'?'同步中':tone==='confirmed'?'✓':tone==='error'?'⚠ 需处理':label);}
+ if(!ready&&reconnecting&&conflicts)display='Sync: 重连中 · 冲突'+conflicts;
+ return {tone,icon,label,display,busy,counts,description:(progress?.available?counts+'；当前接收并发'+progress.active+'；待重试仅统计文件失败，不包含连接错误或冲突；':'进度尚未核对；')+label+'；待处理冲突'+conflicts+'；库内'+known+'个路径；待上传或确认'+(unknown?'数量待核对':uploads)+'；当前接收'+downloads+'。点击查看同步详情。服务器确认不等于其他设备已收到。'};
 }
 export const badgeCSS=`
 .rl-sync-row{display:flex;justify-content:flex-end;flex:0 0 auto;min-height:25px;padding:0 18px 3px;background:var(--background-primary);z-index:1}

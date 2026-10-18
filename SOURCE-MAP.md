@@ -17,3 +17,9 @@
 5. Do not overwrite old tags or Releases. GitHub Actions currently validates and produces a candidate artifact; publishing remains an explicit step.
 
 Server URLs, tokens, user device identities and private vaults are runtime data outside source control. Keep independent backups of vaults and server stores; code backups do not back up notes.
+
+## Next candidate: alpha.27
+
+Adds local vault path / endpoint / server identity and editable local-only device names and diagnostic aliases. The consistency action hashes actual supported local bytes without changing cache, settings, notes or queues. It compares to a metadata snapshot, and flags a snapshot changed during scanning. Local-only, excluded, queued and unreadable files are listed separately.
+
+Repair is an explicit per-file action for missing or different files. It rechecks local bytes, remote bytes, connection, pending operations, path protection, conflicts and active text bindings. A differing original is backed up before replacement; bytes are verified afterward. No bulk upload, deletion or automatic merge is performed. 275 automated tests, typecheck and Files build passed. Candidate verification uses synthetic files only. Existing production installations remain unchanged until an explicit update.

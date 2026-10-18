@@ -33,27 +33,6 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
-var TRANSFER_COUNTERS_CAPABILITY = "device-transfer-counters-v1";
-var RANGE_CAPABILITY = "bounded-blob-range-v1";
-var RANGE_BYTES = 256 * 1024;
-var kinds = ["batch", "range", "chunk"];
-var fields = ["batchRequests", "batchFiles", "batchBytes", "batchErrors", "rangeRequests", "rangeBytes", "rangeErrors", "chunkRequests", "chunkBytes", "chunkErrors"];
-var TransferCounters = class {
-  constructor() {
-    this.data = Object.fromEntries(fields.map((k) => [k, 0]));
-  }
-  record(kind, bytes = 0, failed = false, files = 0) {
-    if (!kinds.includes(kind)) return;
-    this.data[kind + "Requests"]++;
-    this.data[kind + "Bytes"] += bytes;
-    if (failed) this.data[kind + "Errors"]++;
-    else if (kind === "batch") this.data.batchFiles += files;
-  }
-  snapshot() {
-    return { ...this.data };
-  }
-};
-
 var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
 var r = (v, n) => v >>> n | v << 32 - n;
 var Sha256 = class {
@@ -126,148 +105,6 @@ async function hashSource(source, signal) {
   }
   return h.hex();
 }
-
-var SMALL_BATCH_CAPABILITY = "small-blob-batch-v1";
-var BATCH_COUNT = 16;
-var BATCH_BYTES = 256 * 1024;
-function batchRefs(refs) {
-  if (!Array.isArray(refs) || !refs.length || refs.length > BATCH_COUNT) throw Error("Invalid batch count");
-  let size2 = 0;
-  const seen = /* @__PURE__ */ new Set();
-  for (const r2 of refs) {
-    if (!r2 || !/^[a-f0-9]{64}$/.test(r2.hash) || !Number.isSafeInteger(r2.size) || r2.size < 0 || r2.size > CHUNK_BYTES || seen.has(r2.hash)) throw Error("Invalid batch reference");
-    seen.add(r2.hash);
-    size2 += r2.size;
-  }
-  if (size2 > BATCH_BYTES) throw Error("Batch exceeds byte limit");
-  return size2;
-}
-async function verifyBatch(refs, bytes, signal) {
-  if (bytes.length !== batchRefs(refs)) throw Error("Batch response length mismatch");
-  const result = /* @__PURE__ */ new Map();
-  let offset = 0;
-  for (const ref of refs) {
-    signal?.throwIfAborted();
-    const data = bytes.subarray(offset, offset + ref.size);
-    offset += ref.size;
-    if (await hashSource({ size: data.length, read: async (p, n) => data.subarray(p, p + n) }, signal) !== ref.hash) throw Error("Batch hash mismatch");
-    result.set(ref.hash, data);
-  }
-  return result;
-}
-var SmallBlobPipeline = class {
-  /** @param {any[]} refs @param {Function} fetchBatch @param {{canRun?:()=>boolean}} options */
-  constructor(refs, fetchBatch, { canRun = () => true } = {}) {
-    this.fetchBatch = fetchBatch;
-    this.canRun = canRun;
-    this.groups = [];
-    this.indexByHash = /* @__PURE__ */ new Map();
-    this.index = -1;
-    this.closed = false;
-    const seen = /* @__PURE__ */ new Set();
-    let group = [], size2 = 0;
-    for (const r2 of refs) {
-      if (r2.size > CHUNK_BYTES || seen.has(r2.hash)) continue;
-      seen.add(r2.hash);
-      if (group.length && (group.length >= BATCH_COUNT || size2 + r2.size > BATCH_BYTES)) {
-        this.groups.push(group);
-        group = [];
-        size2 = 0;
-      }
-      this.indexByHash.set(r2.hash, this.groups.length);
-      group.push(r2);
-      size2 += r2.size;
-    }
-    if (group.length) this.groups.push(group);
-  }
-  start(index) {
-    if (this.closed || !this.canRun() || index >= this.groups.length) return;
-    this.nextIndex = index;
-    this.next = Promise.resolve().then(() => this.fetchBatch(this.groups[index])).then((value) => ({ value }), (error) => ({ error }));
-  }
-  async idle() {
-    if (this.next) await this.next;
-  }
-  async take(ref) {
-    if (this.closed || !this.canRun()) return null;
-    const index = this.indexByHash.get(ref.hash);
-    if (index === void 0 || index < this.index) return null;
-    if (index !== this.index) {
-      if (this.next && this.nextIndex !== index) {
-        await this.next;
-        this.next = null;
-      }
-      if (!this.next) this.start(index);
-      if (!this.next) return null;
-      this.current = await this.next;
-      this.next = null;
-      this.index = index;
-      this.start(index + 1);
-    }
-    if (this.current.error) throw this.current.error;
-    return this.current.value.get(ref.hash) || null;
-  }
-  async close() {
-    this.closed = true;
-    await this.idle();
-    this.next = null;
-    this.current = null;
-  }
-};
-
-var PERFORMANCE_CAPABILITY = "device-performance-v1";
-var PERFORMANCE_KINDS = ["network", "cache", "vault", "config"];
-var empty = () => ({ count: 0, ms: 0, maxMs: 0, bytes: 0, errors: 0, wallMs: 0 });
-var PerformanceCounters = class {
-  constructor({ now = () => performance.now() } = {}) {
-    this.now = now;
-    this.started = now();
-    this.active = Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, { count: 0, start: 0 }]));
-    this.buckets = Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, empty()]));
-  }
-  add(kind, ms, bytes = 0, error = false) {
-    const b = this.buckets[kind];
-    if (!b) return;
-    b.count++;
-    b.ms += Math.max(0, Math.round(ms));
-    b.maxMs = Math.max(b.maxMs, Math.max(0, Math.round(ms)));
-    b.bytes += Math.max(0, bytes);
-    if (error) b.errors++;
-  }
-  record(kind, ms, bytes = 0, error = false) {
-    this.add(kind, ms, bytes, error);
-    if (this.buckets[kind]) this.buckets[kind].wallMs += Math.max(0, Math.round(ms));
-  }
-  begin(kind) {
-    const t = this.now(), a = this.active[kind];
-    if (!a) return () => {
-    };
-    if (a.count++ === 0) a.start = t;
-    let done = false;
-    return (bytes = 0, error = false) => {
-      if (done) return;
-      done = true;
-      const now = this.now();
-      this.add(kind, now - t, bytes, error);
-      if (--a.count === 0) this.buckets[kind].wallMs += Math.max(0, Math.round(now - a.start));
-    };
-  }
-  async measure(kind, fn) {
-    const done = this.begin(kind);
-    let failed = false;
-    try {
-      return await fn();
-    } catch (e) {
-      failed = true;
-      throw e;
-    } finally {
-      done(0, failed);
-    }
-  }
-  snapshot() {
-    return { elapsedMs: Math.min(1e12, Math.max(0, Math.round(this.now() - this.started))), ...Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, { ...this.buckets[k], wallMs: this.buckets[k].wallMs + (this.active[k].count ? Math.max(0, Math.round(this.now() - this.active[k].start)) : 0) }])) };
-  }
-};
 
 var create = () => /* @__PURE__ */ new Map();
 var copy = (m) => {
@@ -9301,6 +9138,222 @@ function decodeTextPreview(bytes) {
   }
 }
 
+var byteDigest = (bytes) => new Sha256().update(bytes).hex();
+var referenceDigest = (item) => item?.kind === "text" ? byteDigest(new TextEncoder().encode(item.data)) : item?.hash;
+function connectionIdentity({ vaultName, basePath, url, serverId, deviceId, deviceName }) {
+  let endpoint = "\u672A\u914D\u7F6E";
+  try {
+    const u = new URL(url);
+    if (["ws:", "wss:"].includes(u.protocol)) {
+      u.username = "";
+      u.password = "";
+      u.search = "";
+      u.hash = "";
+      endpoint = u.toString();
+    }
+  } catch {
+  }
+  return { vaultName, localPath: basePath || "\u7CFB\u7EDF\u672A\u63D0\u4F9B\u5B8C\u6574\u8DEF\u5F84\uFF0C\u8BF7\u5728 Obsidian \u4ED3\u5E93\u7BA1\u7406\u4E2D\u6838\u5BF9", endpoint, serverId: serverId || "\u5C1A\u672A\u6838\u5B9E", deviceId: deviceId || "\u5C1A\u672A\u5206\u914D", deviceName: deviceName || "\u672A\u547D\u540D\u8BBE\u5907" };
+}
+async function auditFiles({ files, remote, read, queued = (
+  /** @type {string[]} */
+  []
+), maxPaths = 8192 }) {
+  const local = new Map(files.map((f) => [f.path, f])), paths = [.../* @__PURE__ */ new Set([...local.keys(), ...Object.keys(remote)])].sort();
+  if (paths.length > maxPaths) throw Error("Audit path capacity exceeded");
+  const pending = new Set(queued), rows = [];
+  for (const path of paths) {
+    const f = local.get(path), r2 = remote[path];
+    let row = { path, status: "equal", localHash: null, remoteHash: r2 ? referenceDigest(r2) : null };
+    if (!supportedFile(path) || f && f.size > maxFileSize(path)) {
+      row.status = "excluded";
+      rows.push(row);
+      continue;
+    }
+    try {
+      if (f) {
+        const bytes = new Uint8Array(await read(path));
+        if (bytes.length > maxFileSize(path)) throw Error("File grew beyond limit");
+        row.localHash = byteDigest(bytes);
+        row.status = r2 ? row.localHash === row.remoteHash ? "equal" : "different" : "local-only";
+      } else row.status = "missing";
+    } catch {
+      row.status = "read-error";
+    }
+    if (pending.has("*") || pending.has(path)) row.status = "queued";
+    rows.push(row);
+  }
+  const counts = { equal: 0, missing: 0, different: 0, "local-only": 0, queued: 0, excluded: 0, "read-error": 0 };
+  for (const r2 of rows) counts[r2.status]++;
+  return { counts, rows, automaticWrites: 0 };
+}
+function assertRepairSnapshot(row, { localHash, remoteHash, queued = false, stable = true }) {
+  if (!stable || !["missing", "different"].includes(row.status) || queued || localHash !== row.localHash || remoteHash !== row.remoteHash) throw Error("\u6587\u4EF6\u6216\u540C\u6B65\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6838\u9A8C\uFF1B\u672A\u66FF\u6362\u6587\u4EF6");
+}
+
+var TRANSFER_COUNTERS_CAPABILITY = "device-transfer-counters-v1";
+var RANGE_CAPABILITY = "bounded-blob-range-v1";
+var RANGE_BYTES = 256 * 1024;
+var kinds = ["batch", "range", "chunk"];
+var fields = ["batchRequests", "batchFiles", "batchBytes", "batchErrors", "rangeRequests", "rangeBytes", "rangeErrors", "chunkRequests", "chunkBytes", "chunkErrors"];
+var TransferCounters = class {
+  constructor() {
+    this.data = Object.fromEntries(fields.map((k) => [k, 0]));
+  }
+  record(kind, bytes = 0, failed = false, files = 0) {
+    if (!kinds.includes(kind)) return;
+    this.data[kind + "Requests"]++;
+    this.data[kind + "Bytes"] += bytes;
+    if (failed) this.data[kind + "Errors"]++;
+    else if (kind === "batch") this.data.batchFiles += files;
+  }
+  snapshot() {
+    return { ...this.data };
+  }
+};
+
+var SMALL_BATCH_CAPABILITY = "small-blob-batch-v1";
+var BATCH_COUNT = 16;
+var BATCH_BYTES = 256 * 1024;
+function batchRefs(refs) {
+  if (!Array.isArray(refs) || !refs.length || refs.length > BATCH_COUNT) throw Error("Invalid batch count");
+  let size2 = 0;
+  const seen = /* @__PURE__ */ new Set();
+  for (const r2 of refs) {
+    if (!r2 || !/^[a-f0-9]{64}$/.test(r2.hash) || !Number.isSafeInteger(r2.size) || r2.size < 0 || r2.size > CHUNK_BYTES || seen.has(r2.hash)) throw Error("Invalid batch reference");
+    seen.add(r2.hash);
+    size2 += r2.size;
+  }
+  if (size2 > BATCH_BYTES) throw Error("Batch exceeds byte limit");
+  return size2;
+}
+async function verifyBatch(refs, bytes, signal) {
+  if (bytes.length !== batchRefs(refs)) throw Error("Batch response length mismatch");
+  const result = /* @__PURE__ */ new Map();
+  let offset = 0;
+  for (const ref of refs) {
+    signal?.throwIfAborted();
+    const data = bytes.subarray(offset, offset + ref.size);
+    offset += ref.size;
+    if (await hashSource({ size: data.length, read: async (p, n) => data.subarray(p, p + n) }, signal) !== ref.hash) throw Error("Batch hash mismatch");
+    result.set(ref.hash, data);
+  }
+  return result;
+}
+var SmallBlobPipeline = class {
+  /** @param {any[]} refs @param {Function} fetchBatch @param {{canRun?:()=>boolean}} options */
+  constructor(refs, fetchBatch, { canRun = () => true } = {}) {
+    this.fetchBatch = fetchBatch;
+    this.canRun = canRun;
+    this.groups = [];
+    this.indexByHash = /* @__PURE__ */ new Map();
+    this.index = -1;
+    this.closed = false;
+    const seen = /* @__PURE__ */ new Set();
+    let group = [], size2 = 0;
+    for (const r2 of refs) {
+      if (r2.size > CHUNK_BYTES || seen.has(r2.hash)) continue;
+      seen.add(r2.hash);
+      if (group.length && (group.length >= BATCH_COUNT || size2 + r2.size > BATCH_BYTES)) {
+        this.groups.push(group);
+        group = [];
+        size2 = 0;
+      }
+      this.indexByHash.set(r2.hash, this.groups.length);
+      group.push(r2);
+      size2 += r2.size;
+    }
+    if (group.length) this.groups.push(group);
+  }
+  start(index) {
+    if (this.closed || !this.canRun() || index >= this.groups.length) return;
+    this.nextIndex = index;
+    this.next = Promise.resolve().then(() => this.fetchBatch(this.groups[index])).then((value) => ({ value }), (error) => ({ error }));
+  }
+  async idle() {
+    if (this.next) await this.next;
+  }
+  async take(ref) {
+    if (this.closed || !this.canRun()) return null;
+    const index = this.indexByHash.get(ref.hash);
+    if (index === void 0 || index < this.index) return null;
+    if (index !== this.index) {
+      if (this.next && this.nextIndex !== index) {
+        await this.next;
+        this.next = null;
+      }
+      if (!this.next) this.start(index);
+      if (!this.next) return null;
+      this.current = await this.next;
+      this.next = null;
+      this.index = index;
+      this.start(index + 1);
+    }
+    if (this.current.error) throw this.current.error;
+    return this.current.value.get(ref.hash) || null;
+  }
+  async close() {
+    this.closed = true;
+    await this.idle();
+    this.next = null;
+    this.current = null;
+  }
+};
+
+var PERFORMANCE_CAPABILITY = "device-performance-v1";
+var PERFORMANCE_KINDS = ["network", "cache", "vault", "config"];
+var empty = () => ({ count: 0, ms: 0, maxMs: 0, bytes: 0, errors: 0, wallMs: 0 });
+var PerformanceCounters = class {
+  constructor({ now = () => performance.now() } = {}) {
+    this.now = now;
+    this.started = now();
+    this.active = Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, { count: 0, start: 0 }]));
+    this.buckets = Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, empty()]));
+  }
+  add(kind, ms, bytes = 0, error = false) {
+    const b = this.buckets[kind];
+    if (!b) return;
+    b.count++;
+    b.ms += Math.max(0, Math.round(ms));
+    b.maxMs = Math.max(b.maxMs, Math.max(0, Math.round(ms)));
+    b.bytes += Math.max(0, bytes);
+    if (error) b.errors++;
+  }
+  record(kind, ms, bytes = 0, error = false) {
+    this.add(kind, ms, bytes, error);
+    if (this.buckets[kind]) this.buckets[kind].wallMs += Math.max(0, Math.round(ms));
+  }
+  begin(kind) {
+    const t = this.now(), a = this.active[kind];
+    if (!a) return () => {
+    };
+    if (a.count++ === 0) a.start = t;
+    let done = false;
+    return (bytes = 0, error = false) => {
+      if (done) return;
+      done = true;
+      const now = this.now();
+      this.add(kind, now - t, bytes, error);
+      if (--a.count === 0) this.buckets[kind].wallMs += Math.max(0, Math.round(now - a.start));
+    };
+  }
+  async measure(kind, fn) {
+    const done = this.begin(kind);
+    let failed = false;
+    try {
+      return await fn();
+    } catch (e) {
+      failed = true;
+      throw e;
+    } finally {
+      done(0, failed);
+    }
+  }
+  snapshot() {
+    return { elapsedMs: Math.min(1e12, Math.max(0, Math.round(this.now() - this.started))), ...Object.fromEntries(PERFORMANCE_KINDS.map((k) => [k, { ...this.buckets[k], wallMs: this.buckets[k].wallMs + (this.active[k].count ? Math.max(0, Math.round(this.now() - this.active[k].start)) : 0) }])) };
+  }
+};
+
 var import_obsidian = require("obsidian");
 var import_state = require("@codemirror/state");
 
@@ -11214,6 +11267,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client, rows = this.pendingRows(), progress = this.progressModel();
     e.createEl("p", { text: progress.available ? (c?.ready ? "\u6587\u4EF6\u8FDB\u5EA6\uFF1A" : "\u79BB\u7EBF\u53C2\u8003\u8FDB\u5EA6\uFF08\u91CD\u8FDE\u540E\u6838\u5BF9\uFF09\uFF1A") + "\u5DF2\u5B8C\u6210 " + progress.completed + " / " + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : "\u6587\u4EF6\u8FDB\u5EA6\uFF1A\u6B63\u5728\u6838\u5BF9\uFF0C\u5C1A\u4E0D\u80FD\u786E\u8BA4\u5DF2\u5B8C\u6210\u6570\u91CF" });
     e.createEl("p", { text: "\u5F53\u524D\u63A5\u6536\u5E76\u53D1\uFF1A" + progress.active + "\uFF08\u4E0D\u662F\u5269\u4F59\u6587\u4EF6\u6570\uFF09\uFF1B\u5F85\u91CD\u8BD5\u5305\u542B\u5728\u5269\u4F59\u4E2D\uFF0C\u4E0D\u91CD\u590D\u76F8\u52A0\u3002" });
+    const identity = this.identityDetails();
+    e.createEl("p", { text: "\u5F53\u524D\u5E93\uFF1A" + identity.vaultName + " \xB7 " + identity.localPath });
+    e.createEl("p", { text: "\u540C\u6B65\u7A7A\u95F4\uFF1A" + identity.endpoint + " \xB7 ID " + identity.serverId });
+    e.createEl("p", { text: "\u672C\u8BBE\u5907\uFF1A" + identity.deviceName + " \xB7 " + identity.deviceId });
     e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
@@ -11248,6 +11305,119 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     void this.refreshConflicts();
     void this.reportDiagnostic();
     if (this.settings.pathSafety?.items.length) this.schedulePathSafety();
+  }
+  identityDetails() {
+    const adapter = this.app.vault.adapter;
+    return connectionIdentity({ vaultName: this.app.vault.getName(), basePath: adapter.getBasePath?.(), url: this.settings.url, serverId: this.client?.serverId || this.settings.serverId, deviceId: this.settings.deviceId, deviceName: this.settings.deviceName || (import_obsidian.Platform?.isIosApp ? "iPhone / iPad" : import_obsidian.Platform?.isMacOS ? "Mac" : "\u8BBE\u5907") });
+  }
+  deviceLabel(d) {
+    return this.settings.deviceLabels?.[d.deviceId] || (d.deviceId === this.settings.deviceId ? this.settings.deviceName : "") || d.platform + " \xB7 " + d.deviceId.slice(0, 8);
+  }
+  async scanConsistency() {
+    const c = this.client;
+    if (!c?.ready || !await this.allowed() || this.liveSync()) throw Error("\u8BF7\u8FDE\u63A5\u5DF2\u521D\u59CB\u5316\u7684\u540C\u6B65\u5E93\u5E76\u505C\u7528 LiveSync");
+    await c.request("barrier");
+    const digest = this.currentDigest(), remote = entries(c.doc), result = await auditFiles({ files: this.app.vault.getFiles().map((f) => ({ path: f.path, size: f.stat.size })), remote, read: async (path) => {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (!(f instanceof import_obsidian.TFile)) throw Error("\u6587\u4EF6\u5DF2\u53D8\u5316");
+      return this.app.vault.readBinary(f);
+    }, queued: this.pendingRows().map((r2) => r2.path) });
+    await c.request("barrier");
+    return { ...result, serverId: c.serverId, checkedAt: Date.now(), stable: this.client === c && c.ready && digest === this.currentDigest() };
+  }
+  async repairConsistency(row, report) {
+    const c = this.client;
+    if (!c?.ready || c.serverId !== report.serverId || !report.stable) throw Error("\u8FDE\u63A5\u6216\u62A5\u544A\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6838\u9A8C");
+    const job = this.queue.then(async () => {
+      const check = async () => {
+        if (this.client !== c || !c.ready || c.serverId !== report.serverId || this.liveSync()) throw Error("\u8FDE\u63A5\u5DF2\u53D8\u5316");
+        const f2 = this.app.vault.getAbstractFileByPath(row.path), localHash = f2 instanceof import_obsidian.TFile ? byteDigest(new Uint8Array(await this.app.vault.readBinary(f2))) : null;
+        assertRepairSnapshot(row, { localHash, remoteHash: referenceDigest(content(c.doc, row.path)), stable: report.stable, queued: this.pathBlocked(row.path) || this.writing.has(row.path) || this.pendingRows().some((r2) => r2.path === "*" || r2.path === row.path) || this.conflicts.some((r2) => r2.path === row.path) || [...this.bindings.values()].some((b) => b.path === row.path) });
+        return f2;
+      };
+      await check();
+      const item = content(c.doc, row.path);
+      let bytes;
+      if (item.kind !== "text") {
+        if (!await this.cache.has(item)) await c.blobs.download(item, this.cache.sink(item));
+        bytes = await this.cache.materialize(item);
+      }
+      let f = await check();
+      if (f instanceof import_obsidian.TFile) {
+        this.fingerprints.delete(row.path);
+        await this.backup(row.path, await this.read(f));
+      }
+      f = await check();
+      await this.parents(row.path);
+      f = await check();
+      this.writing.add(row.path);
+      try {
+        if (item.kind === "text") {
+          if (f instanceof import_obsidian.TFile) await this.app.vault.modify(f, item.data);
+          else await this.app.vault.create(row.path, item.data);
+        } else if (f instanceof import_obsidian.TFile) await this.app.vault.modifyBinary(f, bytes);
+        else await this.app.vault.createBinary(row.path, bytes);
+        this.fingerprints.delete(row.path);
+      } finally {
+        this.writing.delete(row.path);
+      }
+      const saved = this.app.vault.getAbstractFileByPath(row.path);
+      if (!(saved instanceof import_obsidian.TFile) || byteDigest(new Uint8Array(await this.app.vault.readBinary(saved))) !== row.remoteHash) throw Error("\u4FEE\u590D\u540E\u6821\u9A8C\u672A\u901A\u8FC7\uFF0C\u8BF7\u4FDD\u7559\u6062\u590D\u526F\u672C");
+      return true;
+    });
+    this.queue = job.then(() => {
+    }, () => {
+    });
+    return job;
+  }
+  async openConsistency() {
+    const m = new import_obsidian.Modal(this.app);
+    m.titleEl.setText("\u9010\u6587\u4EF6\u4E00\u81F4\u6027\u6838\u9A8C");
+    m.modalEl.addClass("rl-history-modal");
+    m.contentEl.createEl("p", { text: "\u53EA\u8BFB\u626B\u63CF\u76F4\u63A5\u8BA1\u7B97\u6587\u4EF6 SHA256\uFF0C\u4E0D\u4F7F\u7528\u7F13\u5B58\uFF0C\u4E0D\u6E05\u7A7A\u961F\u5217\u3002\u4E0D\u4F1A\u81EA\u52A8\u4E0A\u4F20\u3001\u8986\u76D6\u6216\u5220\u9664\u3002\u663E\u5F0F\u4FEE\u590D\u4EC5\u66FF\u6362\u9009\u4E2D\u7684\u5F02\u5E38\u6587\u4EF6\uFF0C\u539F\u5185\u5BB9\u5148\u4FDD\u7559\u5230\u672C\u5730\u6062\u590D\u76EE\u5F55\uFF1B\u5F85\u4F20\u3001\u51B2\u7A81\u6216\u5DF2\u53D8\u5316\u7684\u6587\u4EF6\u62D2\u7EDD\u66FF\u6362\u3002" });
+    const panel = m.contentEl.createDiv();
+    let query = "", report;
+    const render = () => {
+      panel.empty();
+      if (!report) return;
+      panel.createEl("p", { text: (report.stable ? "\u672C\u6B21\u6838\u9A8C\u5B8C\u6210" : "\u626B\u63CF\u671F\u95F4\u8FDC\u7AEF\u6709\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6838\u9A8C") + " \xB7 " + JSON.stringify(report.counts) });
+      const rows = report.rows.filter((r2) => r2.status !== "equal" && r2.path.includes(query));
+      panel.createEl("p", { text: rows.length + " \u9879\u5339\u914D\uFF0C\u663E\u793A\u524D100\u9879\uFF1B\u672C\u5730\u72EC\u6709\u6587\u4EF6\u4E0D\u4F1A\u81EA\u52A8\u4E0A\u4F20\u6216\u5220\u9664\u3002" });
+      for (const row of rows.slice(0, 100)) {
+        const setting = new import_obsidian.Setting(panel).setName(row.path).setDesc({ "missing": "\u672C\u5730\u7F3A\u5931", "different": "\u5185\u5BB9\u4E0D\u540C", "local-only": "\u672C\u5730\u72EC\u6709", "queued": "\u540C\u6B65\u961F\u5217\u5904\u7406\u4E2D", "excluded": "\u4E0D\u53C2\u4E0E\u540C\u6B65", "read-error": "\u8BFB\u53D6\u5931\u8D25" }[row.status] || row.status);
+        if (report.stable && ["missing", "different"].includes(row.status)) setting.addButton((b) => b.setButtonText("\u4ECE\u670D\u52A1\u5668\u4FEE\u590D\u6B64\u6587\u4EF6").onClick(() => {
+          const ask = new import_obsidian.Modal(this.app);
+          ask.titleEl.setText("\u786E\u8BA4\u4FEE\u590D \xB7 " + row.path);
+          ask.contentEl.createEl("p", { text: "\u4EC5\u5904\u7406\u8FD9\u4E2A\u6587\u4EF6\u3002\u672C\u5730\u5DF2\u6709\u5185\u5BB9\u5148\u4FDD\u5B58\u5230\u9690\u85CF\u6062\u590D\u76EE\u5F55\uFF0C\u518D\u4F7F\u7528\u670D\u52A1\u5668\u5F53\u524D\u7248\u672C\uFF1B\u5982\u679C\u6587\u4EF6\u6216\u961F\u5217\u53D1\u751F\u53D8\u5316\u5C06\u62D2\u7EDD\u66FF\u6362\u3002" });
+          new import_obsidian.Setting(ask.contentEl).addButton((b2) => b2.setButtonText("\u53D6\u6D88").onClick(() => ask.close())).addButton((b2) => b2.setButtonText("\u4FDD\u7559\u526F\u672C\u5E76\u4FEE\u590D").onClick(async () => {
+            try {
+              await this.repairConsistency(row, report);
+              new import_obsidian.Notice("\u5DF2\u4FEE\u590D\u5E76\u6821\u9A8C\uFF1A" + row.path);
+              ask.close();
+              report = await this.scanConsistency();
+              render();
+            } catch (e) {
+              new import_obsidian.Notice(this.safeError(e));
+            }
+          }));
+          ask.open();
+        }));
+      }
+    };
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5F00\u59CB\u53EA\u8BFB\u6838\u9A8C").onClick(async () => {
+      panel.setText("\u6B63\u5728\u6838\u9A8C\u2026");
+      try {
+        report = await this.scanConsistency();
+        render();
+      } catch (e) {
+        panel.setText(this.safeError(e));
+      }
+    })).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    new import_obsidian.Setting(m.contentEl).setName("\u7B5B\u9009\u5F02\u5E38\u8DEF\u5F84").addText((t) => t.onChange((v) => {
+      query = v;
+      render();
+    }));
+    m.open();
   }
   async recoverQueue() {
     const c = this.client;
@@ -11425,7 +11595,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         await this.reportDiagnostic();
         const result = await c.request("device-diagnostics");
         panel.createEl("p", { text: "\u4EC5\u663E\u793A\u6700\u8FD1\u4E00\u6B21\u8BBE\u5907\u81EA\u62A5\u72B6\u6001\uFF1B\u8D85\u8FC730\u79D2\u3001\u540E\u53F0\u6216\u79BB\u7EBF\u5747\u4E0D\u5224\u4E3A\u540C\u6B65\u5B8C\u6210\u3002\u670D\u52A1\u5668\u91CD\u542F\u6E05\u7A7A\u8BCA\u65AD\uFF0C\u4E0D\u5F71\u54CD\u7B14\u8BB0\u3002" });
-        for (const d of result.devices) panel.createEl("p", { text: d.platform + " \xB7 " + d.deviceId.slice(0, 8) + " \xB7 " + d.version + "\uFF1A" + (d.completeAtReport ? "\u6700\u8FD1\u4E0A\u62A5\u5DF2\u540C\u6B65" : !d.connected ? "\u5DF2\u79BB\u7EBF" : !d.fresh ? "\u4E0A\u62A5\u5DF2\u8FC7\u671F" : !d.foreground ? "\u540E\u53F0\uFF0C\u72B6\u6001\u5F85\u786E\u8BA4" : "\u5C1A\u672A\u786E\u8BA4\u5B8C\u6210") + "\uFF1B\u5F85\u5904\u7406 " + d.queued + "\uFF0C\u63A5\u6536 " + d.receiving + "\uFF0C\u5931\u8D25 " + d.failed + "\uFF0C\u51B2\u7A81 " + d.conflicts + "\uFF1B" + Math.floor(d.ageMs / 1e3) + "\u79D2\u524D\u4E0A\u62A5" });
+        for (const d of result.devices) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + d.version + "\uFF1A" + (d.completeAtReport ? "\u6700\u8FD1\u4E0A\u62A5\u5DF2\u540C\u6B65" : !d.connected ? "\u5DF2\u79BB\u7EBF" : !d.fresh ? "\u4E0A\u62A5\u5DF2\u8FC7\u671F" : !d.foreground ? "\u540E\u53F0\uFF0C\u72B6\u6001\u5F85\u786E\u8BA4" : "\u5C1A\u672A\u786E\u8BA4\u5B8C\u6210") + "\uFF1B\u5F85\u5904\u7406 " + d.queued + "\uFF0C\u63A5\u6536 " + d.receiving + "\uFF0C\u5931\u8D25 " + d.failed + "\uFF0C\u51B2\u7A81 " + d.conflicts + "\uFF1B" + Math.floor(d.ageMs / 1e3) + "\u79D2\u524D\u4E0A\u62A5" });
+        for (const d of result.devices) new import_obsidian.Setting(panel).setName("\u8BBE\u5907\u522B\u540D \xB7 " + d.platform + " " + d.deviceId.slice(0, 8)).addText((t) => t.setValue(this.settings.deviceLabels?.[d.deviceId] || "").onChange(async (v) => {
+          this.settings.deviceLabels = { ...this.settings.deviceLabels, [d.deviceId]: v.trim().slice(0, 64) };
+          await this.persistConfig();
+        }));
         for (const d of result.devices) if (d.performance) {
           const p = d.performance;
           panel.createEl("p", { text: d.platform + " \u5206\u9636\u6BB5\u7D2F\u8BA1\uFF1A\u7F51\u7EDC/\u539F\u751F\u8BF7\u6C42\u7B49\u5F85 " + p.network.wallMs + "ms\uFF08" + p.network.count + "\u6B21\uFF09\uFF1B\u7F13\u5B58\u8BFB\u5199 " + p.cache.wallMs + "ms\uFF1B\u6587\u4EF6\u5199\u5165 " + p.vault.wallMs + "ms\uFF1B\u914D\u7F6E\u4FDD\u5B58 " + p.config.wallMs + "ms\u3002\u8BA1\u65F6\u81EA\u672C\u6B21\u63D2\u4EF6\u542F\u52A8\uFF0C\u90E8\u5206\u9636\u6BB5\u91CD\u53E0\uFF0C\u4E0D\u80FD\u76F8\u52A0\u4F5C\u4E3A\u603B\u8017\u65F6\u3002" });
@@ -11719,6 +11893,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.status = this.addStatusBarItem();
     this.setConnectionStatus("\u672A\u8FDE\u63A5");
     this.addSettingTab(new Settings(this.app, this));
+    this.addCommand({ id: "consistency", name: "\u9010\u6587\u4EF6\u4E00\u81F4\u6027\u6838\u9A8C", callback: () => void this.openConsistency() });
     this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u540C\u6B65\u5E93", callback: () => void this.start() });
     this.addCommand({ id: "path-safety", name: "\u67E5\u770B\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4", callback: () => void this.openPathSafety() });
     this.addCommand({ id: "device-diagnostics", name: "\u67E5\u770B\u8BBE\u5907\u8FDC\u7A0B\u540C\u6B65\u8BCA\u65AD", callback: () => void this.openDeviceDiagnostics() });
@@ -12695,6 +12870,12 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     e.createEl("h2", { text: "Realtime Lab \xB7 \u540C\u6B65" });
     this.p.syncPanel = e.createDiv();
     this.p.renderProgress();
+    new import_obsidian.Setting(e).setName("\u672C\u8BBE\u5907\u540D\u79F0\uFF08\u4EC5\u672C\u673A\u4FDD\u5B58\uFF09").addText((t) => t.setValue(this.p.settings.deviceName || "").onChange(async (v) => {
+      this.p.settings.deviceName = v.trim().slice(0, 64);
+      await this.p.persistConfig();
+      this.p.renderProgress();
+    }));
+    new import_obsidian.Setting(e).setName("\u6587\u4EF6\u4E00\u81F4\u6027").addButton((b) => b.setButtonText("\u9010\u6587\u4EF6\u6838\u9A8C\u4E0E\u4FEE\u590D").onClick(() => void this.p.openConsistency()));
     new import_obsidian.Setting(e).addButton((b) => b.setButtonText("\u5237\u65B0\u72B6\u6001").onClick(() => this.p.renderProgress())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.p.retryQueue()));
     new import_obsidian.Setting(e).setName("\u8BEF\u7F6E\u65E7\u534F\u8BAE\u8BBE\u7F6E").addButton((b) => b.setButtonText("\u5907\u4EFD\u5E76\u6E05\u7A7A\u65E7\u72B6\u6001").onClick(() => void this.p.backupRejectedState()));
     e.createEl("p", { text: "\u652F\u6301\u81EA\u5B9A\u4E49\u4ED3\u5E93\u540D\uFF1B\u6BCF\u4E2A\u5E93\u9700\u5355\u72EC\u521D\u59CB\u5316\u5E76\u8FDE\u63A5\u72EC\u7ACB\u540C\u6B65\u7A7A\u95F4\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA Word DOCX/JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u6D3B\u52A8\u5185\u5BB9\u2264256 MiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264512 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });

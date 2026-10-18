@@ -1,0 +1,27 @@
+import {MAX_BLOB_BYTES,MAX_DISK_BYTES,MAX_DISK_OBJECTS} from './limits.mjs';
+import {CHUNK_BYTES,hashSource} from './sha256.mjs';
+const ROOT='.realtime-lab-v3-cache';
+// Mobile-compatible adapter: each cache file is at most 32 KiB. Unlike repeated
+// vault.readBinary(file), a chunk read never loads the original full attachment.
+export class ObsidianBlobCache{
+ constructor(adapter,{onOperation=(ms,failed)=>{},onStart=()=>((bytes,failed)=>{})}={}){this.onStart=onStart;this.onOperation=onOperation;this.adapter=adapter;this.busy=false;this.quota=null;this.reservations=Promise.resolve();this.metrics={quotaScans:0,quotaRecords:0,reservations:0,operations:0,failures:0,maxOperationMs:0,lastOperation:null};}
+ // The cache is private to this plugin instance. Rebuild once on open, including
+ // incomplete and retained blobs; never trust a durable quota counter after a crash.
+ async scanQuota(){await this.mkdir(ROOT);const listing=await this.io('list',ROOT);let bytes=0,count=0;for(const folder of listing.folders){const p=folder+'/state.json';if(!await this.io('exists',p))continue;const m=JSON.parse(await this.io('read',p));if(!Number.isSafeInteger(m.size)||m.size<0||m.size>MAX_BLOB_BYTES)throw Error('Invalid cache quota metadata');bytes+=m.size;count++;this.metrics.quotaRecords++;}this.metrics.quotaScans++;return {bytes,count};}
+ invalidateQuota(){this.quota=null;}
+ async io(method,...args){const started=Date.now(),done=this.onStart();let failed=false;this.metrics.operations++;this.metrics.lastOperation=method;try{return await this.adapter[method](...args);}catch(e){failed=true;this.metrics.failures++;this.invalidateQuota();throw new Error('Cache '+method+': '+String(e?.message||e),{cause:e});}finally{this.onOperation(Date.now()-started,failed);done?.(0,failed);this.metrics.maxOperationMs=Math.max(this.metrics.maxOperationMs,Date.now()-started);}}
+ check(ref){if(!ref||!/^[a-f0-9]{64}$/.test(ref.hash)||!Number.isSafeInteger(ref.size)||ref.size<0||ref.size>MAX_BLOB_BYTES)throw Error('Invalid cache reference');}
+ base(ref){this.check(ref);return ROOT+'/'+ref.hash;}
+ async mkdir(p){if(!await this.io('exists',p))await this.io('mkdir',p);}
+ async state(ref){const base=this.base(ref),p=base+'/state.json';if(!await this.io('exists',p))return {size:ref.size,offset:0,complete:false};const s=JSON.parse(await this.io('read',p));if(s.size!==ref.size||!Number.isSafeInteger(s.offset)||s.offset<0||s.offset>ref.size||typeof s.complete!=='boolean'||s.complete&&s.offset!==ref.size||!s.complete&&s.offset!==ref.size&&s.offset%CHUNK_BYTES)throw Error('Invalid cached upload state');return s;}
+ async has(ref){return (await this.state(ref)).complete;}
+ async read(ref,p,n){this.check(ref);if(ref.size===0&&p===0&&n===0)return new Uint8Array();if(p%CHUNK_BYTES||n!==Math.min(CHUNK_BYTES,ref.size-p))throw Error('Unaligned cache read');const bytes=new Uint8Array(await this.io('readBinary',this.base(ref)+'/'+p+'.bin'));if(bytes.length!==n)throw Error('Short cache chunk');return bytes;}
+ async reserve(ref){const job=this.reservations.then(async()=>{const base=this.base(ref);if(!this.quota)this.quota=await this.scanQuota();if(await this.io('exists',base+'/state.json'))return;const q=this.quota;if(q.count>=MAX_DISK_OBJECTS||q.bytes+ref.size>MAX_DISK_BYTES)throw Error('Local cache quota reached; retained recovery blobs are included');await this.mkdir(base);await this.io('write',base+'/state.json',JSON.stringify({size:ref.size,offset:0,complete:false}));q.bytes+=ref.size;q.count++;this.metrics.reservations++;});this.reservations=job.catch(()=>{this.invalidateQuota();});return job;}
+
+ async append(ref,p,bytes){await this.reserve(ref);const s=await this.state(ref);if(s.complete)return;if(p!==s.offset||bytes.length!==Math.min(CHUNK_BYTES,ref.size-p))throw Error('Invalid cache chunk offset');await this.io('writeBinary',this.base(ref)+'/'+p+'.bin',bytes.slice().buffer);await this.io('write',this.base(ref)+'/state.json',JSON.stringify({size:ref.size,offset:p+bytes.length,complete:false}));}
+ async finish(ref){await this.reserve(ref);if((await this.state(ref)).offset!==ref.size)throw Error('Cache incomplete');if(await hashSource(this.source(ref))!==ref.hash)throw Error('Cache hash mismatch');await this.io('write',this.base(ref)+'/state.json',JSON.stringify({size:ref.size,offset:ref.size,complete:true}));}
+ source(ref){this.check(ref);return {size:ref.size,read:(p,n)=>this.read(ref,p,n)};}
+ sink(ref){return {length:async()=>(await this.state(ref)).offset,write:(p,b)=>this.append(ref,p,b),read:(p,n)=>this.read(ref,p,n),commit:()=>this.finish(ref)};}
+ async stage(source,{signal}={}){if(this.busy)throw Error('Cache staging busy');this.busy=true;try{if(source.size>MAX_BLOB_BYTES)throw Error('Image exceeds 16 MiB');const ref={size:source.size,hash:await hashSource(source,signal)};let s=await this.state(ref);while(!s.complete&&s.offset<ref.size){signal?.throwIfAborted();const b=await source.read(s.offset,Math.min(CHUNK_BYTES,ref.size-s.offset));await this.append(ref,s.offset,b);s=await this.state(ref);}if(!s.complete)await this.finish(ref);return ref;}finally{this.busy=false;}}
+ async materialize(ref){if(!await this.has(ref))throw Error('Cache not verified');const out=new Uint8Array(ref.size);for(let p=0;p<ref.size;p+=CHUNK_BYTES)out.set(await this.read(ref,p,Math.min(CHUNK_BYTES,ref.size-p)),p);if(await hashSource({size:ref.size,read:async(p,n)=>out.subarray(p,p+n)})!==ref.hash)throw Error('Cache changed');return out.buffer;}
+}

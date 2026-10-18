@@ -1,0 +1,29 @@
+name: Validate and package Realtime Lab Files
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: node --test --test-concurrency=1 test/*.test.mjs
+      - run: npm run build:v3-files
+      - run: node scripts/check-v3-release.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: realtime-lab-files-candidate
+          path: |
+            work/v3-files-plugin/main.js
+            work/v3-files-plugin/manifest.json
+          if-no-files-found: error

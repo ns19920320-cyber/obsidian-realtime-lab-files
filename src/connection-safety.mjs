@@ -1,0 +1,4 @@
+import {parsePairing} from './pairing.mjs';
+export function canonicalEndpoint(url){const p=parsePairing({url,token:'validation-only-'.repeat(3)});return new URL(p.url).href;}
+export function assertStateOrigin(settings){if(!settings.state)return;if(!settings.serverId)throw Error('旧快照缺少已验证的服务器身份；保留原库，在新空测试库加入。');if(!settings.stateOrigin)throw Error('旧同步快照尚未绑定服务器；请保留旧库，在新空测试库加入目标服务器。');if(canonicalEndpoint(settings.url)!==canonicalEndpoint(settings.stateOrigin))throw Error('已阻止把旧同步快照发送到不同服务器。请保留旧库并新建空 V2 测试库加入。');}
+export function planConnection(settings,{url,token,mode},files){const p=parsePairing({url,token});if(!['create','join'].includes(mode))throw Error('请选择创建或加入');assertStateOrigin({...settings,url:p.url});if(!settings.state&&files.length)throw Error('首次创建或加入必须使用空测试库；请先保存现有文件。');return {...settings,url:canonicalEndpoint(p.url),token:p.token,enabled:false,mode};}

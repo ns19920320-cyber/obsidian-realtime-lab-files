@@ -9284,7 +9284,7 @@ var MAX_DISK_OBJECTS = 8192;
 var BLOB_RESPONSE_IDENTITY_CAPABILITY = "blob-response-identity-v1";
 
 var GENERAL_FILES_CAPABILITY = "general-files-v1";
-var GENERAL = /\.(json|csv|jsonl|html?|py|txt|sha256|log|zip|bak)$/i;
+var GENERAL = /\.(json|csv|jsonl|html?|py|txt|sha256|log|zip|bak|docx)$/i;
 var DATED_BACKUP = /\.md\.bak\.\d{8}-\d{6}$/i;
 var imagePath = (p) => typeof p === "string" && IMAGE.test(p);
 function supportedFile(p) {
@@ -9913,7 +9913,6 @@ function diffInventory(local, remote) {
 }
 
 async function allowedV3(vault) {
-  if (!vault.getName().startsWith("Realtime-Lab-V3-Files-")) return false;
   if (await vault.adapter.exists("realtime-lab-v2.json")) return false;
   try {
     const m = JSON.parse(await vault.adapter.read("realtime-lab-v3-files.json"));
@@ -9923,7 +9922,6 @@ async function allowedV3(vault) {
   }
 }
 async function initializeV3(vault) {
-  if (!vault.getName().startsWith("Realtime-Lab-V3-Files-")) throw Error("Not a V3 isolated vault");
   if (await vault.adapter.exists("realtime-lab-v2.json")) throw Error("V2 marker refused; use a new V3 test vault");
   if (await allowedV3(vault)) return;
   const files = vault.getFiles?.() || [];
@@ -9931,7 +9929,6 @@ async function initializeV3(vault) {
   await vault.adapter.write("realtime-lab-v3-files.json", JSON.stringify({ isolatedLab: true, protocol: 3, capability: "versioned-files-v1" }));
 }
 async function inspectInitialization(vault) {
-  if (!vault.getName().startsWith("Realtime-Lab-V3-Files-")) throw Error("Not a V3 isolated vault");
   if (await allowedV3(vault)) return { action: "already-initialized", files: [] };
   const files = (vault.getFiles?.() || []).filter((f) => f.path !== "realtime-lab-v3-files.json" && !f.path.startsWith("."));
   return { action: files.length ? "preview-only" : "initialize-empty", files: files.map((f) => f.path) };
@@ -10086,7 +10083,7 @@ var ObsidianBlobCache = class {
 
 function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
 }, onStart = () => ((bytes, failed) => {
-})) {
+}), readTimeoutMs = 3e4) {
   return async (url, options = {}) => {
     const started = Date.now(), done = onStart();
     let bytes = 0, failed = false;
@@ -10094,7 +10091,16 @@ function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
       options.signal?.throwIfAborted();
       const body = options.body;
       if (body && (!(body instanceof Uint8Array) || body.length > CHUNK_BYTES)) throw Error("Native request frame exceeds 32 KiB");
-      const r2 = await requestUrl2({ url: String(url), method: options.method || "GET", headers: { ...options.headers, ...body ? { "Content-Type": "application/octet-stream" } : {} }, body: body ? body.slice().buffer : void 0, throw: false });
+      let readTimer;
+      const native = requestUrl2({ url: String(url), method: options.method || "GET", headers: { ...options.headers, ...body ? { "Content-Type": "application/octet-stream" } : {} }, body: body ? body.slice().buffer : void 0, throw: false });
+      let r2;
+      try {
+        r2 = await ((options.method || "GET") === "GET" ? Promise.race([native, new Promise((_, reject) => {
+          readTimer = setTimeout(() => reject(Error("Network read timeout; cached progress retained")), readTimeoutMs);
+        })]) : native);
+      } finally {
+        clearTimeout(readTimer);
+      }
       options.signal?.throwIfAborted();
       bytes = r2.arrayBuffer.byteLength;
       if (r2.status >= 400) failed = true;
@@ -10115,7 +10121,7 @@ function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
 function transientTransferFailure(error) {
   const s = String(error?.message || error);
   if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
-  return /blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
+  return /Foreground reconnect; local edits retained|blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
 }
 function transientFilesystemFailure(error) {
   return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
@@ -10346,7 +10352,7 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
   }
   const legacyCounts = "\u2191" + (unknown ? "?" : uploads) + " \u2193" + downloads;
   let display = "Sync: " + (ready && conflicts ? "\u26A0 \u51B2\u7A81" + conflicts : ready && protectedCount ? "\u26A0 \u5F85\u786E\u8BA4" + protectedCount : tone === "confirmed" ? "\u26A1" : tone === "busy" ? "\u21BB" : tone === "waiting" ? "\u25F7" : tone === "error" ? "\u26A0 \u5F02\u5E38" : "\u25CB \u79BB\u7EBF");
-  const counts = progress?.available ? "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : progress ? "\u8FDB\u5EA6\u5F85\u6838\u5BF9" : legacyCounts;
+  const counts = progress?.available ? (ready ? "" : "\u4E0A\u6B21\u8FDB\u5EA6\uFF1A") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : progress ? "\u8FDB\u5EA6\u5F85\u6838\u5BF9" : legacyCounts;
   if (progress && !conflicts && !protectedCount) {
     display = "Sync: " + (label === "\u6062\u590D\u4E2D" ? "\u6062\u590D\u4E2D" : tone === "busy" ? "\u540C\u6B65\u4E2D" : tone === "confirmed" ? "\u2713" : tone === "error" ? "\u26A0 \u9700\u5904\u7406" : label);
   }
@@ -10954,6 +10960,7 @@ var VaultClientV3 = class extends VaultClient {
       this.onSyncState();
       return true;
     })().catch((e) => {
+      if (this.ws !== ws) return false;
       this.lastError = String(e.message || e);
       this.onSyncState();
       if (this.ws === ws && !this.stopped && !this.transportBlocked && this.lastError !== "Local snapshot save failed; outbox retained") this.resume();
@@ -11125,6 +11132,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   diagnosticTimer;
   diagnosticError = "";
   uiUnloaded = false;
+  lastForegroundTick = Date.now();
+  lastWakeAt = 0;
   transfers = new TransferCounters();
   connectionStatus = "\u672A\u8FDE\u63A5";
   operationError = "";
@@ -11203,7 +11212,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   renderPanel(e, headline) {
     e.empty();
     const c = this.client, rows = this.pendingRows(), progress = this.progressModel();
-    e.createEl("p", { text: progress.available ? "\u6587\u4EF6\u8FDB\u5EA6\uFF1A\u5DF2\u5B8C\u6210 " + progress.completed + " / " + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : "\u6587\u4EF6\u8FDB\u5EA6\uFF1A\u6B63\u5728\u6838\u5BF9\uFF0C\u5C1A\u4E0D\u80FD\u786E\u8BA4\u5DF2\u5B8C\u6210\u6570\u91CF" });
+    e.createEl("p", { text: progress.available ? (c?.ready ? "\u6587\u4EF6\u8FDB\u5EA6\uFF1A" : "\u79BB\u7EBF\u53C2\u8003\u8FDB\u5EA6\uFF08\u91CD\u8FDE\u540E\u6838\u5BF9\uFF09\uFF1A") + "\u5DF2\u5B8C\u6210 " + progress.completed + " / " + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u5F85\u91CD\u8BD5 " + progress.retry : "\u6587\u4EF6\u8FDB\u5EA6\uFF1A\u6B63\u5728\u6838\u5BF9\uFF0C\u5C1A\u4E0D\u80FD\u786E\u8BA4\u5DF2\u5B8C\u6210\u6570\u91CF" });
     e.createEl("p", { text: "\u5F53\u524D\u63A5\u6536\u5E76\u53D1\uFF1A" + progress.active + "\uFF08\u4E0D\u662F\u5269\u4F59\u6587\u4EF6\u6570\uFF09\uFF1B\u5F85\u91CD\u8BD5\u5305\u542B\u5728\u5269\u4F59\u4E2D\uFF0C\u4E0D\u91CD\u590D\u76F8\u52A0\u3002" });
     e.createEl("p", { text: "\u5F53\u524D\u72B6\u6001\uFF1A" + headline });
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
@@ -11215,6 +11224,30 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
     if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
     for (const row of rows.slice(0, 50)) e.createEl("p", { text: (row.path === "*" ? "\u672C\u5730\u79BB\u7EBF\u5FEB\u7167\u5F85\u6838\u5BF9" : row.path) + " \xB7 " + row.state + (row.error ? " \xB7 " + this.safeError(row.error) : "") });
+  }
+  resumeForeground(force = true) {
+    const c = this.client;
+    if (document.hidden || !c || this.stopping || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
+    const now = Date.now();
+    if (force && now - this.lastWakeAt < 1500) return;
+    this.lastForegroundTick = now;
+    this.retryAfter = 0;
+    if (force) {
+      this.lastWakeAt = now;
+      this.setConnectionStatus("\u6062\u590D\u8FDE\u63A5\u4E2D\uFF0C\u4FDD\u7559\u539F\u961F\u5217");
+      c.resume();
+    } else void c.checkConnection();
+    void this.recoverQueue();
+    this.updateProgress();
+  }
+  foregroundTick() {
+    if (document.hidden) return;
+    const gap = Date.now() - this.lastForegroundTick;
+    this.lastForegroundTick = Date.now();
+    this.resumeForeground(gap > 2e4);
+    void this.refreshConflicts();
+    void this.reportDiagnostic();
+    if (this.settings.pathSafety?.items.length) this.schedulePathSafety();
   }
   async recoverQueue() {
     const c = this.client;
@@ -11260,7 +11293,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   progressModel() {
     const c = this.client;
-    return fileProgress({ known: c ? Object.keys(entries(c.doc)) : [], pending: this.pendingRows().map((r2) => r2.path), failures: [...this.fileFailures.keys()], active: this.downloadPaths.size, ready: !!c?.ready && this.settings.receivePending?.serverId === c.serverId });
+    return fileProgress({ known: c ? Object.keys(entries(c.doc)) : [], pending: this.pendingRows().map((r2) => r2.path), failures: [...this.fileFailures.keys()], active: this.downloadPaths.size, ready: !!c?.serverId && this.settings.receivePending?.serverId === c.serverId });
   }
   badgeModel() {
     const c = this.client, progress = this.progressModel(), uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
@@ -11274,7 +11307,6 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   syncBadges() {
     if (this.uiUnloaded) return;
-    if (!this.app.vault.getName().startsWith("Realtime-Lab-V3-Files-")) return;
     this.clearOrphanBadges();
     const Observer = document.defaultView?.MutationObserver;
     if (!this.badgeObserver && Observer && document.body) {
@@ -11687,7 +11719,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.status = this.addStatusBarItem();
     this.setConnectionStatus("\u672A\u8FDE\u63A5");
     this.addSettingTab(new Settings(this.app, this));
-    this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u72EC\u7ACB\u6D4B\u8BD5\u5E93", callback: () => void this.start() });
+    this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u540C\u6B65\u5E93", callback: () => void this.start() });
     this.addCommand({ id: "path-safety", name: "\u67E5\u770B\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4", callback: () => void this.openPathSafety() });
     this.addCommand({ id: "device-diagnostics", name: "\u67E5\u770B\u8BBE\u5907\u8FDC\u7A0B\u540C\u6B65\u8BCA\u65AD", callback: () => void this.openDeviceDiagnostics() });
     this.addCommand({ id: "conflicts", name: "\u67E5\u770B\u4E0E\u5904\u7406\u540C\u6B65\u51B2\u7A81", callback: () => void this.openConflicts() });
@@ -11755,27 +11787,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.updateProgress()));
     this.registerEvent(this.app.workspace.on("file-open", () => this.updateProgress()));
     this.registerDomEvent(window, "resize", () => this.updateProgress());
-    this.registerDomEvent(window, "online", () => {
-      if (!this.client || this.stopping || this.client.stopped || this.client.transportBlocked) return;
-      this.retryAfter = 0;
-      if (!this.client.ready) this.client.resume();
-      else void this.recoverQueue();
-      void this.refreshConflicts();
-    });
+    this.registerDomEvent(window, "online", () => this.resumeForeground());
+    this.registerDomEvent(window, "focus", () => this.resumeForeground());
+    this.registerDomEvent(window, "pageshow", () => this.resumeForeground());
+    this.registerDomEvent(document, "resume", () => this.resumeForeground());
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (!document.hidden) this.client?.resume();
+      if (!document.hidden) this.resumeForeground();
       else void this.flushReceipts().catch(() => this.updateProgress());
       void this.reportDiagnostic();
     });
-    this.registerInterval(window.setInterval(() => {
-      if (!document.hidden) {
-        void this.client?.checkConnection();
-        void this.recoverQueue();
-        void this.refreshConflicts();
-        void this.reportDiagnostic();
-        if (this.settings.pathSafety?.items.length) this.schedulePathSafety();
-      }
-    }, 1e4));
+    this.registerInterval(window.setInterval(() => this.foregroundTick(), 1e4));
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.enabled) void this.start();
       else this.setConnectionStatus("\u672A\u8FDE\u63A5\uFF08\u81EA\u52A8\u8FDE\u63A5\u5DF2\u5173\u95ED\uFF09");
@@ -11820,10 +11841,6 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     return allowedV3(this.app.vault);
   }
   async initialize() {
-    if (!this.app.vault.getName().startsWith("Realtime-Lab-V3-Files-")) {
-      new import_obsidian.Notice("\u8BF7\u65B0\u5EFA\u7A7A\u5E93\uFF0C\u540D\u79F0\u4EE5 Realtime-Lab-V3-Files- \u5F00\u5934\uFF1B\u65E7\u5E93\u4E0D\u4F1A\u88AB\u521D\u59CB\u5316\u3002");
-      return;
-    }
     if (this.liveSync()) {
       new import_obsidian.Notice("\u8BF7\u5173\u95ED\u6D4B\u8BD5\u5E93\u4E2D\u7684 LiveSync");
       return;
@@ -11836,7 +11853,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         return;
       }
       await initializeV3(this.app.vault);
-      new import_obsidian.Notice("V3 \u72EC\u7ACB\u6D4B\u8BD5\u5E93\u5DF2\u521D\u59CB\u5316");
+      new import_obsidian.Notice("V3 \u540C\u6B65\u5E93\u5DF2\u521D\u59CB\u5316");
     } catch (e) {
       new import_obsidian.Notice(String(e));
     }
@@ -11948,7 +11965,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }
     await this.queue;
     if (!await this.allowed() || this.liveSync()) {
-      new import_obsidian.Notice("\u4EC5\u652F\u6301\u5DF2\u521D\u59CB\u5316\u4E14\u672A\u5F00\u542F LiveSync \u7684 Realtime-Lab-V3-Files- \u6D4B\u8BD5\u5E93");
+      new import_obsidian.Notice("\u4EC5\u652F\u6301\u5DF2\u521D\u59CB\u5316\u4E14\u672A\u5F00\u542F LiveSync \u7684\u540C\u6B65\u5E93");
       return;
     }
     if (!/^wss?:\/\//.test(this.settings.url) || this.settings.token.length < 32) {
@@ -12314,7 +12331,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     modal.open();
   }
   async previewInventory(allowUninitialized = false) {
-    if (!this.app.vault.getName().startsWith("Realtime-Lab-V3-Files-") || !allowUninitialized && !await this.allowed()) {
+    if (!allowUninitialized && !await this.allowed()) {
       new import_obsidian.Notice("\u4EC5\u9884\u89C8\u5F53\u524D\u72EC\u7ACB V3 \u6D4B\u8BD5\u5E93");
       return;
     }
@@ -12675,15 +12692,15 @@ var Settings = class extends import_obsidian.PluginSettingTab {
   display() {
     const e = this.containerEl;
     e.empty();
-    e.createEl("h2", { text: "Realtime Lab V3 \xB7 \u6574\u5E93\u6D4B\u8BD5" });
+    e.createEl("h2", { text: "Realtime Lab \xB7 \u540C\u6B65" });
     this.p.syncPanel = e.createDiv();
     this.p.renderProgress();
     new import_obsidian.Setting(e).addButton((b) => b.setButtonText("\u5237\u65B0\u72B6\u6001").onClick(() => this.p.renderProgress())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.p.retryQueue()));
     new import_obsidian.Setting(e).setName("\u8BEF\u7F6E\u65E7\u534F\u8BAE\u8BBE\u7F6E").addButton((b) => b.setButtonText("\u5907\u4EFD\u5E76\u6E05\u7A7A\u65E7\u72B6\u6001").onClick(() => void this.p.backupRejectedState()));
-    e.createEl("p", { text: "\u4EC5 Realtime-Lab-V3-Files- \u72EC\u7ACB\u6D4B\u8BD5\u5E93\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u6D3B\u52A8\u5185\u5BB9\u2264256 MiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264512 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
+    e.createEl("p", { text: "\u652F\u6301\u81EA\u5B9A\u4E49\u4ED3\u5E93\u540D\uFF1B\u6BCF\u4E2A\u5E93\u9700\u5355\u72EC\u521D\u59CB\u5316\u5E76\u8FDE\u63A5\u72EC\u7ACB\u540C\u6B65\u7A7A\u95F4\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA Word DOCX/JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u6D3B\u52A8\u5185\u5BB9\u2264256 MiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264512 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
     new import_obsidian.Setting(e).setName("\u521B\u5EFA\u6216\u52A0\u5165\u5411\u5BFC").addButton((b) => b.setButtonText("\u914D\u7F6E\u8FDE\u63A5").onClick(() => void this.p.setupConnection()));
     new import_obsidian.Setting(e).setName("\u53EA\u8BFB\u6587\u4EF6\u53CA\u9644\u4EF6\u6E05\u5355").addButton((b) => b.setButtonText("\u9884\u89C8\uFF0C\u4E0D\u8FC1\u79FB").onClick(() => void this.p.previewInventory()));
-    new import_obsidian.Setting(e).setName("\u521D\u59CB\u5316\u72EC\u7ACB\u6D4B\u8BD5\u5E93").addButton((b) => b.setButtonText("\u521D\u59CB\u5316").onClick(() => void this.p.initialize()));
+    new import_obsidian.Setting(e).setName("\u521D\u59CB\u5316\u540C\u6B65\u5E93").addButton((b) => b.setButtonText("\u521D\u59CB\u5316").onClick(() => void this.p.initialize()));
     new import_obsidian.Setting(e).setName("V3 WebSocket \u5730\u5740").addText((t) => t.setValue(this.p.settings.url).onChange(async (v) => {
       if (this.p.settings.state && !this.p.settings.stateOrigin) this.p.settings.stateOrigin = this.p.settings.url;
       this.p.settings.url = v.trim();
@@ -12702,7 +12719,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
       this.p.renderProgress();
       if (v && !this.p.client) await this.p.start();
     }));
-    new import_obsidian.Setting(e).setName("\u8FDE\u63A5\u6574\u4E2A\u6D4B\u8BD5\u5E93").addButton((b) => b.setButtonText("\u8FDE\u63A5").onClick(() => void this.p.start()));
+    new import_obsidian.Setting(e).setName("\u8FDE\u63A5\u6574\u4E2A\u540C\u6B65\u5E93").addButton((b) => b.setButtonText("\u8FDE\u63A5").onClick(() => void this.p.start()));
     new import_obsidian.Setting(e).setName("\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4").addButton((b) => b.setButtonText("\u67E5\u770B\u5F85\u786E\u8BA4\u64CD\u4F5C").onClick(() => void this.p.openPathSafety()));
     new import_obsidian.Setting(e).setName("\u8BBE\u5907\u8FDC\u7A0B\u8BCA\u65AD").addButton((b) => b.setButtonText("\u67E5\u770B\u8BBE\u5907\u72B6\u6001").onClick(() => void this.p.openDeviceDiagnostics()));
     new import_obsidian.Setting(e).setName("\u540C\u6B65\u51B2\u7A81").addButton((b) => b.setButtonText("\u67E5\u770B\u4E0E\u5904\u7406").onClick(() => void this.p.openConflicts()));

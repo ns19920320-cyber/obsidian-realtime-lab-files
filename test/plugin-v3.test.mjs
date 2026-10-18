@@ -1,0 +1,316 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {build} from 'esbuild';
+import WebSocket from 'ws';
+import {createVaultServerV3} from '../src/v3/server.mjs';
+import {VaultClientV3} from '../src/v3/client.mjs';
+import {put,content,remove} from '../src/v3/model.mjs';
+const mock=`export const Platform={isMacOS:true};export class Plugin {registerEvent(){} registerInterval(id){id.unref?.()} registerDomEvent(target,event,cb){(this.domEvents??={})[event]=cb} addCommand(){} addSettingTab(){} addStatusBarItem(){return {setText(){}}} async loadData(){return null} async saveData(s){this.saved=structuredClone(s)}} export class TFile{constructor(path,size=0){this.path=path;this.stat={size}}} export const setIcon=(el,name)=>el.setAttribute("data-icon",name); export class MarkdownView{} export class App{} export class Modal{} export class Notice{constructor(s){}} export class Setting{} export class PluginSettingTab{constructor(app){this.app=app}} export const normalizePath=p=>p; export async function requestUrl(o){const r=await fetch(o.url,{method:o.method,headers:o.headers,body:o.body});return {status:r.status,headers:Object.fromEntries(r.headers),arrayBuffer:await r.arrayBuffer()}};`;
+const output=new URL('./.plugin-v3-under-test.mjs',import.meta.url);
+globalThis.WebSocket=WebSocket;globalThis.window=globalThis;
+const wait=async f=>{for(let i=0;i<300;i++){if(f())return;await new Promise(r=>setTimeout(r,10));}throw Error('Timeout');};
+function vault(){const data=new Map(),files=new Map(),folders=new Set(),events={};let writes=0,binaryReads=0,maxChunk=0;const v={getName:()=> 'Realtime-Lab-V3-Files-Integration',getFiles:()=>[...files.values()],getAbstractFileByPath:p=>files.get(p)||(folders.has(p)?{path:p}:null),on:(event,cb)=>{(events[event]??=[]).push(cb);return {};},adapter:{stat:async p=>({size:typeof data.get(p)==='string'?new TextEncoder().encode(data.get(p)).length:data.get(p)?.byteLength||0}),list:async p=>({files:[...data.keys()].filter(k=>k.startsWith(p+'/')&&!k.slice(p.length+1).includes('/')),folders:[...folders].filter(k=>k.startsWith(p+'/')&&!k.slice(p.length+1).includes('/'))}),exists:async p=>data.has(p)||folders.has(p),mkdir:async p=>{folders.add(p)},read:async p=>{if(p==='realtime-lab-v3-files.json')return '{"isolatedLab":true,"protocol":3,"capability":"versioned-files-v1"}';return data.get(p);},write:async(p,s)=>{data.set(p,s);writes++;},writeBinary:async(p,s)=>{data.set(p,s);writes++;},readBinary:async p=>{const b=data.get(p);maxChunk=Math.max(maxChunk,b.byteLength);return b;}},read:async f=>data.get(f.path),readBinary:async f=>{binaryReads++;const d=data.get(f.path);return typeof d==='string'?new TextEncoder().encode(d).buffer:d},createFolder:async p=>{folders.add(p)},async create(p,s){const f={path:p,stat:{size:s.length??s.byteLength}};Object.setPrototypeOf(f,fileProto);files.set(p,f);data.set(p,s);for(const cb of events.create||[])cb(f);writes++;return f;},async createBinary(p,s){return this.create(p,s)},async modify(f,s){data.set(f.path,s);f.stat.size=s.length??s.byteLength;for(const cb of events.modify||[])cb(f);writes++;},async modifyBinary(f,s){return this.modify(f,s)},async rename(f,next){const old=f.path;const moved=[...files.values()].filter(x=>x.path===old||x.path.startsWith(old+'/'));for(const x of moved){const from=x.path,to=next+from.slice(old.length),value=data.get(from);files.delete(from);data.delete(from);x.path=to;files.set(to,x);data.set(to,value);}f.path=next;for(const cb of events.rename||[])cb(f,old);},async trash(f){for(const key of [...files.keys()])if(key===f.path||key.startsWith(f.path+'/')){files.delete(key);data.delete(key);}for(const cb of events.delete||[])cb(f);writes++;}};return {v,data,files,get writes(){return writes},get binaryReads(){return binaryReads},get maxChunk(){return maxChunk}};}
+const source=fs.readFileSync(new URL('../src/v3/plugin.ts',import.meta.url),'utf8')+'\nexport {TFile,MarkdownView};';
+await build({stdin:{contents:source,loader:'ts',resolveDir:new URL('../src/v3',import.meta.url).pathname},outfile:output.pathname,bundle:true,platform:'node',format:'esm',packages:'external',plugins:[{name:'stub',setup(b){b.onResolve({filter:/^obsidian$/},()=>({path:'mock',namespace:'stub'}));b.onLoad({filter:/.*/,namespace:'stub'},()=>({contents:mock,loader:'js'}));}}]});
+const bundle=await import(output.href+'?bridge');fs.unlinkSync(output);const fileProto=bundle.TFile.prototype;globalThis.document={hidden:false};
+const bytesSource=b=>({size:b.length,read:async(p,n)=>b.subarray(p,p+n)});
+async function env(t){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'v3-plugin-')),token='synthetic-native-v3-'.repeat(3),server=await createVaultServerV3({dir,token}),other=new VaultClientV3({url:'ws://127.0.0.1:'+server.port,token,WebSocketImpl:WebSocket}),mem=vault(),p=new bundle.default();p.app={vault:mem.v,plugins:{enabledPlugins:new Set()},workspace:{events:{},on(event,cb){this.events[event]=cb;return {};},onLayoutReady(cb){this.layoutReady=cb;},getLeavesOfType:()=>[]}};await p.onload();p.settings.url=other.url;p.settings.token=token;t.after(async()=>{await p.stop();await other.close();await p.queue;await server.close();fs.rmSync(dir,{recursive:true,force:true});});other.connect();await wait(()=>other.ready);return {p,other,mem,server};}
+test('V3 plugin adapter receives image via chunk cache and text updates do not reread original binary',async t=>{const {p,other,mem}=await env(t);const bytes=new Uint8Array(32768*3+7).fill(61),ref=await other.putImage('图片/手机.png',bytesSource(bytes));put(other.doc,'文字.md',{kind:'text',data:'first'});await p.start();await wait(()=>mem.files.has('图片/手机.png')&&mem.data.get('文字.md')==='first');assert.deepEqual(new Uint8Array(mem.data.get('图片/手机.png')),bytes);const reads=mem.binaryReads;for(let i=0;i<5;i++){put(other.doc,'文字.md',{kind:'text',data:'文字'+i});await wait(()=>mem.data.get('文字.md')==='文字'+i);}assert.equal(mem.binaryReads,reads);assert(mem.maxChunk<=32768);assert.equal(content(p.client.doc,'图片/手机.png').hash,ref.hash);assert(p.saved.protocol===3);});
+test('V3 plugin reads local source once, uploads refs and keeps binary out of settings',async t=>{const {p,other,mem,server}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);const bytes=new Uint8Array(32768*2+9).fill(47),before=mem.binaryReads;await mem.v.createBinary('电脑.png',bytes.buffer);await wait(()=>content(other.doc,'电脑.png'));assert.equal(mem.binaryReads-before,1);await p.stop();assert(p.saved.state.length<5000);assert(!p.saved.state.includes('Ly8vLy8v'));assert(server.blobs.has(content(other.doc,'电脑.png').hash,bytes.length));assert(mem.maxChunk<=32768);});
+test('V3 plugin backs up binary before remote deletion and excludes private cache paths',async t=>{const {p,other,mem,server}=await env(t);const bytes=new Uint8Array([1,3,5,7]);await other.putImage('恢复.png',bytesSource(bytes));await p.start();await wait(()=>mem.files.has('恢复.png'));remove(other.doc,'恢复.png');await wait(()=>!mem.files.has('恢复.png'));assert([...mem.data].some(([k,v])=>k.startsWith('.realtime-lab-v3-recovery/')&&v instanceof ArrayBuffer&&new Uint8Array(v).length===4));assert([...server.doc.getMap('files').keys()].every(k=>!k.startsWith('.')));});
+test('V3 plugin refuses legacy settings and V2 markers; explicit rejected-settings backup preserves old state',async t=>{const {p,mem}=await env(t);const old={state:'old-encoded-state',token:'synthetic-legacy-only',url:'ws://127.0.0.1:1'};p.legacyConfig=old;await p.start();assert.equal(p.client,null);await assert.rejects(p.persistConfig(),/拒绝覆盖/);await p.backupRejectedState();assert.equal(p.legacyConfig,null);assert.equal(p.saved.protocol,3);assert([...mem.data].some(([k,v])=>k.includes('rejected-old-settings')&&JSON.parse(v).state===old.state));mem.data.set('realtime-lab-v2.json','{"isolatedLab":true,"protocol":2}');assert.equal(await p.allowed(),false);await p.start();assert.equal(p.client,null);});
+test('mobile-compatible chunk cache survives reopen with partial progress and checks quota before writing',async()=>{const {ObsidianBlobCache}=await import('../src/v3/obsidian-cache.mjs'),{hashSource}=await import('../src/v3/sha256.mjs'),m=vault(),b=new Uint8Array(32768*2+7).fill(17),ref={hash:await hashSource(bytesSource(b)),size:b.length};let cache=new ObsidianBlobCache(m.v.adapter);await cache.sink(ref).write(0,b.subarray(0,32768));cache=new ObsidianBlobCache(m.v.adapter);assert.equal(await cache.sink(ref).length(),32768);await cache.sink(ref).write(32768,b.subarray(32768,65536));await cache.sink(ref).write(65536,b.subarray(65536));await cache.sink(ref).commit();assert.deepEqual(new Uint8Array(await cache.materialize(ref)),b);assert(m.maxChunk<=32768);m.data.set('.realtime-lab-v3-cache/quota/state.json',JSON.stringify({size:5*1024*1024}));for(let i=0;i<104;i++){await m.v.adapter.mkdir('.realtime-lab-v3-cache/quota'+i);m.data.set('.realtime-lab-v3-cache/quota'+i+'/state.json',JSON.stringify({size:5*1024*1024}));}cache=new ObsidianBlobCache(m.v.adapter);await assert.rejects(cache.stage(bytesSource(new Uint8Array([1]))),/quota/);});
+test('V3 plugin cold restart publishes offline image edits from private chunk cache',async t=>{const {p,mem,other,server}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);const f=await mem.v.createBinary('重启.png',new Uint8Array([1,2,3]).buffer);await wait(()=>content(other.doc,'重启.png'));p.client.stopped=true;p.client.ws.close();await wait(()=>!p.client.ready);await mem.v.modifyBinary(f,new Uint8Array([4,5,6]).buffer);await p.queue;assert(p.settings.pending?.items.length);await p.stop();const next=new bundle.default();next.app=p.app;await next.onload();next.settings=structuredClone(p.saved);t.after(async()=>{await next.stop();await next.queue;});await next.start();await wait(()=>next.client?.ready&&next.syncedOnce&&next.settings.pending.items.length===0);const ref=content(other.doc,'重启.png');await wait(()=>content(server.doc,'重启.png')?.hash===content(next.client.doc,'重启.png')?.hash);assert.deepEqual([...server.blobs.read(content(server.doc,'重启.png').hash,0)],[4,5,6]);assert([...mem.data.keys()].some(k=>k.startsWith('.realtime-lab-v3-cache/')));});
+test('V3 plugin missing pending-only image asks explicit deletion direction before restart publication',async t=>{const {p,mem,other,server}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);p.client.stopped=true;p.client.ws.close();await wait(()=>!p.client.ready);const f=await mem.v.createBinary('待传删除.png',new Uint8Array([8,7,6]).buffer);await p.queue;assert(p.settings.pending?.items.length);await p.stop();mem.files.delete(f.path);mem.data.delete(f.path);const next=new bundle.default();next.app=p.app;await next.onload();next.settings=structuredClone(p.saved);let asked=false;next.resolveMissing=async paths=>{asked=true;assert(paths.includes(f.path));return 'delete';};t.after(async()=>{await next.stop();await next.queue;});await next.start();await wait(()=>next.client?.ready&&next.syncedOnce);assert(asked);assert.equal(content(server.doc,f.path),null);assert.equal(mem.files.has(f.path),false);assert.equal(next.settings.pending.items.length,0);});
+test('Files plugin uses whole-file mode for ordinary Markdown and PDF while retaining inline test-note policy',async t=>{const {p,mem,other}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);await mem.v.create('普通.md','整文件文字');await wait(()=>content(other.doc,'普通.md')?.kind==='file');assert.equal(other.doc.getText('text:普通.md').length,0);await mem.v.createBinary('附件.pdf',new TextEncoder().encode('%PDF synthetic').buffer);await wait(()=>content(other.doc,'附件.pdf')?.kind==='file');await mem.v.create('实时协作测试.md','逐字协作');await wait(()=>content(other.doc,'实时协作测试.md')?.kind==='text');assert.equal(content(other.doc,'实时协作测试.md').data,'逐字协作');});
+test('Files plugin reflects whole-file Markdown and backs up its previous bytes before replacement',async t=>{const {p,mem,other}=await env(t),a=new TextEncoder().encode('整篇第一版'),b=new TextEncoder().encode('整篇第二版');await other.putFile('整篇.md',bytesSource(a));await p.start();await wait(()=>mem.data.get('整篇.md')==='整篇第一版');await other.putFile('整篇.md',bytesSource(b));await wait(()=>mem.data.get('整篇.md')==='整篇第二版');assert([...mem.data].some(([k,v])=>k.startsWith('.realtime-lab-v3-recovery/')&&v instanceof ArrayBuffer&&new TextDecoder().decode(v)==='整篇第一版'));});
+test('Files plugin coalesces repeated file events while an upload is blocked instead of queuing one read per event',async t=>{const {p,mem,other}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);let release,entered=false;const original=p.upload.bind(p),gate=new Promise(r=>release=r);p.upload=async f=>{if(!entered){entered=true;await gate;}return original(f);};t.after(()=>release?.());const f=await mem.v.create('连续.md','v0');await wait(()=>entered);const before=mem.binaryReads;for(let i=1;i<=100;i++)await mem.v.modify(f,'v'+i);assert.equal(p.dirtyFiles.size,1);release();await wait(()=>content(other.doc,'连续.md')?.kind==='file'&&p.dirtyFiles.size===0);await p.queue;assert(mem.binaryReads-before<=2);const ref=content(other.doc,'连续.md');const bytes=await p.cache.materialize(ref);assert.equal(new TextDecoder().decode(bytes),'v100');});
+
+test('Files mobile editor without CM binding uploads while initial file reflection is blocked',async t=>{
+ const {p,mem,other,server}=await env(t);
+ put(other.doc,'实时协作测试.md',{kind:'text',data:'base'});
+ await wait(()=>content(server.doc,'实时协作测试.md')?.data==='base');
+ const f=await mem.v.create('实时协作测试.md','base');
+ let release,entered=false;const gate=new Promise(r=>release=r),reflect=p.reflect.bind(p);
+ p.reflect=async()=>{entered=true;await gate;return reflect();};t.after(()=>release?.());
+ await p.start();await wait(()=>entered&&p.syncedOnce);assert(p.initializing);
+ const change=p.app.workspace.events['editor-change'];if(typeof change!=='function'){release();await p.queue;}assert.equal(typeof change,'function','mobile editor requires a public editor-change fallback');
+ await mem.v.modify(f,'base 手机初始下载期间输入');
+ change({getValue:()=> 'base 手机初始下载期间输入'},{file:f});
+ await wait(()=>content(server.doc,f.path)?.data==='base 手机初始下载期间输入');
+ release();await p.queue;assert.equal(mem.data.get(f.path),'base 手机初始下载期间输入');
+});
+
+test('Files cold update recovers an existing unsent phone text file without new input or state reset',async t=>{
+ const {p,mem,server,other}=await env(t);put(other.doc,'实时协作测试.md',{kind:'text',data:'base'});
+ await wait(()=>content(server.doc,'实时协作测试.md')?.data==='base');await p.start();await wait(()=>p.syncedOnce&&mem.data.get('实时协作测试.md')==='base');
+ await p.stop();await p.queue;const saved=structuredClone(p.saved),id=saved.serverId;
+ // A suspended old mobile plugin saved the file but missed its editor event.
+ mem.data.set('实时协作测试.md','base 新版实时验证 1016');mem.files.get('实时协作测试.md').stat.size=32;
+ const next=new bundle.default();next.app=p.app;await next.onload();next.settings=saved;t.after(async()=>{await next.stop();await next.queue;});
+ await next.start();await wait(()=>next.syncedOnce&&content(server.doc,'实时协作测试.md')?.data==='base 新版实时验证 1016');
+ assert.equal(next.settings.serverId,id);assert.equal(mem.data.get('实时协作测试.md'),'base 新版实时验证 1016');
+ assert([...mem.data].some(([k,v])=>k.startsWith('.realtime-lab-v3-recovery/')&&v==='base 新版实时验证 1016'));
+});
+
+test('Files visibility resume preserves the live document and automatically sends existing offline edits',async t=>{
+ const {p,mem,server,other}=await env(t);put(other.doc,'实时协作测试.md',{kind:'text',data:'base'});await wait(()=>content(server.doc,'实时协作测试.md')?.data==='base');
+ await p.start();await wait(()=>p.syncedOnce&&mem.data.get('实时协作测试.md')==='base');const old=p.client.ws,doc=p.client.doc,id=p.client.serverId;
+ old.send=()=>{};p.app.workspace.events['editor-change']({getValue:()=> 'base 手机已存文字'},{file:mem.files.get('实时协作测试.md')});assert.equal(content(server.doc,'实时协作测试.md').data,'base');
+ p.domEvents.visibilitychange();await wait(()=>p.client.ready&&p.client.ws!==old&&content(server.doc,'实时协作测试.md')?.data==='base 手机已存文字');
+ assert.equal(p.client.doc,doc);assert.equal(p.client.serverId,id);
+});
+
+test('Files failed online upload retains durable blob and visible retry path until successful retry',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce);const upload=p.client.blobs.upload.bind(p.client.blobs);let fail=true;p.client.blobs.upload=async(...args)=>{if(fail)throw Error('Synthetic upload interruption');return upload(...args);};
+ await mem.v.createBinary('队列重试.png',new Uint8Array([21,22,23]).buffer);await p.queue;
+ assert(p.fileFailures.has('队列重试.png'));assert(p.dirtyFiles.has('队列重试.png'));assert.equal(p.settings.pending.items.length,1);assert(p.pendingRows().some(r=>r.path==='队列重试.png'&&r.state==='失败，可重试'));
+ fail=false;await p.retryQueue();await p.queue;await wait(()=>content(other.doc,'队列重试.png'));assert.equal(p.settings.pending.items.length,0);assert.equal(p.fileFailures.size,0);assert.equal(p.dirtyFiles.size,0);await p.client.confirmUploads();assert.equal(p.pendingRows().length,0);
+});
+test('Files startup honors existing auto-connect choice without resetting content or identity',async t=>{
+ const {p,mem,server}=await env(t);p.settings.enabled=false;p.app.workspace.layoutReady();assert.equal(p.client,null);
+ p.settings.enabled=true;p.app.workspace.layoutReady();await wait(()=>p.syncedOnce);const id=p.settings.serverId;assert.equal(id,server.serverId);assert.equal(p.settings.enabled,true);
+ await mem.v.create('自动连接保留.md','content retained');await p.queue;await p.stop();assert.equal(mem.data.get('自动连接保留.md'),'content retained');assert.equal(p.settings.serverId,id);assert.equal(p.settings.enabled,true);
+});
+
+test('Files status never equates socket readiness with confirmed upload completion',async t=>{
+ const {p,server}=await env(t);await p.start();await wait(()=>p.syncedOnce);await p.client.confirmUploads();assert.equal(p.summaryStatus(),'已提交服务器');
+ const old=p.client.ws;old.send=()=>{};put(p.client.doc,'待确认.md',{kind:'text',data:'not acknowledged'});assert.match(p.summaryStatus(),/待上传或确认/);assert(!content(server.doc,'待确认.md'));p.fileFailures.set('失败.md','synthetic');assert.match(p.summaryStatus(),/失败项目/);
+});
+
+
+test('header badge follows connection and queue without duplication in reading and editing views',async t=>{
+ const {JSDOM}=await import('jsdom');const dom=new JSDOM('<div class="view-header"></div>');const proto=dom.window.HTMLElement.prototype;
+ proto.empty=function(){this.replaceChildren()};proto.addClass=function(...c){this.classList.add(...c)};proto.setText=function(s){this.textContent=s};proto.createSpan=function(o){const e=dom.window.document.createElement('span');e.className=o.cls;this.append(e);return e};
+ const {p}=await env(t);const oldDocument=globalThis.document;globalThis.document=dom.window.document;t.after(()=>{globalThis.document=oldDocument});let opened=0;p.openSyncDetails=()=>opened++;
+ const header=dom.window.document.querySelector('div'),view=new bundle.MarkdownView();view.file=new bundle.TFile('实时协作测试.md');view.addAction=(icon,title,cb)=>{const el=dom.window.document.createElement('div');el.addEventListener('click',cb);header.append(el);return el};
+ view.contentEl=dom.window.document.createElement('div');header.after(view.contentEl);let leaves=[{view}];p.app.workspace.getLeavesOfType=()=>leaves;p.app.workspace.getActiveViewOfType=()=>view;
+ p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-badge').length,1);assert.equal(dom.window.document.querySelector('.rl-sync-badge').dataset.tone,'offline');
+ dom.window.document.body.classList.add('is-mobile');view.containerEl=dom.window.document.body;header.getBoundingClientRect=()=>({bottom:96,height:44});p.syncBadges();assert.equal(dom.window.document.querySelector('.rl-sync-row').style.top,'100px','mobile row anchored below the actual toolbar, not viewport top');
+ const background=new bundle.MarkdownView();background.file=new bundle.TFile('后台.md');background.containerEl=view.containerEl;background.contentEl=dom.window.document.createElement('div');header.after(background.contentEl);leaves.push({view:background});p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-row').length,1,'background mobile tabs must not overlay the active status');
+ p.app.workspace.getActiveViewOfType=()=>background;p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-row').length,1,'switching mobile tabs replaces the previous status');p.app.workspace.getActiveViewOfType=()=>null;p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-row').length,0,'no active Markdown view hides the floating status');p.app.workspace.getActiveViewOfType=()=>view;
+ p.dirtyFiles.set('a.md',new bundle.TFile('a.md'));p.syncBadges();assert.match(dom.window.document.body.textContent,/进度待核对/);
+ p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-badge').length,1);dom.window.document.querySelector('.rl-sync-badge').dispatchEvent(new dom.window.KeyboardEvent('keydown',{key:'Enter',bubbles:true}));assert.equal(opened,1);
+ dom.window.document.querySelector('.rl-sync-row').remove();p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-badge').length,1,'recreated reading/editing header');
+ p.fileFailures.set('a.md','failure');p.syncBadges();assert.equal(dom.window.document.querySelector('.rl-sync-badge').dataset.tone,'error');
+ leaves=[];p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-badge').length,0);dom.window.close();
+});
+
+test('automatic reconnect drains retained dirty files and clears transient queue failures without typing',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce&&!p.initializing);
+ const upload=p.client.blobs.upload.bind(p.client.blobs);let fail=true;p.client.blobs.upload=async(...args)=>{if(fail)throw new TypeError('Failed to fetch');return upload(...args)};
+ await mem.v.create('自动补传.md','existing offline words');await wait(()=>p.fileFailures.has('自动补传.md'));await p.queue;assert(p.settings.pending.items.length);
+ fail=false;p.client.resume();await wait(()=>p.client.ready&&!p.initializing&&content(other.doc,'自动补传.md'));await p.queue;
+ assert.equal(p.dirtyFiles.size,0);assert.equal(p.fileFailures.size,0);await p.client.confirmUploads();assert.equal(p.pendingRows().length,0);
+});
+
+test('foreground recovery retries transient HTTP upload failures but leaves storage failures for explicit action',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce&&!p.initializing);
+ const upload=p.client.blobs.upload.bind(p.client.blobs);let fail=true;p.client.blobs.upload=async(...args)=>{if(fail)throw Error('Blob request failed (503)');return upload(...args)};
+ await mem.v.create('联网自动恢复.md','no repeated typing');await wait(()=>p.fileFailures.size);await p.queue;
+ fail=false;await p.recoverQueue();await wait(()=>content(other.doc,'联网自动恢复.md'));await p.queue;await p.client.confirmUploads();assert.equal(p.pendingRows().length,0);
+ p.fileFailures.set('磁盘.md','Local storage quota exceeded');p.operationError='Local storage quota exceeded';let tried=false;p.retryQueue=async()=>{tried=true};await p.recoverQueue();assert.equal(tried,false);assert(p.fileFailures.has('磁盘.md'));
+});
+
+
+test('folder rename moves Markdown and images with recoverable old paths and no lost local updates',async t=>{
+ const {p,mem,other,server}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);
+ const f=await mem.v.create('批量/笔记.md','folder text');await mem.v.createBinary('批量/图片.png',new Uint8Array([1,8,2]).buffer);await p.queue;await wait(()=>content(other.doc,'批量/图片.png'));
+ await mem.v.rename({path:'批量'},'重命名');await p.queue;await wait(()=>content(other.doc,'重命名/图片.png'));
+ assert.equal(content(other.doc,'批量/图片.png'),null);assert.equal(content(other.doc,'批量/笔记.md'),null);assert(content(other.doc,'重命名/笔记.md'));assert((await p.client.request('history',{path:'批量/图片.png'})).some(v=>!v.deleted));assert.equal(mem.data.get('重命名/笔记.md'),'folder text');await mem.v.trash({path:'重命名'});await p.queue;await wait(()=>content(other.doc,'重命名/图片.png')===null);assert.equal(content(other.doc,'重命名/笔记.md'),null);assert((await p.client.request('history',{path:'重命名/图片.png'})).some(v=>!v.deleted));
+});
+test('one failed image download does not block another file and failed local uploads are not overwritten',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);
+ p.client.serverCapabilities=p.client.serverCapabilities.filter(x=>x!=='small-blob-batch-v1');const bad=await other.blobs.upload(bytesSource(new Uint8Array([11,12]))),good=await other.blobs.upload(bytesSource(new Uint8Array([13,14])));const download=p.client.blobs.download.bind(p.client.blobs);let fail=true;p.client.blobs.download=async(ref,...args)=>{if(fail&&ref.hash===bad.hash)throw new TypeError('Failed to fetch');return download(ref,...args)};
+ await other.batchFiles(async()=>{put(other.doc,'失败.png',{kind:'image',...bad});put(other.doc,'继续.png',{kind:'image',...good});});await wait(()=>mem.files.has('继续.png'));assert(p.fileFailures.has('失败.png'));assert(!mem.files.has('失败.png'));
+ fail=false;await p.retryQueue();await p.queue;assert(mem.files.has('失败.png'));assert(!p.fileFailures.has('失败.png'));
+ const note=await mem.v.create('本地保留.md','original');await p.queue;const upload=p.client.blobs.upload.bind(p.client.blobs);p.client.blobs.upload=async()=>{throw new TypeError('Failed to fetch')};await mem.v.modify(note,'local unsent');await p.queue;await p.reflect();assert.equal(mem.data.get(note.path),'local unsent');assert(p.dirtyFiles.has(note.path));p.client.blobs.upload=upload;await p.retryQueue();await p.queue;assert.equal(mem.data.get(note.path),'local unsent');
+});
+test('history restore backs up current bytes, refuses unsent changes, and copy leaves source intact',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);const f=await mem.v.create('历史恢复.md','first');await p.queue;const versions=await p.client.request('history',{path:f.path}),id=versions.find(v=>!v.deleted).id;
+ await mem.v.modify(f,'second');await p.queue;await p.client.confirmUploads();const expected=content(p.client.doc,f.path);await p.restoreVersion(f.path,id,'恢复副本/历史.md',null);await wait(()=>mem.data.get('恢复副本/历史.md')==='first');assert.equal(mem.data.get(f.path),'second');
+ p.dirtyFiles.set(f.path,f);await assert.rejects(p.restoreVersion(f.path,id,f.path,expected),/待传/);p.dirtyFiles.delete(f.path);await p.restoreVersion(f.path,id,f.path,expected);await wait(()=>mem.data.get(f.path)==='first');assert([...mem.data].some(([k,v])=>k.startsWith('.realtime-lab-v3-recovery/')&&v instanceof ArrayBuffer&&new TextDecoder().decode(v)==='second'));
+});
+
+test('renamed image keeps newer unsent bytes through network failure and retry without resurrecting old path',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);const f=await mem.v.createBinary('原图.png',new Uint8Array([1,2]).buffer);await p.queue;const upload=p.client.blobs.upload.bind(p.client.blobs);let fail=true;p.client.blobs.upload=async(...args)=>{if(fail)throw new TypeError('Failed to fetch');return upload(...args)};
+ await mem.v.modifyBinary(f,new Uint8Array([9,8,7]).buffer);await p.queue;await mem.v.rename(f,'子目录/新图.png');await p.queue;assert(p.dirtyFiles.has(f.path));await p.reflect();assert.deepEqual([...new Uint8Array(mem.data.get(f.path))],[9,8,7]);fail=false;await p.retryQueue();await p.queue;await wait(()=>content(other.doc,f.path)?.size===3);assert.equal(content(other.doc,'原图.png'),null);assert.equal(p.pendingRows().length,0);
+});
+
+test('plugin exposes conflict count, refuses decisions with pending edits, and keeps all variants as copies',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);const f=await mem.v.create('冲突处理.md','base');await p.queue;const base=content(other.doc,f.path);await mem.v.modify(f,'Mac branch');await p.queue;await other.putFile(f.path,bytesSource(new TextEncoder().encode('offline branch')),{base});await p.queue;await p.refreshConflicts();assert.equal(p.conflicts.length,1);assert.match(p.summaryStatus(),/冲突/);assert.match(p.badgeModel().display,/冲突1/);const review=p.conflicts[0],expected=content(p.client.doc,f.path);p.dirtyFiles.set(f.path,f);await assert.rejects(p.resolveConflict(review,'keep-both',undefined,expected),/待传/);p.dirtyFiles.delete(f.path);await p.resolveConflict(review,'keep-both',undefined,expected);assert.equal(p.conflicts.length,0);assert.equal([...mem.files.keys()].filter(p=>p.startsWith('冲突副本/')).length,2);assert.equal(content(p.client.doc,f.path).hash,expected.hash);
+});
+
+test('hot update removes orphan status and unloaded callbacks cannot recreate it',async t=>{
+ const {JSDOM}=await import('jsdom');const dom=new JSDOM('<div class="view-header"></div><div class="view-content"></div>');const proto=dom.window.HTMLElement.prototype;
+ proto.addClass=function(...c){this.classList.add(...c)};proto.setText=function(s){this.textContent=s};proto.createSpan=function(o){const e=dom.window.document.createElement('span');e.className=o.cls;this.append(e);return e};
+ const prior=globalThis.document;globalThis.document=dom.window.document;t.after(()=>{globalThis.document=prior;dom.window.close()});
+ const p=new bundle.default(),view=new bundle.MarkdownView();view.file=new bundle.TFile('实时协作测试.md');view.containerEl=dom.window.document.body;view.contentEl=dom.window.document.querySelector('.view-content');dom.window.document.body.classList.add('is-mobile');dom.window.document.querySelector('.view-header').getBoundingClientRect=()=>({height:44,bottom:96});
+ p.app={vault:{getName:()=> 'Realtime-Lab-V3-Files-HotUpdate'},workspace:{getLeavesOfType:()=>[{view}],getActiveViewOfType:()=>view}};
+ const orphan=dom.window.document.createElement('div');orphan.className='rl-sync-row';orphan.textContent='Sync: ○ 离线';dom.window.document.body.append(orphan);
+ p.syncBadges();assert.equal(dom.window.document.querySelectorAll('.rl-sync-row').length,1,'new instance removes old orphan row');
+ const delayedOrphan=orphan.cloneNode(true);dom.window.document.body.append(delayedOrphan);await new Promise(r=>setTimeout(r,0));assert.equal(dom.window.document.querySelectorAll('.rl-sync-row').length,1,'late legacy row from the replaced build is removed without waiting for new sync traffic');
+ p.onunload();p.setConnectionStatus('late close callback');p.updateProgress();p.renderProgress();p.syncBadges();
+ await new Promise(r=>setTimeout(r,150));assert.equal(dom.window.document.querySelectorAll('.rl-sync-row').length,0,'late asynchronous callbacks cannot recreate an unloaded status');
+});
+
+test('plugin reports anonymous queue counts without paths or credentials and preserves diagnostic identity',async t=>{
+ const {p,server}=await env(t),id=p.settings.deviceId;assert.match(id,/^[a-f0-9-]{36}$/);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.client.confirmUploads();await p.reportDiagnostic();let result=await p.client.request('device-diagnostics');const row=result.devices.find(d=>d.deviceId===id);assert(row);assert.equal(row.platform,'macos');assert.equal(row.queued,0);assert(!JSON.stringify(result).includes(p.settings.token));assert(!JSON.stringify(result).includes('实时协作测试.md'));p.dirtyFiles.set('private-name.md',new bundle.TFile('private-name.md'));await p.reportDiagnostic();result=await p.client.request('device-diagnostics');assert.equal(result.devices.find(d=>d.deviceId===id).dirty,1);assert.equal(result.devices.find(d=>d.deviceId===id).completeAtReport,false);assert(!JSON.stringify(result).includes('private-name'));p.dirtyFiles.clear();await p.persistConfig();assert.equal(p.saved.deviceId,id);assert(server.writeCount>=1);
+});
+
+test('diagnostics does not mark complete while remote contents are still being written locally',async t=>{
+ const {p,other,mem}=await env(t);put(other.doc,'实时协作测试.md',{kind:'text',data:'before'});await p.start();await wait(()=>mem.data.get('实时协作测试.md')==='before'&&!p.initializing);await p.client.confirmUploads();let release,entered=false;const gate=new Promise(r=>release=r),modify=mem.v.modify;mem.v.modify=async(f,s)=>{entered=true;await gate;return modify(f,s)};t.after(()=>release());put(other.doc,'实时协作测试.md',{kind:'text',data:'after'});await wait(()=>entered);await p.reportDiagnostic();const row=(await p.client.request('device-diagnostics')).devices.find(d=>d.deviceId===p.settings.deviceId);assert(row.busy);assert.equal(row.completeAtReport,false);release();await p.queue;await wait(()=>mem.data.get('实时协作测试.md')==='after');
+});
+
+test('protected local deletion waits when source changed, and cancel restores newer remote content',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('保护删除.md',bytesSource(new TextEncoder().encode('base')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has('保护删除.md'));await mem.v.trash(mem.files.get('保护删除.md'));await p.queue;assert.equal(p.settings.pathSafety.items.length,1);await other.putFile('保护删除.md',bytesSource(new TextEncoder().encode('remote newer')));await p.flushPathSafety();assert.match(p.settings.pathSafety.items[0].error,/Source changed/);assert(content(other.doc,'保护删除.md'));await p.cancelPathSafety();await wait(()=>mem.data.get('保护删除.md')==='remote newer');assert.equal(p.settings.pathSafety.items.length,0);
+});
+test('five local deletes are held durably until reviewed, with backups before propagation',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<5;i++)await other.putFile('批删/'+i+'.md',bytesSource(new TextEncoder().encode('synthetic '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);for(const f of [...mem.files.values()])await mem.v.trash(f);await p.queue;await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,5);assert.equal(p.saved.pathSafety.items.length,5);assert([...other.doc.getMap('files').keys()].filter(x=>content(other.doc,x)).length===5);assert(p.pendingRows().length>=5);await p.approvePathSafety();await wait(()=>[...other.doc.getMap('files').keys()].every(x=>content(other.doc,x)===null));assert.equal(p.settings.pathSafety.items.length,0);assert([...mem.data.keys()].filter(x=>x.startsWith('.realtime-lab-v3-recovery/')).length>=5);
+});
+test('legacy bulk remote deletion persists a review and preserves local files until approval',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<5;i++)await other.putFile('远端批删/'+i+'.md',bytesSource(new TextEncoder().encode('keep '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);await other.batchFiles(async()=>{for(let i=0;i<5;i++)remove(other.doc,'远端批删/'+i+'.md');});await wait(()=>p.settings.remoteDeleteReview);await p.queue;assert.equal(mem.files.size,5);assert.equal(p.saved.remoteDeleteReview.paths.length,5);assert.equal(p.pendingRows().length,5);const review=p.settings.remoteDeleteReview;review.approved=true;await p.persistConfig();await p.reflect();assert.equal(mem.files.size,0);assert.equal(p.settings.remoteDeleteReview,undefined);assert([...mem.data.keys()].filter(x=>x.startsWith('.realtime-lab-v3-recovery/')).length>=5);
+});
+test('an offline queued rename survives plugin restart and publishes latest local bytes once',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('离线旧.png',bytesSource(new Uint8Array([1,2])));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has('离线旧.png'));p.client.ws.close();await wait(()=>!p.client.ready);const f=mem.files.get('离线旧.png');await mem.v.rename(f,'离线新.png');await mem.v.modifyBinary(f,new Uint8Array([8,9,10]).buffer);await p.queue;const saved=structuredClone(p.settings);assert.equal(saved.pathSafety.items.length,1);await p.stop();const next=new bundle.default();next.app=p.app;next.loadData=async()=>saved;await next.onload();t.after(async()=>{next.onunload();await next.queue;});await next.start();await wait(()=>content(other.doc,'离线新.png')?.size===3&&content(other.doc,'离线旧.png')===null);assert.deepEqual([...new Uint8Array(mem.data.get('离线新.png'))],[8,9,10]);assert.equal(next.settings.pathSafety.items.length,0);assert.equal((await next.client.request('history',{path:'离线新.png'})).filter(v=>!v.deleted).length,1);
+});
+
+test('occupied rename target is not overwritten; cancellation preserves native bytes as a recovery copy',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('来源.md',bytesSource(new TextEncoder().encode('source bytes')));await other.putFile('已有.md',bytesSource(new TextEncoder().encode('occupied bytes')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===2);await mem.v.rename(mem.files.get('来源.md'),'已有.md');await p.queue;await p.flushPathSafety();assert.match(p.settings.pathSafety.items[0].error,/target exists/);const original=content(other.doc,'已有.md');await p.cancelPathSafety();assert.equal(content(other.doc,'已有.md').hash,original.hash);assert.equal(mem.data.get('已有.md'),'occupied bytes');assert.equal(mem.data.get('来源.md'),'source bytes');assert([...mem.files.keys()].some(x=>x.startsWith('恢复副本/取消路径操作-')));
+});
+test('lost protected operation acknowledgement retries without repeated backups or duplicate versions',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('重试旧.png',bytesSource(new Uint8Array([3,4,5])));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has('重试旧.png'));await mem.v.rename(mem.files.get('重试旧.png'),'重试新.png');await p.queue;const request=p.client.request.bind(p.client);let lost=true;p.client.request=async(type,args)=>{const result=await request(type,args);if(type==='path-operation'&&lost){lost=false;throw new TypeError('Lost acknowledgement');}return result;};await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,1);const count=[...mem.data.keys()].filter(x=>x.startsWith('.realtime-lab-v3-recovery/')).length;await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,0);assert.equal([...mem.data.keys()].filter(x=>x.startsWith('.realtime-lab-v3-recovery/')).length,count);assert.equal((await request('history',{path:'重试新.png'})).length,1);assert.equal(content(other.doc,'重试旧.png'),null);
+});
+
+test('reviewed folder rename syncs its image and Obsidian-updated links together without changing bytes',async t=>{
+ const {p,mem,other}=await env(t);const files={'原目录/引用.md':'![[原目录/图.png]]','原目录/一.md':'one','原目录/二.md':'two','原目录/三.md':'three'};for(const [path,text] of Object.entries(files))await other.putFile(path,bytesSource(new TextEncoder().encode(text)));await other.putImage('原目录/图.png',bytesSource(new Uint8Array([7,6,5])));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);const imageHash=content(other.doc,'原目录/图.png').hash;await mem.v.rename({path:'原目录'},'新目录');await mem.v.modify(mem.files.get('新目录/引用.md'),'![[新目录/图.png]]');await p.queue;await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,1);await p.approvePathSafety();await wait(()=>content(other.doc,'新目录/图.png'));assert.equal(content(other.doc,'新目录/图.png').hash,imageHash);assert.equal(mem.data.get('新目录/引用.md'),'![[新目录/图.png]]');assert(Object.keys(files).every(path=>content(other.doc,path)===null));assert.equal(p.settings.pathSafety.items.length,0);
+});
+test('remote delete approval expires if server changes before the local deletion is applied',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<5;i++)await other.putFile('审阅/'+i+'.md',bytesSource(new TextEncoder().encode('saved '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);await other.batchFiles(async()=>{for(let i=0;i<5;i++)remove(other.doc,'审阅/'+i+'.md');});await wait(()=>p.settings.remoteDeleteReview);const review=p.settings.remoteDeleteReview;review.approved=true;await other.putFile('新变化.md',bytesSource(new TextEncoder().encode('different snapshot')));await wait(()=>p.settings.remoteDeleteReview!==review);assert.equal(p.settings.remoteDeleteReview.approved,false);assert([...mem.files.keys()].filter(x=>x.startsWith('审阅/')).length===5);
+});
+test('confirmed deletion of missing files after stopped-period editing still uses a stale-base guard',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('停用缺失.md',bytesSource(new TextEncoder().encode('old')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has('停用缺失.md'));await p.stop();await mem.v.trash(mem.files.get('停用缺失.md'));await other.putFile('停用缺失.md',bytesSource(new TextEncoder().encode('new remote edit')));p.resolveMissing=async()=> 'delete';await p.start();await wait(()=>p.settings.pathSafety?.items[0]?.error);assert.match(p.settings.pathSafety.items[0].error,/Source changed/);assert(content(other.doc,'停用缺失.md'));assert.equal(mem.files.has('停用缺失.md'),false);await p.cancelPathSafety();await wait(()=>mem.data.get('停用缺失.md')==='new remote edit');
+});
+
+test('path review only approves the displayed plans and refuses a changed prepared plan',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<6;i++)await other.putFile('范围/'+i+'.md',bytesSource(new TextEncoder().encode('protected '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===6);for(let i=0;i<5;i++)await mem.v.trash(mem.files.get('范围/'+i+'.md'));await p.queue;const reviewed=p.settings.pathSafety.items.map(i=>({id:i.op.id,plan:JSON.stringify(i.op)}));await mem.v.trash(mem.files.get('范围/5.md'));await p.queue;await p.approvePathSafety(reviewed);assert.equal(p.settings.pathSafety.items.length,1);assert(content(other.doc,'范围/5.md'));assert.equal(p.settings.pathSafety.items[0].approved,false);await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,1,'remaining bulk members must not silently turn into auto-approved single deletes');assert(content(other.doc,'范围/5.md'));const stale=[{id:p.settings.pathSafety.items[0].op.id,plan:'different'}];await assert.rejects(p.approvePathSafety(stale),/计划已变化/);assert(content(other.doc,'范围/5.md'));
+});
+
+test('delete approval is bound to the deletion generation even when material state returns to the same tombstone',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<5;i++)await other.putFile('代次/'+i+'.md',bytesSource(new TextEncoder().encode('original '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);await other.batchFiles(async()=>{for(let i=0;i<5;i++)remove(other.doc,'代次/'+i+'.md');});await wait(()=>p.settings.remoteDeleteReview);const review=p.settings.remoteDeleteReview;review.approved=true;const ref=await other.blobs.upload(bytesSource(new TextEncoder().encode('new deleted generation')));await other.batchFiles(async()=>{put(other.doc,'代次/0.md',{kind:'file',...ref});remove(other.doc,'代次/0.md');});await wait(()=>p.settings.remoteDeleteReview!==review);assert.equal(p.settings.remoteDeleteReview.approved,false);assert.equal(mem.files.size,5);
+});
+
+test('native adapter preserves generic bytes, empty files, renamed data and history copies',async t=>{const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);for(const name of ['data.json','data.csv','script.py','page.html','archive.zip','document.docx','empty.txt','note.md.bak.20260411-220248']){const bytes=name==='empty.txt'?new Uint8Array():new Uint8Array([0,255,128,13,10]);const f=await mem.v.createBinary(name,bytes.buffer);await p.queue;try{await wait(()=>content(other.doc,name));}catch(e){throw Error(name+': '+p.operationError+' '+JSON.stringify([...p.fileFailures])+' '+p.connectionStatus);}assert.equal(content(other.doc,name).kind,'file');assert.deepEqual(new Uint8Array(mem.data.get(name)),bytes);const versions=await p.client.request('history',{path:name});await p.restoreVersion(name,versions[0].id,'恢复副本/'+name,null);assert.deepEqual(new Uint8Array(mem.data.get('恢复副本/'+name)),bytes);if(name==='data.json'){await mem.v.rename(f,'moved/data.json');await p.queue;await p.flushPathSafety();await wait(()=>!content(other.doc,name)&&content(other.doc,f.path));assert.deepEqual(new Uint8Array(mem.data.get(f.path)),bytes);}}assert.equal(p.pendingRows().length,0);});
+
+test('large cache reservation is linear in adapter metadata reads and reopens partial accounting',async()=>{
+ const {ObsidianBlobCache}=await import('../src/v3/obsidian-cache.mjs'),m=vault(),cache=new ObsidianBlobCache(m.v.adapter);let reads=0;const read=m.v.adapter.read;m.v.adapter.read=async p=>{reads++;return read(p)};
+ const refs=Array.from({length:2944},(_,i)=>({hash:i.toString(16).padStart(64,'0'),size:4096}));
+ for(const ref of refs)await cache.reserve(ref);
+ assert.equal(cache.metrics.quotaScans,1);assert.equal(reads,0);assert.equal(cache.quota.count,2944);assert.equal(cache.quota.bytes,2944*4096);
+ const reopen=new ObsidianBlobCache(m.v.adapter);await reopen.reserve({hash:'f'.repeat(64),size:1});assert.equal(reads,2944);assert.equal(reopen.quota.bytes,2944*4096+1);
+});
+test('concurrent reservations charge once; uncertain state write rebuilds quota before next allocation',async()=>{
+ const {ObsidianBlobCache}=await import('../src/v3/obsidian-cache.mjs'),m=vault(),cache=new ObsidianBlobCache(m.v.adapter),ref={hash:'a'.repeat(64),size:123};
+ await Promise.all(Array.from({length:10},()=>cache.reserve(ref)));assert.equal(cache.quota.bytes,123);assert.equal(cache.quota.count,1);
+ const write=m.v.adapter.write;let fail=true;m.v.adapter.write=async(p,s)=>{await write(p,s);if(fail){fail=false;throw Error('File system operation timed out.')}};
+ const next={hash:'b'.repeat(64),size:321};await assert.rejects(cache.reserve(next),/Cache write: File system operation timed out/);await cache.reserve(next);assert.equal(cache.quota.bytes,444);assert.equal(cache.quota.count,2);
+});
+test('initial filesystem timeout automatically retries receive without resetting state or existing files',async t=>{
+ const {p,other,mem}=await env(t);await mem.v.create('实时协作测试.md','existing synthetic');await other.putFile('资料.json',bytesSource(new TextEncoder().encode('{"synthetic":true}')));
+ const write=mem.v.adapter.writeBinary;let failed=false;mem.v.adapter.writeBinary=async(path,b)=>{if(!failed&&path.startsWith('.realtime-lab-v3-cache/')){failed=true;throw Error('File system operation timed out.')}return write(path,b)};
+ await p.start();await wait(()=>failed&&!p.initializing&&p.fileFailures.size>0);const id=p.client.serverId;assert(p.saved.receivePending.paths.includes('资料.json'));await p.recoverQueue();await p.queue;
+ assert(mem.files.has('资料.json'));assert.equal(mem.data.get('实时协作测试.md'),'existing synthetic');assert.equal(p.client.serverId,id);assert.equal(p.fileFailures.size,0);assert.equal(p.settings.receivePending.paths.length,0);
+});
+test('restart resumes recorded unfinished receives but still asks about a genuine completed-file deletion',async t=>{
+ const {p,other,mem}=await env(t);await other.putFile('完成.json',bytesSource(new TextEncoder().encode('done')));await other.putFile('未完成.json',bytesSource(new TextEncoder().encode('pending')));
+ const write=mem.v.adapter.writeBinary;mem.v.adapter.writeBinary=async()=>{throw Error('File system operation timed out.')};await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&p.fileFailures.size>0);await p.stop();
+ mem.v.adapter.writeBinary=write;const next=new bundle.default();next.app=p.app;await next.onload();next.settings=structuredClone(p.saved);next.resolveMissing=async()=>{throw Error('Unexpected direction prompt for unfinished receipt')};t.after(async()=>{await next.stop();await next.queue});await next.start();await wait(()=>mem.files.has('完成.json')&&mem.files.has('未完成.json'));await next.queue;await next.stop();
+ mem.files.delete('完成.json');mem.data.delete('完成.json');const third=new bundle.default();third.app=p.app;await third.onload();third.settings=structuredClone(next.saved);let asked=false;third.resolveMissing=async paths=>{asked=true;assert.deepEqual(paths,['完成.json']);return 'cancel'};t.after(async()=>{await third.stop();await third.queue});await third.start();assert(asked);assert.equal(mem.files.has('完成.json'),false);
+});
+test('timeout after a completed native create is reconciled without duplicating or overwriting a subsequent local edit',async t=>{
+ const {p,other,mem}=await env(t);await other.putFile('晚完成.json',bytesSource(new TextEncoder().encode('remote')));const create=mem.v.createBinary.bind(mem.v);let once=true;mem.v.createBinary=async(path,b)=>{const f=await create(path,b);if(once){once=false;throw Error('File system operation timed out.')}return f};await p.start();await wait(()=>!p.initializing&&p.fileFailures.size>0);const f=mem.files.get('晚完成.json');await mem.v.modify(f,new TextEncoder().encode('local edit').buffer);await p.queue;await p.recoverQueue();await p.queue;assert.equal(new TextDecoder().decode(mem.data.get(f.path)),'local edit');assert.equal(p.fileFailures.size,0);
+});
+test('filesystem timeout during first local preparation reruns preparation instead of declaring ready early',async t=>{
+ const {p,other,mem}=await env(t);await mem.v.createBinary('首次本机.csv',new TextEncoder().encode('synthetic local bytes').buffer);const write=mem.v.adapter.writeBinary;let fail=true;mem.v.adapter.writeBinary=async(path,b)=>{if(fail){fail=false;throw Error('File system operation timed out.')}return write(path,b)};await p.start();await wait(()=>!!p.operationError&&!p.initializing);assert.equal(p.syncedOnce,false);await p.recoverQueue();await p.queue;assert(p.syncedOnce);assert(content(other.doc,'首次本机.csv'));assert.equal(p.operationError,'');
+});
+
+test('progress uses durable unfinished receive paths after reopen without altering state, and clears on recovery',async t=>{
+ const {p,other,mem}=await env(t);await other.putFile('进度.json',bytesSource(new TextEncoder().encode('synthetic progress')));
+ const write=mem.v.adapter.writeBinary;mem.v.adapter.writeBinary=async()=>{throw Error('File system operation timed out.')};
+ await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&p.fileFailures.size>0);
+ const before=JSON.stringify(p.settings),progress=p.progressModel();assert.equal(progress.available,true);assert.equal(progress.remaining,1);assert.equal(progress.retry,1);assert.equal(progress.completed,progress.total-1);
+ assert.match(p.badgeModel().counts,/剩余 1.*待重试 1/);assert.equal(JSON.stringify(p.settings),before);
+ mem.v.adapter.writeBinary=write;await p.recoverQueue();await p.queue;
+ const done=p.progressModel();assert.equal(done.remaining,0);assert.equal(done.retry,0);assert.equal(done.completed,done.total);assert.equal(mem.files.has('进度.json'),true);
+});
+
+test('receive acknowledgements batch without losing the durable replay plan on crash or save failure',async t=>{
+ const {p}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);const serverId=p.client.serverId,paths=Array.from({length:40},(_,i)=>'合成/'+i+'.json');
+ p.settings.receivePending={serverId,paths};await p.persistConfig();p.receiptLastSaved=Date.now();let writes=0;const save=p.saveData.bind(p);p.saveData=async s=>{writes++;await save(s)};
+ for(const path of paths.slice(0,7))await p.received(path);
+ assert.equal(writes,0);assert.deepEqual(p.saved.receivePending.paths,paths,'crash replays conservative durable intent');assert.equal(p.pendingRows().length,33,'UI excludes only processed receipts');
+ for(const path of paths.slice(7))await p.received(path);assert.equal(writes,2);assert.equal(p.saved.receivePending.paths.length,8);
+ p.saveData=async()=>{throw Error('synthetic disk unavailable')};await assert.rejects(p.flushReceipts(),/disk unavailable/);assert.equal(p.settings.receivePending.paths.length,8);assert.equal(p.saved.receivePending.paths.length,8);assert.equal(p.receiveAcks.size,8);
+ p.saveData=save;p.operationError='';await p.flushReceipts();assert.equal(p.saved.receivePending.paths.length,0);assert.equal(p.receiveAcks.size,0);assert.equal(p.settings.serverId,serverId);
+});
+
+test('repeated network interruption pauses after three consecutive failures while isolated file errors do not block healthy files',async t=>{
+ const {p,other,mem}=await env(t);for(let i=0;i<8;i++)await other.putFile('网络恢复/'+i+'.json',bytesSource(new TextEncoder().encode('synthetic '+i)));
+ const reflect=p.reflect.bind(p);let attempts=0,download;p.reflect=async()=>{p.client.serverCapabilities=p.client.serverCapabilities.filter(x=>x!=='small-blob-batch-v1');if(!download){download=p.client.blobs.download.bind(p.client.blobs);p.client.blobs.download=async()=>{attempts++;throw Error('Network load failed')}}return reflect()};
+ await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&p.fileFailures.size>0);await p.queue;assert(attempts<=3,'bounded consecutive failures in a pass');assert(p.fileFailures.size<=3);assert.equal(p.settings.receivePending.paths.length,8);
+ p.client.blobs.download=download;await p.recoverQueue();await p.queue;assert.equal(p.fileFailures.size,0);for(let i=0;i<8;i++)assert(mem.files.has('网络恢复/'+i+'.json'));assert.equal(p.saved.receivePending.paths.length,0);
+});
+
+test('crash snapshot with unflushed receive receipts rechecks existing files and finishes without reset or duplicate content',async t=>{
+ const {p,other,mem}=await env(t);for(let i=0;i<20;i++)await other.putFile('崩溃合成/'+i+'.json',bytesSource(new TextEncoder().encode('synthetic durable '+i)));
+ const received=p.received.bind(p);let count=0,crash;p.received=async path=>{await received(path);if(++count===8){p.client.flushPersist(true);assert(await p.client.persistence.wait());await p.configWrites;crash=structuredClone(p.saved);p.stopping=true;}};
+ await p.start();await wait(()=>!!crash&&!p.initializing);await p.queue;assert(crash.receivePending.paths.length>20-mem.files.size,'durable checkpoint conservatively includes some already-written files');assert(p.receiveAcks.size>0);const identity=p.client.serverId;await p.stop();
+ const next=new bundle.default();next.app=p.app;await next.onload();next.settings=crash;next.resolveMissing=async()=>{throw Error('Unexpected missing direction prompt')};t.after(async()=>{await next.stop();await next.queue});await next.start();await wait(()=>next.syncedOnce&&!next.initializing&&!next.pendingRows().length);await next.queue;
+ assert.equal(next.client.serverId,identity);assert.equal(next.settings.receivePending.paths.length,0);assert.equal(next.fileFailures.size,0);assert.equal(mem.files.size,20);for(let i=0;i<20;i++)assert.equal(new TextDecoder().decode(mem.data.get('崩溃合成/'+i+'.json')),'synthetic durable '+i);
+});
+
+test('temporary shared blob writer contention preserves pending upload and recovers through normal backoff',async t=>{
+ const {p,mem,server}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);const fetch=p.client.blobs.fetch;let blocked=false;p.client.blobs.fetch=async(u,o)=>{if(o?.method==='PUT'&&!blocked){blocked=true;return new Response('{}',{status:409})}return fetch(u,o)};
+ await mem.v.createBinary('并发合成.png',new Uint8Array([19,20,21]).buffer);await wait(()=>p.fileFailures.size>0);await p.queue;assert.equal(p.client.pending.length,1);assert.equal(content(server.doc,'并发合成.png'),null);await p.recoverQueue();await p.queue;assert.equal(p.fileFailures.size,0);assert.equal(p.client.pending.length,0);assert(content(server.doc,'并发合成.png'));assert.deepEqual(new Uint8Array(mem.data.get('并发合成.png')),new Uint8Array([19,20,21]));
+});
+
+test('phase counters observe native request, cache, vault and configuration operations without recording paths',async t=>{const{p,other,mem}=await env(t);await other.putFile('计时合成.json',bytesSource(new TextEncoder().encode('synthetic measurement')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has('计时合成.json'));await p.queue;const perf=p.performance.snapshot();for(const k of ['network','cache','vault','config'])assert(perf[k].count>0,k);assert(!JSON.stringify(perf).includes('计时合成'));await p.reportDiagnostic();const d=await p.client.request('device-diagnostics');assert(d.devices.some(x=>x.performance?.network.count>0));});
+
+test('connection loss during a receive does not mark every remaining file as failed',async t=>{const{p,other,mem}=await env(t);for(let i=0;i<8;i++)await other.putFile('断连计数/'+i+'.json',bytesSource(new TextEncoder().encode('synthetic '+i)));const reflect=p.reflect.bind(p);let saved,attempts=0;p.reflect=async()=>{p.client.serverCapabilities=p.client.serverCapabilities.filter(x=>x!=='small-blob-batch-v1');if(!saved){saved=p.client.blobs.download.bind(p.client.blobs);p.client.blobs.download=async()=>{attempts++;p.client.ready=false;throw Error('Connect verified V3 metadata before transferring blobs')}}return reflect()};await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&p.fileFailures.size>0);await p.queue;assert.equal(attempts,1);assert.equal(p.fileFailures.size,1);assert.equal(p.settings.receivePending.paths.length,8);p.client.ready=true;p.client.blobs.download=saved;await p.recoverQueue();await p.queue;assert.equal(p.fileFailures.size,0);assert.equal(mem.files.size,8);});
+
+
+test('small-file batch prefetch overlaps blocked native vault writes and preserves receive checkpoints',async t=>{
+ const {p,other,mem}=await env(t),expected=new Map();
+ await other.batchFiles(async()=>{for(let i=0;i<40;i++){const data=new TextEncoder().encode('synthetic batch '+i);expected.set('批量/'+i+'.md',new TextDecoder().decode(data));await other.putFile('批量/'+i+'.md',bytesSource(data));}});
+ let release,entered=false,calls=0;const gate=new Promise(r=>release=r),create=mem.v.create.bind(mem.v);t.after(()=>release?.());mem.v.create=async(path,data)=>{if(path.startsWith('批量/')&&!entered){entered=true;await gate;}return create(path,data);};
+ await p.start();const batch=p.client.blobs.downloadBatch.bind(p.client.blobs);p.client.blobs.downloadBatch=async(...args)=>{calls++;return batch(...args);};
+ await wait(()=>entered&&calls>=2);assert(p.settings.receivePending.paths.length>=39);release();await wait(()=>[...expected.keys()].every(k=>mem.files.has(k)));await p.queue;for(const [k,v]of expected)assert.equal(mem.data.get(k),v);assert.equal(p.settings.receivePending.paths.length,0);assert(calls<=3);assert(p.transfers.snapshot().batchRequests>0);assert.equal(p.transfers.snapshot().batchFiles,40);assert.equal(p.fileFailures.size,0);
+});
+
+
+test('failed batch keeps every receive intent and recovers without retyping or resetting state',async t=>{
+ const {p,other,mem}=await env(t);await other.batchFiles(async()=>{for(let i=0;i<20;i++)await other.putFile('批量续传/'+i+'.md',bytesSource(new TextEncoder().encode('synthetic retry '+i)));});
+ const reflect=p.reflect.bind(p);let download;p.reflect=async()=>{if(!download){download=p.client.blobs.downloadBatch.bind(p.client.blobs);p.client.blobs.downloadBatch=async()=>{throw Error('Network load failed');};}return reflect();};await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&p.fileFailures.size>0);await p.queue;assert.equal(p.settings.receivePending.paths.length,20);assert.equal(mem.files.size,0);assert(p.fileFailures.size<=3);
+ p.client.blobs.downloadBatch=download;await p.recoverQueue();await p.queue;assert.equal(mem.files.size,20);assert.equal(p.settings.receivePending.paths.length,0);assert.equal(p.fileFailures.size,0);
+});
+
+test('unlock via focus or missed visibility event recovers existing edits and retained receive progress',async t=>{
+ const {p,mem,server,other}=await env(t);put(other.doc,'实时协作测试.md',{kind:'text',data:'base'});await p.start();await wait(()=>p.syncedOnce&&mem.data.get('实时协作测试.md')==='base');
+ const doc=p.client.doc,id=p.client.serverId,old=p.client.ws;old.send=()=>{};
+ p.app.workspace.events['editor-change']({getValue:()=> 'base preserved unlock edit'},{file:mem.files.get('实时协作测试.md')});
+ p.operationError='Foreground reconnect; local edits retained';p.fileFailures.set('实时协作测试.md',p.operationError);p.retryAfter=Date.now()+60000;
+ p.domEvents.focus();p.domEvents.pageshow();const replacement=p.client.ws;assert.notEqual(replacement,old);assert.equal(p.lastWakeAt>0,true);
+ await wait(()=>p.client.ready&&content(server.doc,'实时协作测试.md')?.data==='base preserved unlock edit');
+ await p.queue;await p.recoverQueue();await p.queue;assert.equal(p.operationError,'');assert.equal(p.client.doc,doc);assert.equal(p.client.serverId,id);
+ const current=p.client.ws;p.lastForegroundTick=Date.now()-60000;p.lastWakeAt=0;p.foregroundTick();assert.notEqual(p.client.ws,current);
+ await wait(()=>p.client.ready);assert.equal(p.client.doc,doc);
+});
+
+test('offline receive queue retains counts without claiming fresh completion',async t=>{
+ const {p,other}=await env(t);put(other.doc,'remaining.md',{kind:'text',data:'preserve'});await p.start();await wait(()=>p.syncedOnce);await p.queue;
+ p.settings.receivePending={serverId:p.client.serverId,paths:['remaining.md']};p.client.ready=false;
+ const progress=p.progressModel(),badge=p.badgeModel();assert.equal(progress.available,true);assert.equal(progress.remaining,1);assert.equal(progress.completed,0);assert.match(badge.counts,/上次进度.*剩余 1/);assert.notEqual(badge.tone,'confirmed');
+});

@@ -1,0 +1,9 @@
+{
+  "id": "realtime-lab-v3",
+  "name": "Realtime Lab V3 (Isolated Test)",
+  "version": "0.5.0-alpha.1",
+  "minAppVersion": "1.7.2",
+  "description": "Protocol 3 isolated test vault sync with chunked image cache and version recovery. New Realtime-Lab-V3 vaults only.",
+  "author": "Local development",
+  "isDesktopOnly": false
+}

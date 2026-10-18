@@ -1,0 +1,2 @@
+// At most one queued/in-flight task; changes during it request one later pass.
+export function coalescedTask(enqueue,run,allowed=()=>true){let queued=false,dirty=false;const request=()=>{dirty=true;if(queued)return;queued=true;enqueue(async()=>{dirty=false;try{if(allowed())await run();}finally{queued=false;if(dirty&&allowed())request();}});};return {request,cancel(){dirty=false;},get queued(){return queued;}};}

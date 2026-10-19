@@ -10975,6 +10975,7 @@ var BlobTransfer = class {
         checkStatus(s, source.size);
         if (s.offset !== offset + n) throw Error("Invalid upload acknowledgement");
         onProgress(s.offset);
+        this.onTransfer("upload", n, false);
       }
       return { hash, size: source.size };
     } finally {
@@ -12502,8 +12503,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.dirtyFiles.delete(p);
       try {
         await this.upload(f);
-        this.fileFailures.delete(p);
-        if (!this.client.pending.some((x) => x.path === p)) await this.retrySuccess("upload:" + p);
+        if (ledger?.items.has("upload:" + p)) {
+          this.dirtyFiles.set(p, f);
+        } else {
+          this.fileFailures.delete(p);
+          if (!this.client.pending.some((x) => x.path === p)) await this.retrySuccess("upload:" + p);
+        }
       } catch (e) {
         this.dirtyFiles.set(p, f);
         this.fileFailures.set(p, this.safeError(e));
@@ -12572,7 +12577,6 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       const source = this.cache.source(item);
       await c.stageFile(f.path, source);
       if (c.ready) await c.flushPending();
-      if (c.ready && this.ledger()?.items.has("upload:" + path)) throw Error(this.fileFailures.get(path) || "Pending file transfer retained");
       return;
     }
     const trial = new Doc();
@@ -12877,7 +12881,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           }
           await this.received(p);
           this.fileFailures.delete(p);
-          await this.retrySuccess("download:" + p);
+          await this.retrySuccess("download:" + p, true);
           transportFailures = 0;
         } catch (e) {
           this.fileFailures.set(p, this.safeError(c.ready ? e : "Disconnected during receive: " + this.safeError(e)));

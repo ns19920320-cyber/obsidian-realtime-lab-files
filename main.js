@@ -38,6 +38,7 @@ var REASON_CODES = ["cache-staging-busy", "filesystem-transient", "network-trans
 function errorCode(error) {
   const s = String(error?.message || error || "");
   if (!s) return null;
+  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s)) return "transferring";
   if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
   if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
   if (/identity mismatch|身份/i.test(s)) return "identity";
@@ -10243,6 +10244,7 @@ function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
 
 function transientTransferFailure(error) {
   if (error?.code === "METADATA_NOT_READY") return true;
+  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(String(error?.message || error))) return true;
   const s = String(error?.message || error);
   if (/^(?:Error: )?Connect verified V3 metadata before transferring blobs$/.test(s)) return true;
   if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
@@ -10735,7 +10737,7 @@ var VaultClient = class {
             } catch (error) {
               if (this.stopped || this.ws !== ws || ws.readyState !== 1) return;
               if (this.retryPreparation(error)) {
-                this.onStatus("\u9644\u4EF6\u7F51\u7EDC\u6682\u4E0D\u53EF\u7528\uFF0C\u4FDD\u7559\u5F85\u4F20\u961F\u5217\u5E76\u81EA\u52A8\u91CD\u8FDE\uFF1A" + String(error?.message || error));
+                this.onStatus("\u9644\u4EF6\u51C6\u5907\u6682\u4E0D\u53EF\u7528\uFF0C\u4FDD\u7559\u5F85\u4F20\u961F\u5217\u5E76\u81EA\u52A8\u91CD\u8FDE\uFF1A" + String(error?.message || error));
                 ws.close(1012, "Retry cached upload");
               } else {
                 this.onStatus("\u540C\u6B65\u524D\u9644\u4EF6\u51C6\u5907\u5931\u8D25\uFF0C\u4FDD\u7559\u672C\u5730\u5185\u5BB9\u540E\u91CD\u8BD5\uFF1A" + String(error?.message || error));
@@ -10839,6 +10841,30 @@ var BlobTransfer = class {
   } }) {
     Object.assign(this, { url: url.replace(/\/$/, ""), token, fetch: fetchImpl, serverId, onIdentity, verifyIdentity, responseIdentity, rangeReads, onTransfer });
     this.busy = false;
+    this.transferCount = 0;
+    this.lane = Promise.resolve();
+  }
+  transfer(fn, { signal } = {}) {
+    if (this.transferCount >= 4) return Promise.reject(Error("Transfer busy"));
+    this.transferCount++;
+    const job = this.lane.then(async () => {
+      signal?.throwIfAborted();
+      return fn();
+    }).finally(() => {
+      this.transferCount--;
+    });
+    this.lane = job.catch(() => {
+    });
+    return job;
+  }
+  upload(source, options = {}) {
+    return this.transfer(() => this.uploadExclusive(source, options), options);
+  }
+  downloadBatch(refs, options = {}) {
+    return this.transfer(() => this.downloadBatchExclusive(refs, options), options);
+  }
+  download(ref, sink, options = {}) {
+    return this.transfer(() => this.downloadExclusive(ref, sink, options), options);
   }
   async identity(signal) {
     if (!this.serverId && !this.verifyIdentity) throw Error("Verified metadata identity required");
@@ -10859,7 +10885,7 @@ var BlobTransfer = class {
     if (this.expectedResponseIdentity && r2.headers.get("X-Realtime-Lab-Server") !== this.expectedResponseIdentity) throw Error("Server identity mismatch in blob response");
     return r2;
   }
-  async upload(source, { signal, onProgress = () => {
+  async uploadExclusive(source, { signal, onProgress = () => {
   } } = {}) {
     if (this.busy) throw Error("Transfer busy");
     this.busy = true;
@@ -10883,7 +10909,7 @@ var BlobTransfer = class {
       this.busy = false;
     }
   }
-  async downloadBatch(refs, { signal } = {}) {
+  async downloadBatchExclusive(refs, { signal } = {}) {
     if (this.busy) throw Error("Transfer busy");
     this.busy = true;
     let received = 0, failed = true, attempted = false;
@@ -10907,7 +10933,7 @@ var BlobTransfer = class {
       this.busy = false;
     }
   }
-  async download(ref, sink, { signal, onProgress = () => {
+  async downloadExclusive(ref, sink, { signal, onProgress = () => {
   } } = {}) {
     if (this.busy) throw Error("Transfer busy");
     this.busy = true;

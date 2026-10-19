@@ -396,3 +396,10 @@ test('diagnostic throttle retains a final toggle event and overlapping reports r
  const request=p.client.request.bind(p.client);let release,entered;const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r);let once=true;p.client.request=async(type,data)=>{if(type==='device-report'&&once){once=false;entered();await gate;}return request(type,data)};
  const first=p.reportDiagnostic();await started;p.settings.autoConsistency=false;await p.reportDiagnostic();assert(p.diagnosticResend);release();await first;await wait(()=>p.diagnosticTimer===undefined&&!p.diagnosticBusy);row=(await other.request('device-diagnostics')).devices.find(d=>d.deviceId===p.settings.deviceId);assert.equal(row.details.audit.enabled,false);
 });
+
+test('transfer busy during pending-upload reconnect retries automatically without dropping versions or cached bytes',async t=>{
+ const {p,mem,server}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);const id=p.settings.deviceId,cache=p.cache;
+ const upload=p.client.blobs.upload.bind(p.client.blobs);p.client.blobs.upload=async()=>{throw Error('Transfer busy')};await mem.v.createBinary('synthetic-pending-busy.png',new Uint8Array([34,35,36]).buffer);await wait(()=>p.client.pending.length===1);await p.queue;assert(p.dirtyFiles.has('synthetic-pending-busy.png'));
+ p.client.blobs.upload=upload;await p.start();const client=p.client,real=client.blobs.upload.bind(client.blobs);let attempts=0;client.blobs.upload=async(...args)=>{if(attempts++===0)throw Error('Transfer busy');return real(...args)};
+ await wait(()=>attempts>=2&&client.ready&&p.syncedOnce&&!p.initializing&&client.pending.length===0);await p.queue;assert.equal(client.stopped,false);assert.equal(p.settings.deviceId,id);assert.equal(p.cache,cache);assert.equal(p.fileFailures.size,0);assert.equal(p.pendingRows().length,0);assert.deepEqual(new Uint8Array(mem.data.get('synthetic-pending-busy.png')),new Uint8Array([34,35,36]));assert(content(server.doc,'synthetic-pending-busy.png'));
+});

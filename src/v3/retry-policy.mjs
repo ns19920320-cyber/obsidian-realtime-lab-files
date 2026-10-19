@@ -2,6 +2,7 @@
 // invalid data and local persistence failures still require explicit handling.
 export function transientTransferFailure(error){
  if(error?.code==='METADATA_NOT_READY')return true;
+ if(/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(String(error?.message||error)))return true;
  const s=String(error?.message||error);
  if(/^(?:Error: )?Connect verified V3 metadata before transferring blobs$/.test(s))return true;
  if(/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s))return false;

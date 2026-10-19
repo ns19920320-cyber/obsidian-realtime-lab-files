@@ -2,6 +2,8 @@
 export const DIAGNOSTIC_DETAILS_CAPABILITY='device-diagnostic-details-v1';
 export const REASON_CODES=['cache-staging-busy','filesystem-transient','network-transient','metadata-not-ready','authentication','identity','quota','persistence','invalid-data','unknown-error','initializing','receiving','uploading','local-operation','transferring','saving','recovering','stopping','conflict-check','conflict','path-review','consistency-hold','consistency-difference'];
 export function errorCode(error){const s=String(error?.message||error||'');if(!s)return null;
+ if(/Blob request failed \((?:409|429)\)/i.test(s))return 'transferring';
+ if(/request failed \((?:408|5\d\d)\)/i.test(s))return 'network-transient';
  if(/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s))return 'transferring';
  if(/^(?:Error: )?Cache staging busy$/.test(s))return 'cache-staging-busy';
  if(/401|403|Unauthorized|认证/i.test(s))return 'authentication';

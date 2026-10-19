@@ -353,3 +353,21 @@ test('competing remote creation cannot overwrite a safe-upload draft, including 
 });
 
 test('lost safe-upload acknowledgement retains a durable hold then clears only on equal-byte recheck without another version',async t=>{const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;await p.client.confirmUploads();const f=new bundle.TFile('lost-ack.md',5);mem.files.set(f.path,f);mem.data.set(f.path,'saved');const publish=p.client.putFile.bind(p.client);p.client.putFile=async(...args)=>{await publish(...args);throw Error('synthetic lost acknowledgement')};await p.runSafeConsistency();await p.queue;assert(p.settings.consistencyHolds.includes(f.path));assert.equal(mem.data.get(f.path),'saved');const before=await other.request('history',{path:f.path});assert.equal(before.length,1);p.client.putFile=publish;await p.runSafeConsistency();assert(!p.settings.consistencyHolds.includes(f.path));assert.equal(mem.data.get(f.path),'saved');assert.deepEqual(await other.request('history',{path:f.path}),before);});
+
+test('cache serializes overlapping staging, retains chunks and continues after failure or queued abort',async()=>{
+ const {ObsidianBlobCache}=await import('../src/v3/obsidian-cache.mjs'),m=vault(),cache=new ObsidianBlobCache(m.v.adapter);let release,entered;
+ const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r),a=new Uint8Array(40000).fill(31),b=new Uint8Array(70).fill(32);
+ let first=true;const one=cache.stage({size:a.length,read:async(p,n)=>{if(first){first=false;entered();await gate;}return a.subarray(p,p+n)}});await started;
+ const controller=new AbortController(),aborted=cache.stage(bytesSource(b),{signal:controller.signal});controller.abort();const rejected=assert.rejects(aborted,/abort/i);const two=cache.stage(bytesSource(b));release();const [ra,rb]=await Promise.all([one,two]);await rejected;
+ assert.deepEqual(new Uint8Array(await cache.materialize(ra)),a);assert.deepEqual(new Uint8Array(await cache.materialize(rb)),b);const snapshot=new Map(m.data);
+ const failed=cache.stage({size:1,read:async()=>{throw Error('synthetic read failure')}}),ok=cache.stage(bytesSource(b));await assert.rejects(failed,/synthetic/);assert.deepEqual(await ok,rb);assert.equal(cache.busy,false);for(const [k,v] of snapshot)assert.deepEqual(m.data.get(k),v);
+});
+
+test('legacy staging busy automatically reconciles without resetting client, retained cache or conflict history',async t=>{
+ const {p,other,mem,server}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);const client=p.client,cache=p.cache,stage=cache.stage.bind(cache);let fail=true;
+ cache.stage=async(...args)=>{if(fail)throw Error('Cache staging busy');return stage(...args)};
+ const bytes=new Uint8Array([71,72,73]);await mem.v.createBinary('synthetic-busy.png',bytes.buffer);await wait(()=>p.dirtyFiles.has('synthetic-busy.png')&&p.fileFailures.size>0);await p.queue;
+ p.operationError='Cache staging busy';fail=false;await p.recoverQueue();await p.queue;await wait(()=>content(other.doc,'synthetic-busy.png'));await client.confirmUploads();
+ assert.equal(p.client,client);assert.equal(p.cache,cache);assert.equal(p.operationError,'');assert.equal(p.fileFailures.size,0);assert.equal(p.pendingRows().length,0);assert.deepEqual(new Uint8Array(mem.data.get('synthetic-busy.png')),bytes);assert.equal(p.summaryStatus(),'已提交服务器');assert(!/错误|失败|拒绝|阻止/.test(p.connectionStatus));
+ p.operationError='Invalid cache reference';await p.recoverQueue();assert.equal(p.operationError,'Invalid cache reference');
+});

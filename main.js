@@ -33,17 +33,21 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
-function pathReviewGroups(items = []) {
-  return items.map((i) => ({ id: i.op.id, title: (i.op.kind === "rename" ? "\u91CD\u547D\u540D" : "\u5220\u9664") + " \xB7 " + i.op.entries.length + " \u9879", count: i.op.entries.length, affected: new Set(i.op.entries.flatMap((e) => e.to ? [e.from, e.to] : [e.from])).size, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: i.error || "", lines: i.op.entries.map((e) => e.to ? e.from + " \u2192 " + e.to : e.from), reviewed: { id: i.op.id, plan: JSON.stringify(i.op) } }));
+var RECOVERY_DIAGNOSTICS_CAPABILITY = "device-recovery-diagnostics-v1";
+
+function transientTransferFailure(error) {
+  if (error?.code === "METADATA_NOT_READY") return true;
+  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(String(error?.message || error))) return true;
+  const s = String(error?.message || error);
+  if (/^(?:Error: )?Connect verified V3 metadata before transferring blobs$/.test(s)) return true;
+  if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
+  return /Foreground reconnect; local edits retained|blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
 }
-function syncSections(options = {}) {
-  const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0 } = options;
-  const transfer = progress?.available ? (ready ? "" : "\u79BB\u7EBF\u53C2\u8003 \xB7 ") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u91CD\u8BD5 " + progress.retry + " \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions : "\u91CD\u8FDE\u540E\u6838\u5BF9\u8FDB\u5EA6 \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions;
-  let auditText = "\u5C1A\u672A\u6838\u5BF9";
-  if (audit) {
-    auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
-  }
-  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
+function transientFilesystemFailure(error) {
+  return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
+}
+function recoverableSyncFailure(error) {
+  return /^(?:Error: )?Cache staging busy$/.test(String(error?.message || error)) || transientFilesystemFailure(error) || transientTransferFailure(error);
 }
 
 var DIAGNOSTIC_DETAILS_CAPABILITY = "device-diagnostic-details-v1";
@@ -51,6 +55,8 @@ var REASON_CODES = ["cache-staging-busy", "filesystem-transient", "network-trans
 function errorCode(error) {
   const s = String(error?.message || error || "");
   if (!s) return null;
+  if (/Blob request failed \((?:409|429)\)/i.test(s)) return "transferring";
+  if (/request failed \((?:408|5\d\d)\)/i.test(s)) return "network-transient";
   if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s)) return "transferring";
   if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
   if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
@@ -89,6 +95,67 @@ function diagnosticDetailsText(d) {
   if (!d) return "\u8BE6\u7EC6\u8BCA\u65AD\uFF1A\u8BBE\u5907\u6216\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301";
   const a = d.audit;
   return "\u5F02\u5E38/\u5FD9\u788C\u539F\u56E0\uFF1A" + (d.reasons.map((r2) => ({ "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "metadata-not-ready": "\u5143\u6570\u636E\u672A\u5C31\u7EEA", "authentication": "\u9274\u6743\u5931\u8D25", "identity": "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", "quota": "\u5BB9\u91CF\u9650\u5236", "persistence": "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "invalid-data": "\u6570\u636E\u6821\u9A8C\u5F02\u5E38", "unknown-error": "\u672A\u5206\u7C7B\u9519\u8BEF\uFF08\u9700\u672C\u673A\u8BE6\u60C5\uFF09", "initializing": "\u521D\u59CB\u5316\u4E2D", "receiving": "\u63A5\u6536\u4E2D", "uploading": "\u4E0A\u4F20\u4E2D", "local-operation": "\u672C\u5730\u5904\u7406", "transferring": "\u4F20\u8F93\u4E2D", "saving": "\u4FDD\u5B58\u4E2D", "recovering": "\u91CD\u8BD5\u6062\u590D\u4E2D", "stopping": "\u6B63\u5728\u65AD\u5F00", "conflict-check": "\u51B2\u7A81\u68C0\u67E5\u672A\u786E\u8BA4", "conflict": "\u6709\u51B2\u7A81", "path-review": "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u786E\u8BA4", "consistency-hold": "\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D", "consistency-difference": "\u4E00\u81F4\u6027\u6709\u5DEE\u5F02" })[r2] || r2).join("\u3001") || "\u65E0") + "\uFF1B\u81EA\u52A8\u6838\u5BF9\uFF1A" + (a.enabled ? "\u5F00\u542F" : "\u5173\u95ED") + "\uFF1B\u9636\u6BB5\uFF1A" + a.phase + "\uFF1B\u6838\u5BF9\u65F6\u95F4\uFF1A" + (a.checkedAt ? new Date(a.checkedAt).toISOString() : "\u5C1A\u672A\u6838\u5BF9") + "\uFF1B\u7ED3\u679C\u4ECD\u9002\u7528\uFF1A" + a.current + "\uFF1B\u7ED3\u679C\uFF1A" + JSON.stringify(a.counts) + "\uFF1B\u6682\u7F13\u539F\u56E0\uFF1A" + a.reason;
+}
+
+var RetryLedger = class {
+  /** @param {any} options */
+  constructor({ state, serverId, now = Date.now, random: random2 = Math.random } = {}) {
+    this.now = now;
+    this.random = random2;
+    this.serverId = serverId;
+    this.items = /* @__PURE__ */ new Map();
+    if (state) {
+      if (state.serverId !== serverId || !Array.isArray(state.items) || state.items.length > 8192) throw Error("Invalid retry ledger identity");
+      for (const r2 of state.items) {
+        if (!r2 || typeof r2.key !== "string" || r2.key.length > 4096 || !Number.isSafeInteger(r2.attempts) || r2.attempts < 1 || r2.attempts > 1e5 || !Number.isSafeInteger(r2.nextAt) || r2.nextAt < 0 || r2.nextAt > now() + 6e4 || !Number.isSafeInteger(r2.lastAt) || r2.lastAt < 0 || typeof r2.retryable !== "boolean" || !REASON_CODES.includes(r2.code) || this.items.has(r2.key) || Object.keys(r2).some((k) => !["key", "attempts", "nextAt", "lastAt", "retryable", "code"].includes(k))) throw Error("Invalid retry ledger");
+        this.items.set(r2.key, { ...r2 });
+      }
+    }
+  }
+  due(key) {
+    const r2 = this.items.get(key);
+    return !r2 || r2.retryable && r2.nextAt <= this.now();
+  }
+  fail(key, error) {
+    if (!this.items.has(key) && this.items.size >= 8192) throw Error("Retry ledger capacity reached; queue retained");
+    const attempts = Math.min(1e5, (this.items.get(key)?.attempts || 0) + 1), retryable = recoverableSyncFailure(error), delay = Math.min(6e4, 1e3 * 2 ** Math.min(attempts - 1, 6)) * (0.75 + 0.25 * this.random());
+    this.items.set(key, { key, attempts, retryable, code: errorCode(error) || "unknown-error", lastAt: this.now(), nextAt: retryable ? Math.round(this.now() + delay) : 0 });
+  }
+  success(key) {
+    return this.items.delete(key);
+  }
+  order(keys2) {
+    return [...keys2].sort((a, b) => (this.items.get(a)?.lastAt || 0) - (this.items.get(b)?.lastAt || 0));
+  }
+  snapshot() {
+    return { serverId: this.serverId, items: [...this.items.values()].map((r2) => ({ ...r2 })) };
+  }
+  summary() {
+    const rows = [...this.items.values()], retry = rows.filter((r2) => r2.retryable);
+    return { retrying: retry.length, blocked: rows.length - retry.length, nextAt: retry.length ? Math.min(...retry.map((r2) => r2.nextAt)) : 0, reasons: [...new Set(rows.map((r2) => r2.code))] };
+  }
+};
+function stallStatus({ pending = 0, lastProgressAt, now = Date.now(), active = [], retry, ready = true, hidden = false }) {
+  const oldest = [...active].sort((a, b) => a.startedAt - b.startedAt)[0], age = Math.max(0, now - lastProgressAt, oldest ? now - oldest.startedAt : 0);
+  let reason = hidden ? "background" : !ready ? "connection" : oldest?.kind || retry?.reasons?.[0] || (retry?.blocked ? "manual-review" : retry?.retrying ? "retry-backoff" : "queue");
+  return { stalled: !!pending && !hidden && age >= 6e4, idleSeconds: Math.min(604800, Math.floor(age / 1e3)), reason, pending, retrying: retry?.retrying || 0, blocked: retry?.blocked || 0, nextRetrySeconds: retry?.nextAt ? Math.min(60, Math.max(0, Math.ceil((retry.nextAt - now) / 1e3))) : 0 };
+}
+function stallText(s) {
+  const names = { background: "\u5E94\u7528\u5728\u540E\u53F0", connection: "\u8FDE\u63A5\u6216\u9274\u6743\u672A\u5C31\u7EEA", network: "\u7F51\u7EDC\u8BF7\u6C42\u7B49\u5F85", cache: "\u7F13\u5B58\u8BFB\u5199\u7B49\u5F85", vault: "\u6587\u4EF6\u5199\u76D8\u7B49\u5F85", config: "\u672C\u5730\u961F\u5217\u4FDD\u5B58\u7B49\u5F85", queue: "\u7B49\u5F85\u961F\u5217\u8C03\u5EA6", "retry-backoff": "\u9000\u907F\u91CD\u8BD5\u7B49\u5F85", "manual-review": "\u9700\u624B\u52A8\u590D\u6838", "transferring": "\u4F20\u8F93\u901A\u9053\u5FD9\u788C", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", authentication: "\u9274\u6743\u5931\u8D25", identity: "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", quota: "\u5BB9\u91CF\u9650\u5236", persistence: "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "unknown-error": "\u672A\u77E5\u9519\u8BEF\uFF0C\u9700\u67E5\u770B\u672C\u673A\u8BE6\u60C5" };
+  return (s.stalled ? "\u8D85\u8FC760\u79D2\u672A\u89C1\u5B8C\u6210\u8FDB\u5C55\uFF1B" : "") + (names[s.reason] || s.reason) + "\uFF1B\u81EA\u52A8\u91CD\u8BD5 " + s.retrying + " \u9879\uFF0C\u9700\u590D\u6838 " + s.blocked + " \u9879" + (s.retrying ? "\uFF1B\u8DDD\u4E0B\u6B21\u91CD\u8BD5 " + s.nextRetrySeconds + " \u79D2" : "") + "\u3002\u4E0D\u4F1A\u6E05\u7A7A\u961F\u5217\u6216\u81EA\u52A8\u8986\u76D6\u51B2\u7A81\u3002";
+}
+
+function pathReviewGroups(items = []) {
+  return items.map((i) => ({ id: i.op.id, title: (i.op.kind === "rename" ? "\u91CD\u547D\u540D" : "\u5220\u9664") + " \xB7 " + i.op.entries.length + " \u9879", count: i.op.entries.length, affected: new Set(i.op.entries.flatMap((e) => e.to ? [e.from, e.to] : [e.from])).size, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: i.error || "", lines: i.op.entries.map((e) => e.to ? e.from + " \u2192 " + e.to : e.from), reviewed: { id: i.op.id, plan: JSON.stringify(i.op) } }));
+}
+function syncSections(options = {}) {
+  const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0 } = options;
+  const transfer = progress?.available ? (ready ? "" : "\u79BB\u7EBF\u53C2\u8003 \xB7 ") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u91CD\u8BD5 " + progress.retry + " \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions : "\u91CD\u8FDE\u540E\u6838\u5BF9\u8FDB\u5EA6 \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions;
+  let auditText = "\u5C1A\u672A\u6838\u5BF9";
+  if (audit) {
+    auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
+  }
+  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
 }
 
 var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
@@ -10255,21 +10322,6 @@ function requestFetch(requestUrl2, onOperation = (ms, bytes, failed) => {
   };
 }
 
-function transientTransferFailure(error) {
-  if (error?.code === "METADATA_NOT_READY") return true;
-  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(String(error?.message || error))) return true;
-  const s = String(error?.message || error);
-  if (/^(?:Error: )?Connect verified V3 metadata before transferring blobs$/.test(s)) return true;
-  if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
-  return /Foreground reconnect; local edits retained|blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
-}
-function transientFilesystemFailure(error) {
-  return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
-}
-function recoverableSyncFailure(error) {
-  return /^(?:Error: )?Cache staging busy$/.test(String(error?.message || error)) || transientFilesystemFailure(error) || transientTransferFailure(error);
-}
-
 function changedPaths(doc2, transaction) {
   const paths = /* @__PURE__ */ new Set();
   for (const [name, type] of doc2.share) {
@@ -10453,7 +10505,7 @@ function documentDigest(doc2) {
   return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
 }
 
-function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0 }) {
+function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0, stalled = false, stallReason = "" }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
     tone = "error";
@@ -10507,6 +10559,12 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     display = "Sync: " + (label === "\u91CD\u8FDE\u4E2D" ? "\u91CD\u8FDE\u4E2D" : label === "\u6062\u590D\u4E2D" ? "\u6062\u590D\u4E2D" : tone === "busy" ? "\u540C\u6B65\u4E2D" : tone === "confirmed" ? "\u2713" : tone === "error" ? "\u26A0 \u9700\u5904\u7406" : label);
   }
   if (!ready && reconnecting && conflicts) display = "Sync: \u91CD\u8FDE\u4E2D \xB7 \u51B2\u7A81" + conflicts;
+  if (stalled && ready && !conflicts && !protectedCount) {
+    tone = "error";
+    icon = "alert-circle";
+    label = "\u540C\u6B65\u6682\u672A\u63A8\u8FDB";
+    display = "Sync: \u26A0 " + ({ network: "\u7B49\u5F85\u7F51\u7EDC", cache: "\u7B49\u5F85\u7F13\u5B58", vault: "\u7B49\u5F85\u5199\u76D8", config: "\u7B49\u5F85\u4FDD\u5B58" }[stallReason] || "\u6682\u672A\u63A8\u8FDB");
+  }
   return { tone, icon, label, display, busy, counts, description: (progress?.available ? counts + "\uFF1B\u5F53\u524D\u63A5\u6536\u5E76\u53D1" + progress.active + "\uFF1B\u5F85\u91CD\u8BD5\u4EC5\u7EDF\u8BA1\u6587\u4EF6\u5931\u8D25\uFF0C\u4E0D\u5305\u542B\u8FDE\u63A5\u9519\u8BEF\u6216\u51B2\u7A81\uFF1B" : "\u8FDB\u5EA6\u5C1A\u672A\u6838\u5BF9\uFF1B") + label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
 var badgeCSS = `
@@ -11025,7 +11083,13 @@ var VaultClientV3 = class extends VaultClient {
         if (!this.blobCache) throw Error("Pending file cache required");
         for (const p of this.pending) {
           if (!context.isCurrent()) return;
-          await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
+          if (options.retryDue && !options.retryDue(p.path)) continue;
+          try {
+            await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
+          } catch (e) {
+            if (!options.onRetryFailure || /401|403|identity mismatch/i.test(String(e.message || e))) throw e;
+            await options.onRetryFailure(p.path, e);
+          }
         }
       }
     }, maxBufferedBytes: 4 * 1024 * 1024, maxInboxBytes: 8 * 1024 * 1024 });
@@ -11036,6 +11100,9 @@ var VaultClientV3 = class extends VaultClient {
     } });
     this.blobCache = options.blobCache;
     this.onPending = options.onPending;
+    this.retryDue = options.retryDue || (() => true);
+    this.onRetryFailure = options.onRetryFailure;
+    this.onRetrySuccess = options.onRetrySuccess;
     this.pending = options.pending?.items || [];
     if (options.pending && (options.pending.protocol !== 3 || options.pending.serverId !== this.serverId || !this.serverId)) throw Error("Pending uploads require matching verified server identity");
     if (this.pending.length > 6e3) throw Error("Pending reference limit");
@@ -11266,18 +11333,33 @@ var VaultClientV3 = class extends VaultClient {
     if (this.binaryBusy) throw Error("Binary operation busy");
     if (!this.blobCache || !this.onPending || !this.ready) throw Error("Connect before resuming cached uploads");
     this.binaryBusy = true;
+    const blocked = /* @__PURE__ */ new Set();
+    let failure;
     try {
-      while (this.pending.length) {
-        const p = this.pending[0];
-        await this.putFile(p.path, this.blobCache.source(p), { ...options, version: p.version, base: p.base, preserveDeleted: true });
-        await this.request("barrier");
-        this.flushPersist(true);
-        if (!this.persistence.persist || !await this.persistence.wait()) throw Error("Save metadata snapshot before removing pending reference");
-        const next = this.pending.slice(1);
-        await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
-        this.pending = next;
-        this.onSyncState();
+      for (const p of [...this.pending]) {
+        if (blocked.has(p.path) || !this.retryDue(p.path)) {
+          blocked.add(p.path);
+          continue;
+        }
+        try {
+          await this.putFile(p.path, this.blobCache.source(p), { ...options, version: p.version, base: p.base, preserveDeleted: true });
+          await this.request("barrier");
+          this.flushPersist(true);
+          if (!this.persistence.persist || !await this.persistence.wait()) throw Error("Save metadata snapshot before removing pending reference");
+          const next = this.pending.filter((x) => x !== p);
+          await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
+          this.pending = next;
+          await this.onRetrySuccess?.(p.path);
+          this.onSyncState();
+        } catch (e) {
+          blocked.add(p.path);
+          failure ??= e;
+          if (!this.onRetryFailure) throw e;
+          await this.onRetryFailure(p.path, e);
+          if (!this.ready) break;
+        }
       }
+      if (failure && !this.onRetryFailure) throw failure;
     } finally {
       this.binaryBusy = false;
     }
@@ -11304,6 +11386,52 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   consistencyReport;
   consistencyStatus = "\u5C1A\u672A\u6838\u5BF9";
   consistencySeen = /* @__PURE__ */ new Set();
+  recoveryTimer;
+  retryLedgerInstance;
+  queueWasPending = false;
+  lastQueueProgressAt = Date.now();
+  activePhases = /* @__PURE__ */ new Map();
+  phaseSequence = 0;
+  ledger() {
+    const serverId = this.client?.serverId || this.settings.serverId;
+    if (!serverId) return null;
+    if (this.retryLedgerInstance?.serverId !== serverId) {
+      this.retryLedgerInstance = new RetryLedger({ serverId, state: this.settings.retryState });
+      for (const r2 of this.retryLedgerInstance.items.values()) if (/^(upload|download):/.test(r2.key) && supportedFile(r2.key.slice(r2.key.indexOf(":") + 1))) this.fileFailures.set(r2.key.slice(r2.key.indexOf(":") + 1), r2.code);
+    }
+    return this.retryLedgerInstance;
+  }
+  scheduleRetry() {
+    window.clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = void 0;
+    const summary = this.ledger()?.summary();
+    if (!summary?.retrying || this.stopping || this.uiUnloaded || !this.client?.ready) return;
+    this.recoveryTimer = window.setTimeout(() => {
+      this.recoveryTimer = void 0;
+      void this.recoverQueue().catch(() => {
+      }).finally(() => this.scheduleRetry());
+    }, Math.max(250, summary.nextAt - Date.now()));
+  }
+  async retryFailure(key, e) {
+    const ledger = this.ledger();
+    if (!ledger) return;
+    ledger.fail(key, e);
+    this.settings.retryState = ledger.snapshot();
+    await this.persistConfig();
+    this.scheduleRetry();
+    this.updateProgress();
+  }
+  async retrySuccess(key, progress = false) {
+    const ledger = this.ledger(), removed = ledger?.success(key);
+    if (removed) {
+      this.settings.retryState = ledger.snapshot();
+      await this.persistConfig();
+    }
+    if (removed || progress) this.lastQueueProgressAt = Date.now();
+  }
+  recoveryStatus() {
+    return stallStatus({ pending: this.pendingRows().length, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden });
+  }
   performance = new PerformanceCounters();
   settings = { protocol: 3, capability: FILE_REFS_CAPABILITY, url: "ws://127.0.0.1:17241", token: "", state: "", enabled: false };
   client = null;
@@ -11385,6 +11513,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   updateProgress() {
     if (this.uiUnloaded) return;
+    const pending = !!this.pendingRows().length;
+    if (pending && !this.queueWasPending) this.lastQueueProgressAt = Date.now();
+    this.queueWasPending = pending;
     window.clearTimeout(this.progressTimer);
     this.progressTimer = window.setTimeout(() => this.renderProgress(), 100);
   }
@@ -11394,12 +11525,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   summaryStatus() {
     const c = this.client;
+    if (this.pendingRows().length && this.recoveryStatus().stalled) return "\u540C\u6B65\u6682\u672A\u63A8\u8FDB\uFF1A" + stallText(this.recoveryStatus());
     if (!c?.ready) return this.connectionStatus + "\uFF1B\u5F85\u4F20\u6587\u4EF6\u7248\u672C" + (c?.pending.length ?? this.settings.pending?.items?.length ?? 0) + "\uFF1B\u51B2\u7A81" + this.conflicts.length;
     if (this.settings.pathSafety?.items.length) return "\u6709" + this.settings.pathSafety.items.length + "\u9879\u5220\u9664\u6216\u91CD\u547D\u540D\u7B49\u5F85\u786E\u8BA4/\u91CD\u8BD5";
     if (this.settings.remoteDeleteReview) return "\u6709" + this.settings.remoteDeleteReview.paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\u7B49\u5F85\u786E\u8BA4";
     if (this.conflicts.length) return "\u6709" + this.conflicts.length + "\u9879\u51B2\u7A81\u5F85\u5904\u7406\uFF0C\u53CC\u65B9\u7248\u672C\u5DF2\u4FDD\u7559";
     if (this.conflictError) return "\u5DF2\u8FDE\u63A5\uFF0C\u51B2\u7A81\u72B6\u6001\u5C1A\u672A\u786E\u8BA4";
     if (this.fileFailures.size && this.downloadPaths.size && [...this.fileFailures.values()].every(recoverableSyncFailure) && !c.lastError && !this.operationError) return "\u6B63\u5728\u6062\u590D\u540C\u6B65\uFF0C\u5931\u8D25\u9879\u76EE\u9010\u9879\u91CD\u8BD5";
+    if (this.ledger()?.items.size) return stallText(this.recoveryStatus());
     if (c.lastError || this.fileFailures.size || this.operationError) return "\u5DF2\u8FDE\u63A5\uFF0C\u6709\u5931\u8D25\u9879\u76EE\uFF0C\u5185\u5BB9\u4FDD\u7559";
     if (!this.syncedOnce || this.initializing) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u51C6\u5907\u6587\u4EF6";
     if (this.reflection.queued || this.downloadPaths.size) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u63A5\u6536\u6587\u4EF6";
@@ -11446,6 +11579,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
     if ([this.operationError, ...this.fileFailures.values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u8BF7\u4FDD\u6301 Obsidian \u5728\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
+    if (this.pendingRows().length || this.ledger()?.items.size) e.createEl("p", { text: stallText(this.recoveryStatus()) });
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
     if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
     for (const row of rows.slice(0, 50)) e.createEl("p", { text: (row.path === "*" ? "\u672C\u5730\u79BB\u7EBF\u5FEB\u7167\u5F85\u6838\u5BF9" : row.path) + " \xB7 " + row.state + (row.error ? " \xB7 " + this.safeError(row.error) : "") });
@@ -11702,23 +11836,30 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   async recoverQueue() {
     const c = this.client;
     if (!c || this.stopping || c.stopped || c.transportBlocked || !c.ready || this.initializing || this.recoveryBusy || Date.now() < this.retryAfter) return;
-    const errors = [this.operationError, ...this.fileFailures.values()].filter(Boolean);
-    if (!errors.length || !errors.every(recoverableSyncFailure)) return;
+    if (this.ledger() && !this.ledger().due("operation") && !this.syncedOnce) return;
+    const errors = [this.operationError, ...this.fileFailures.values(), c.lastError].filter(Boolean);
+    if (!errors.some(recoverableSyncFailure) && !c.pending.some((p) => this.ledger()?.due("upload:" + p.path)) && ![...this.dirtyFiles.keys()].some((p) => this.ledger()?.due("upload:" + p)) && !this.settings.receivePending?.paths.some((p) => this.ledger()?.due("download:" + p))) return;
     this.recoveryBusy = true;
-    this.retryAfter = Date.now() + Math.min(6e4, 2e3 * 2 ** Math.min(this.recoveryAttempts++, 5));
+    this.retryAfter = Date.now() + 2e3;
     try {
-      await this.retryQueue();
+      await this.retryQueue(false);
       await this.queue;
-      if (!this.operationError && !this.fileFailures.size) {
-        this.recoveryAttempts = 0;
-        this.retryAfter = 0;
-      }
     } finally {
       this.recoveryBusy = false;
     }
   }
-  async retryQueue() {
-    this.operationError = "";
+  async retryQueue(force = true) {
+    if (force) {
+      const ledger = this.ledger();
+      if (ledger) {
+        for (const r2 of ledger.items.values()) {
+          r2.nextAt = 0;
+          r2.retryable = true;
+        }
+        this.settings.retryState = ledger.snapshot();
+        await this.persistConfig();
+      }
+    }
     if (!this.client || this.client.stopped || this.client.transportBlocked) {
       await this.start();
       return;
@@ -11738,7 +11879,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       await this.flushPathSafety();
       const confirmed = await c.confirmUploads();
       await this.reflect();
-      if (confirmed && !this.operationError && !this.fileFailures.size && !this.pendingRows().length) this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
+      if (confirmed && !this.fileFailures.size && !this.pendingRows().length) {
+        if (recoverableSyncFailure(this.operationError)) this.operationError = "";
+        if (recoverableSyncFailure(c.lastError)) c.lastError = "";
+        await this.retrySuccess("operation");
+        this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
+      }
       this.updateProgress();
     });
   }
@@ -11750,7 +11896,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client, progress = this.progressModel(), uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
-    return badgeState({ progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    const recovery = this.recoveryStatus();
+    return badgeState({ stalled: recovery.stalled, stallReason: recovery.reason, progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -11857,7 +12004,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -11890,6 +12037,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.settings.deviceLabels = { ...this.settings.deviceLabels, [d.deviceId]: v.trim().slice(0, 64) };
           await this.persistConfig();
         }));
+        for (const d of result.devices) if (d.recovery) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + stallText(d.recovery) });
         for (const d of result.devices) if (d.performance) {
           const p = d.performance;
           panel.createEl("p", { text: d.platform + " \u5206\u9636\u6BB5\u7D2F\u8BA1\uFF1A\u7F51\u7EDC/\u539F\u751F\u8BF7\u6C42\u7B49\u5F85 " + p.network.wallMs + "ms\uFF08" + p.network.count + "\u6B21\uFF09\uFF1B\u7F13\u5B58\u8BFB\u5199 " + p.cache.wallMs + "ms\uFF1B\u6587\u4EF6\u5199\u5165 " + p.vault.wallMs + "ms\uFF1B\u914D\u7F6E\u4FDD\u5B58 " + p.config.wallMs + "ms\u3002\u8BA1\u65F6\u81EA\u672C\u6B21\u63D2\u4EF6\u542F\u52A8\uFF0C\u90E8\u5206\u9636\u6BB5\u91CD\u53E0\uFF0C\u4E0D\u80FD\u76F8\u52A0\u4F5C\u4E3A\u603B\u8017\u65F6\u3002" });
@@ -12212,6 +12360,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const loaded = await this.loadData();
     if (loaded && (loaded.protocol !== 3 || loaded.capability !== FILE_REFS_CAPABILITY)) this.legacyConfig = loaded;
     else this.settings = { ...this.settings, ...loaded };
+    const begin = this.performance.begin.bind(this.performance);
+    this.performance.begin = (kind) => {
+      const id2 = ++this.phaseSequence;
+      this.activePhases.set(id2, { kind, startedAt: Date.now() });
+      const done = begin(kind);
+      return (bytes = 0, error = false) => {
+        this.activePhases.delete(id2);
+        done(bytes, error);
+      };
+    };
     if (!this.legacyConfig && !this.settings.deviceId) {
       this.settings.deviceId = crypto.randomUUID();
       await this.persistConfig();
@@ -12324,24 +12482,32 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     }).catch((e) => {
       new import_obsidian.Notice("\u6D4B\u8BD5\u5E93\u540C\u6B65\uFF1A" + String(e.message || e));
       this.operationError = this.safeError(e.message || e);
+      void this.retryFailure("operation", e).catch(() => {
+        this.operationError = "\u672C\u5730\u91CD\u8BD5\u8BA1\u5212\u4FDD\u5B58\u5931\u8D25\uFF1B\u539F\u961F\u5217\u4FDD\u7559";
+      });
       this.setConnectionStatus("\u64CD\u4F5C\u5931\u8D25\uFF1A" + this.operationError);
     });
   }
   async flushLocalFiles() {
-    for (const p of [...this.dirtyFiles.keys()]) {
+    const ledger = this.ledger();
+    for (const key of ledger?.items.keys() || []) {
+      if (!key.startsWith("upload:")) continue;
+      const p = key.slice(7), f = this.app.vault.getAbstractFileByPath(p);
+      if (f instanceof import_obsidian.TFile && !this.client?.pending.some((x) => x.path === p)) this.dirtyFiles.set(p, f);
+    }
+    for (const p of ledger?.order([...this.dirtyFiles.keys()].map((p2) => "upload:" + p2)).map((key) => key.slice(7)) || [...this.dirtyFiles.keys()]) {
       const f = this.dirtyFiles.get(p);
-      this.dirtyFiles.delete(p);
       if (!f || !this.client || this.stopping) return;
-      if (this.pathBlocked(p)) {
-        this.dirtyFiles.set(p, f);
-        continue;
-      }
+      if (this.pathBlocked(p) || !ledger?.due("upload:" + p) && ledger) continue;
+      this.dirtyFiles.delete(p);
       try {
         await this.upload(f);
         this.fileFailures.delete(p);
+        if (!this.client.pending.some((x) => x.path === p)) await this.retrySuccess("upload:" + p);
       } catch (e) {
         this.dirtyFiles.set(p, f);
         this.fileFailures.set(p, this.safeError(e));
+        await this.retryFailure("upload:" + p, e);
         this.setConnectionStatus("\u6709\u6587\u4EF6\u4E0A\u4F20\u5931\u8D25\uFF0C\u5185\u5BB9\u4FDD\u7559\uFF0C\u53EF\u91CD\u8BD5");
       }
     }
@@ -12406,6 +12572,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       const source = this.cache.source(item);
       await c.stageFile(f.path, source);
       if (c.ready) await c.flushPending();
+      if (c.ready && this.ledger()?.items.has("upload:" + path)) throw Error(this.fileFailures.get(path) || "Pending file transfer retained");
       return;
     }
     const trial = new Doc();
@@ -12496,7 +12663,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.syncedOnce = false;
     const hadState = !!this.settings.state;
     let first = true;
-    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl, void 0, () => this.performance.begin("network")), onTransfer: (kind, bytes, failed, files) => this.transfers.record(kind, bytes, failed, files), mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, pending: this.settings.pending, outbox: this.settings.outbox, onSyncState: () => this.updateProgress(), onOutbox: async (outbox) => {
+    const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl, void 0, () => this.performance.begin("network")), onTransfer: (kind, bytes, failed, files) => {
+      this.transfers.record(kind, bytes, failed, files);
+      if (!failed && bytes) this.lastQueueProgressAt = Date.now();
+    }, mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, retryDue: (path) => this.ledger()?.due("upload:" + path) ?? true, onRetryFailure: async (path, e) => {
+      this.fileFailures.set(path, this.safeError(e));
+      await this.retryFailure("upload:" + path, e);
+    }, onRetrySuccess: async (path) => {
+      this.fileFailures.delete(path);
+      await this.retrySuccess("upload:" + path, true);
+    }, pending: this.settings.pending, outbox: this.settings.outbox, onSyncState: () => this.updateProgress(), onOutbox: async (outbox) => {
       this.settings.outbox = outbox;
       await this.persistConfig();
     }, onPending: async (pending) => {
@@ -12527,7 +12703,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           const remote = entries(c.doc);
           await c.batchFiles(async () => {
             for (const f of this.app.vault.getFiles().filter((f2) => supportedFile(f2.path))) {
-              if (this.pathBlocked(f.path)) continue;
+              if (this.pathBlocked(f.path) || c.pending.some((p) => p.path === f.path) || this.ledger() && !this.ledger().due("upload:" + f.path)) continue;
               const local = await this.read(f), r2 = remote[f.path];
               const meta = c.doc.getMap("files").get(f.path);
               if (r2) {
@@ -12540,6 +12716,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           first = false;
         }
         this.syncedOnce = true;
+        await this.retrySuccess("operation");
         await this.refreshConflicts();
         await this.reflect();
         this.refresh();
@@ -12553,6 +12730,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         }
       } finally {
         this.initializing = false;
+        this.scheduleRetry();
       }
     };
     this.client = c;
@@ -12606,6 +12784,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       for (const [p, m] of [...files].sort((a, b) => Number(!!(a[1].deleted || c.doc.getMap("deleted").has(a[0]))) - Number(!!(b[1].deleted || c.doc.getMap("deleted").has(b[0]))))) {
         if (this.stopping || this.client !== c) return;
         if (!c.ready) break;
+        if (this.ledger() && !this.ledger().due("download:" + p)) continue;
         if (!supportedFile(p) || this.pathBlocked(p) || this.dirtyFiles.has(p) || c.pending.some((x) => x.path === p)) continue;
         try {
           const f = this.app.vault.getAbstractFileByPath(p);
@@ -12640,6 +12819,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
             if (equal(old, item)) {
               await this.received(p);
               this.fileFailures.delete(p);
+              await this.retrySuccess("download:" + p);
               transportFailures = 0;
               continue;
             }
@@ -12697,9 +12877,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           }
           await this.received(p);
           this.fileFailures.delete(p);
+          await this.retrySuccess("download:" + p);
           transportFailures = 0;
         } catch (e) {
           this.fileFailures.set(p, this.safeError(c.ready ? e : "Disconnected during receive: " + this.safeError(e)));
+          await this.retryFailure("download:" + p, e);
           this.updateProgress();
           if (!c.ready) break;
           if (transientFilesystemFailure(e)) {
@@ -12738,6 +12920,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   async received(path) {
     const plan = this.settings.receivePending;
     if (plan?.serverId !== this.client?.serverId || !plan?.paths.includes(path)) return;
+    if (!this.receiveAcks.has(path)) this.lastQueueProgressAt = Date.now();
     this.receiveAcks.add(path);
     if (this.receiveAcks.size >= 16 || Date.now() - this.receiptLastSaved >= 1e3) await this.flushReceipts();
   }
@@ -13165,6 +13348,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     window.clearTimeout(this.safetyTimer);
     this.safetyTimer = void 0;
     this.stopping = true;
+    window.clearTimeout(this.recoveryTimer);
     window.clearTimeout(this.conflictTimer);
     this.reflection.cancel();
     this.fileUploads.cancel();

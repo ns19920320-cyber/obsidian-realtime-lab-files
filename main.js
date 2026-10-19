@@ -33,6 +33,50 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var DIAGNOSTIC_DETAILS_CAPABILITY = "device-diagnostic-details-v1";
+var REASON_CODES = ["cache-staging-busy", "filesystem-transient", "network-transient", "metadata-not-ready", "authentication", "identity", "quota", "persistence", "invalid-data", "unknown-error", "initializing", "receiving", "uploading", "local-operation", "transferring", "saving", "recovering", "stopping", "conflict-check", "conflict", "path-review", "consistency-hold", "consistency-difference"];
+function errorCode(error) {
+  const s = String(error?.message || error || "");
+  if (!s) return null;
+  if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
+  if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
+  if (/identity mismatch|身份/i.test(s)) return "identity";
+  if (/quota|capacity|容量/i.test(s)) return "quota";
+  if (/snapshot|persist|本地保存|快照/i.test(s)) return "persistence";
+  if (/invalid|无效|校验/i.test(s)) return "invalid-data";
+  if (/Connect verified V3 metadata|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
+  if (/File system operation timed out|\b(?:EBUSY|EAGAIN|EMFILE|ENFILE)\b/i.test(s)) return "filesystem-transient";
+  if (/network|fetch|load failed|disconnected|timeout|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s)) return "network-transient";
+  return "unknown-error";
+}
+var auditCounts = ["equal", "missing", "different", "local-only", "queued", "excluded", "read-error", "downloaded", "uploaded", "refused"];
+var phases = ["never", "running", "waiting", "complete", "deferred"];
+var auditReasons = ["none", "queue-active", "changed", "conflict-unverified", "baseline-invalid", "unknown-error"];
+function validateDiagnosticDetails(v) {
+  const exact = (o, keys2) => o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length === keys2.length && Object.keys(o).every((k) => keys2.includes(k));
+  const count = (n) => Number.isSafeInteger(n) && n >= 0 && n <= 1e5;
+  if (!exact(v, ["reasons", "audit"]) || !Array.isArray(v.reasons) || v.reasons.length > REASON_CODES.length || new Set(v.reasons).size !== v.reasons.length || v.reasons.some((r2) => !REASON_CODES.includes(r2))) throw Error("Invalid diagnostic details");
+  const a = v.audit;
+  if (!exact(a, ["enabled", "phase", "reason", "checkedAt", "stable", "current", "limited", "counts"]) || typeof a.enabled !== "boolean" || !phases.includes(a.phase) || !auditReasons.includes(a.reason) || ![a.stable, a.current, a.limited].every((x) => typeof x === "boolean") || !(a.checkedAt === null || Number.isSafeInteger(a.checkedAt) && a.checkedAt >= 0 && a.checkedAt <= 864e13) || !exact(a.counts, auditCounts) || !auditCounts.every((k) => count(a.counts[k]))) throw Error("Invalid audit diagnostics");
+  return { reasons: [...v.reasons], audit: { ...a, counts: { ...a.counts } } };
+}
+function diagnosticDetails(p) {
+  const c = p.client, reasons = /* @__PURE__ */ new Set();
+  for (const e of [p.operationError, c?.lastError, p.conflictError, ...p.fileFailures.values()]) {
+    const code = errorCode(e);
+    if (code) reasons.add(code);
+  }
+  const flags = { "initializing": p.initializing || !p.syncedOnce, "receiving": p.reflection.queued || p.downloadPaths.size, "uploading": p.fileUploads.queued, "local-operation": p.localOperations || p.writing.size, "transferring": c?.binaryBusy, "saving": p.receiveAcks.size || p.receiptFlush || c?.persistence.dirty || c?.persistence.inFlight, "recovering": p.recoveryBusy, "stopping": p.stopping, "conflict-check": p.conflictError, "conflict": p.conflicts.length, "path-review": p.settings.pathSafety?.items.length || p.settings.remoteDeleteReview?.paths.length, "consistency-hold": p.settings.consistencyHolds?.length, "consistency-difference": p.consistencyIssues() };
+  for (const [k, on] of Object.entries(flags)) if (on) reasons.add(k);
+  const r2 = p.consistencyReport, counts = Object.fromEntries(auditCounts.map((k) => [k, k === "refused" ? r2?.refused?.length || 0 : r2?.counts?.[k] ?? r2?.[k] ?? 0]));
+  return validateDiagnosticDetails({ reasons: [...reasons], audit: { enabled: !!p.settings.autoConsistency, phase: p.consistencyBusy ? "running" : p.consistencyPhase || "never", reason: p.consistencyReason || "none", checkedAt: r2?.checkedAt ?? null, stable: !!r2?.stable, current: !!r2?.stable && r2.serverId === c?.serverId && p.consistencyDigest === p.currentDigest() && p.consistencyAuditEpoch === p.consistencyEpoch, limited: !!r2?.limited, counts } });
+}
+function diagnosticDetailsText(d) {
+  if (!d) return "\u8BE6\u7EC6\u8BCA\u65AD\uFF1A\u8BBE\u5907\u6216\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301";
+  const a = d.audit;
+  return "\u5F02\u5E38/\u5FD9\u788C\u539F\u56E0\uFF1A" + (d.reasons.map((r2) => ({ "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "metadata-not-ready": "\u5143\u6570\u636E\u672A\u5C31\u7EEA", "authentication": "\u9274\u6743\u5931\u8D25", "identity": "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", "quota": "\u5BB9\u91CF\u9650\u5236", "persistence": "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "invalid-data": "\u6570\u636E\u6821\u9A8C\u5F02\u5E38", "unknown-error": "\u672A\u5206\u7C7B\u9519\u8BEF\uFF08\u9700\u672C\u673A\u8BE6\u60C5\uFF09", "initializing": "\u521D\u59CB\u5316\u4E2D", "receiving": "\u63A5\u6536\u4E2D", "uploading": "\u4E0A\u4F20\u4E2D", "local-operation": "\u672C\u5730\u5904\u7406", "transferring": "\u4F20\u8F93\u4E2D", "saving": "\u4FDD\u5B58\u4E2D", "recovering": "\u91CD\u8BD5\u6062\u590D\u4E2D", "stopping": "\u6B63\u5728\u65AD\u5F00", "conflict-check": "\u51B2\u7A81\u68C0\u67E5\u672A\u786E\u8BA4", "conflict": "\u6709\u51B2\u7A81", "path-review": "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u786E\u8BA4", "consistency-hold": "\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D", "consistency-difference": "\u4E00\u81F4\u6027\u6709\u5DEE\u5F02" })[r2] || r2).join("\u3001") || "\u65E0") + "\uFF1B\u81EA\u52A8\u6838\u5BF9\uFF1A" + (a.enabled ? "\u5F00\u542F" : "\u5173\u95ED") + "\uFF1B\u9636\u6BB5\uFF1A" + a.phase + "\uFF1B\u6838\u5BF9\u65F6\u95F4\uFF1A" + (a.checkedAt ? new Date(a.checkedAt).toISOString() : "\u5C1A\u672A\u6838\u5BF9") + "\uFF1B\u7ED3\u679C\u4ECD\u9002\u7528\uFF1A" + a.current + "\uFF1B\u7ED3\u679C\uFF1A" + JSON.stringify(a.counts) + "\uFF1B\u6682\u7F13\u539F\u56E0\uFF1A" + a.reason;
+}
+
 var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
 var r = (v, n) => v >>> n | v << 32 - n;
 var Sha256 = class {
@@ -11210,6 +11254,10 @@ var equal = (a, b) => a?.kind === b?.kind && (a?.kind === "text" ? a.data === b?
 var MAX_IMAGE2 = 5 * 1024 * 1024;
 var BACKUP = ".realtime-lab-v3-recovery";
 var RealtimeLab = class extends import_obsidian.Plugin {
+  consistencyPhase = "never";
+  consistencyReason = "none";
+  consistencyDigest = "";
+  consistencyAuditEpoch = -1;
   consistencyBusy = false;
   consistencyNextAt = 0;
   consistencyEpoch = 0;
@@ -11404,10 +11452,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.consistencyBusy || !c?.ready || this.stopping || this.uiUnloaded || document.hidden || !this.syncedOnce || this.initializing) return;
     const idle = () => this.client === c && c.ready && !this.stopping && !this.uiUnloaded && !document.hidden && !this.pendingRows().length && !this.reflection.queued && !this.downloadPaths.size && !this.localOperations && !c.binaryBusy;
     if (!idle()) {
+      this.consistencyPhase = "waiting";
+      this.consistencyReason = "queue-active";
       this.consistencyStatus = "\u7B49\u5F85\u73B0\u6709\u961F\u5217\u5904\u7406\u5B8C\u6BD5";
       this.consistencyNextAt = Date.now() + 6e4;
       return;
     }
+    this.consistencyReason = "none";
     this.consistencyBusy = true;
     this.consistencyStatus = "\u6B63\u5728\u9010\u6587\u4EF6\u6838\u5BF9";
     let downloaded = 0, uploaded = 0;
@@ -11477,9 +11528,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.settings.consistencySeen = [...this.consistencySeen];
       await this.persistConfig();
       const verified = await this.scanConsistency();
+      this.consistencyPhase = verified.stable ? "complete" : "deferred";
+      this.consistencyReason = verified.stable ? "none" : "changed";
+      this.consistencyDigest = verified.stable ? this.currentDigest() : "";
+      this.consistencyAuditEpoch = this.consistencyEpoch;
       this.consistencyReport = { ...verified, downloaded, uploaded, refused, limited: plan.length > 50 };
       this.consistencyStatus = (verified.stable ? "\u6838\u5BF9\u5B8C\u6210" : "\u672C\u8F6E\u6709\u65B0\u53D8\u5316\uFF0C\u5F85\u4E0B\u8F6E\u6838\u5BF9") + "\uFF1A\u4E00\u81F4" + verified.counts.equal + "\uFF0C\u8865\u6536" + downloaded + "\uFF0C\u8865\u4F20" + uploaded + "\uFF0C\u6B63\u6587\u5DEE\u5F02" + verified.counts.different + "\uFF0C\u672A\u8865\u9F50" + (verified.counts.missing + verified.counts["local-only"]) + "\uFF0C\u6682\u7F13" + refused.length + (plan.length > 50 ? "\uFF08\u5176\u4F59\u4E0B\u8F6E\u7EE7\u7EED\uFF09" : "");
     } catch (e) {
+      this.consistencyPhase = "deferred";
+      const message = String(e);
+      this.consistencyReason = message.includes("\u51B2\u7A81\u72B6\u6001") ? "conflict-unverified" : message.includes("\u57FA\u7EBF\u65E0\u6548") ? "baseline-invalid" : /变化/.test(message) ? "changed" : "unknown-error";
       this.consistencyStatus = "\u6838\u5BF9\u6682\u7F13\uFF1A" + this.safeError(e);
     } finally {
       this.consistencyBusy = false;
@@ -11745,7 +11803,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -11769,6 +11827,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         const result = await c.request("device-diagnostics");
         panel.createEl("p", { text: "\u4EC5\u663E\u793A\u6700\u8FD1\u4E00\u6B21\u8BBE\u5907\u81EA\u62A5\u72B6\u6001\uFF1B\u8D85\u8FC730\u79D2\u3001\u540E\u53F0\u6216\u79BB\u7EBF\u5747\u4E0D\u5224\u4E3A\u540C\u6B65\u5B8C\u6210\u3002\u670D\u52A1\u5668\u91CD\u542F\u6E05\u7A7A\u8BCA\u65AD\uFF0C\u4E0D\u5F71\u54CD\u7B14\u8BB0\u3002" });
         for (const d of result.devices) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + d.version + "\uFF1A" + (d.completeAtReport ? "\u6700\u8FD1\u4E0A\u62A5\u5DF2\u540C\u6B65" : !d.connected ? "\u5DF2\u79BB\u7EBF" : !d.fresh ? "\u4E0A\u62A5\u5DF2\u8FC7\u671F" : !d.foreground ? "\u540E\u53F0\uFF0C\u72B6\u6001\u5F85\u786E\u8BA4" : "\u5C1A\u672A\u786E\u8BA4\u5B8C\u6210") + "\uFF1B\u5F85\u5904\u7406 " + d.queued + "\uFF0C\u63A5\u6536 " + d.receiving + "\uFF0C\u5931\u8D25 " + d.failed + "\uFF0C\u51B2\u7A81 " + d.conflicts + "\uFF1B" + Math.floor(d.ageMs / 1e3) + "\u79D2\u524D\u4E0A\u62A5" });
+        for (const d of result.devices) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + diagnosticDetailsText(d.details) });
         for (const d of result.devices) new import_obsidian.Setting(panel).setName("\u8BBE\u5907\u522B\u540D \xB7 " + d.platform + " " + d.deviceId.slice(0, 8)).addText((t) => t.setValue(this.settings.deviceLabels?.[d.deviceId] || "").onChange(async (v) => {
           this.settings.deviceLabels = { ...this.settings.deviceLabels, [d.deviceId]: v.trim().slice(0, 64) };
           await this.persistConfig();

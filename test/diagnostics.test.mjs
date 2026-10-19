@@ -10,3 +10,13 @@ test('authenticated report/query, old client compatibility, no vault writes, dis
 });
 
 test('equal material content with different Yjs garbage collection has the same diagnostic digest',()=>{const a=new Y.Doc({gc:false}),b=new Y.Doc();put(a,'实时协作测试.md',{kind:'text',data:'before'});Y.applyUpdate(b,Y.encodeStateAsUpdate(a));a.getText('text:实时协作测试.md').delete(0,6);Y.applyUpdate(b,Y.encodeStateAsUpdate(a));assert.notDeepEqual(Y.encodeStateAsUpdate(a),Y.encodeStateAsUpdate(b));assert.equal(documentDigest(a),documentDigest(b));});
+
+test('diagnostic details are bounded allowlisted and cannot carry raw errors, paths or credentials',async()=>{
+ const {validateDiagnosticDetails,errorCode}=await import('../src/v3/diagnostic-details.mjs');
+ const counts=Object.fromEntries(['equal','missing','different','local-only','queued','excluded','read-error','downloaded','uploaded','refused'].map(k=>[k,0]));
+ const details={reasons:['cache-staging-busy'],audit:{enabled:true,phase:'complete',reason:'none',checkedAt:123,stable:true,current:true,limited:false,counts}};
+ assert.deepEqual(validateDiagnosticDetails(details),details);
+ for(const bad of [{...details,token:'secret'},{...details,reasons:['private-note.md']},{...details,audit:{...details.audit,path:'secret'}},{...details,audit:{...details.audit,counts:{...counts,equal:-1}}},{...details,audit:{...details.audit,checkedAt:Infinity}}])assert.throws(()=>validateDiagnosticDetails(bad));
+ assert.equal(errorCode('Cache staging busy'),'cache-staging-busy');assert.equal(errorCode('Cache write /secret/note token=my-secret: mystery'),'unknown-error');assert.equal(errorCode('File system operation timed out'),'filesystem-transient');
+ const doc=new Y.Doc(),store=new DeviceDiagnostics(),ws={readyState:1};store.report(ws,{...report(doc),details});assert.equal(store.snapshot(documentDigest(doc),0)[0].completeAtReport,false);store.report(ws,{...report(doc),details:{...details,reasons:[]}});assert(store.snapshot(documentDigest(doc),0)[0].completeAtReport);assert.equal(store.snapshot(documentDigest(doc),0)[0].details.audit.counts.equal,0);
+});

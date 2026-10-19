@@ -371,3 +371,13 @@ test('legacy staging busy automatically reconciles without resetting client, ret
  assert.equal(p.client,client);assert.equal(p.cache,cache);assert.equal(p.operationError,'');assert.equal(p.fileFailures.size,0);assert.equal(p.pendingRows().length,0);assert.deepEqual(new Uint8Array(mem.data.get('synthetic-busy.png')),bytes);assert.equal(p.summaryStatus(),'已提交服务器');assert(!/错误|失败|拒绝|阻止/.test(p.connectionStatus));
  p.operationError='Invalid cache reference';await p.recoverQueue();assert.equal(p.operationError,'Invalid cache reference');
 });
+
+test('remote details report actual audit result and sanitized causes, invalidate changed files and clear recovered error',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('synthetic-audit.json',bytesSource(new TextEncoder().encode('synthetic')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;await p.runSafeConsistency();p.settings.autoConsistency=true;
+ const query=async()=>{p.diagnosticLastSent=0;await p.reportDiagnostic();return (await other.request('device-diagnostics')).devices.find(d=>d.deviceId===p.settings.deviceId)};
+ let row=await query();assert.equal(row.details.audit.enabled,true);assert.equal(row.details.audit.phase,'complete');assert.equal(row.details.audit.counts.equal,1);assert.equal(row.details.audit.current,true);assert(row.details.audit.checkedAt>0);
+ p.operationError='Cache staging busy';row=await query();assert(row.details.reasons.includes('cache-staging-busy'));assert.equal(row.completeAtReport,false);await p.recoverQueue();await p.queue;row=await query();assert(!row.details.reasons.includes('cache-staging-busy'));
+ p.operationError='private /synthetic/path secret-token';row=await query();assert(row.details.reasons.includes('unknown-error'));assert(!JSON.stringify(row).includes('secret-token'));p.operationError='';
+ p.consistencyEpoch++;row=await query();assert.equal(row.details.audit.current,false);
+ p.client.serverCapabilities=p.client.serverCapabilities.filter(x=>x!=='device-diagnostic-details-v1');row=await query();assert.equal(row.details,undefined);assert.equal(p.diagnosticError,'');
+});

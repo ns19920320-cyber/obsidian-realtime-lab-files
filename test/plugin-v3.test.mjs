@@ -381,3 +381,18 @@ test('remote details report actual audit result and sanitized causes, invalidate
  p.consistencyEpoch++;row=await query();assert.equal(row.details.audit.current,false);
  p.client.serverCapabilities=p.client.serverCapabilities.filter(x=>x!=='device-diagnostic-details-v1');row=await query();assert.equal(row.details,undefined);assert.equal(p.diagnosticError,'');
 });
+
+test('audit toggle saves without losing state, immediately reports, survives reload and diagnoses save failure',async t=>{
+ const {p,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;const identity=p.settings.deviceId,token=p.settings.token,client=p.client,cache=p.cache;
+ await p.setAutoConsistency(true);assert.equal(p.saved.autoConsistency,true);assert.equal(p.settings.deviceId,identity);assert.equal(p.settings.token,token);assert.equal(p.client,client);assert.equal(p.cache,cache);
+ await wait(()=>!p.consistencyBusy);await p.setAutoConsistency(false);assert.equal(p.saved.autoConsistency,false);const row=(await other.request('device-diagnostics')).devices.find(d=>d.deviceId===identity);assert.equal(row.details.audit.enabled,false);
+ const durable=structuredClone(p.saved),fresh=new bundle.default();fresh.loadData=async()=>durable;fresh.app=p.app;await fresh.onload();assert.equal(fresh.settings.autoConsistency,false);fresh.uiUnloaded=true;clearTimeout(fresh.progressTimer);
+ const save=p.saveData.bind(p);p.saveData=async()=>{throw Error('synthetic persistence failure')};await p.setAutoConsistency(true);assert.equal(p.saved.autoConsistency,false);assert.match(p.operationError,/本地保存失败/);const failed=(await other.request('device-diagnostics')).devices.find(d=>d.deviceId===identity);assert(failed.details.reasons.includes('persistence'));p.saveData=save;
+});
+
+test('diagnostic throttle retains a final toggle event and overlapping reports resend the latest state',async t=>{
+ const {p,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;clearTimeout(p.diagnosticTimer);p.diagnosticTimer=undefined;p.diagnosticLastSent=Date.now();p.settings.autoConsistency=true;p.scheduleDiagnostic();assert.notEqual(p.diagnosticTimer,undefined);
+ await wait(()=>p.diagnosticTimer===undefined&&!p.diagnosticBusy);let row=(await other.request('device-diagnostics')).devices.find(d=>d.deviceId===p.settings.deviceId);assert.equal(row.details.audit.enabled,true);
+ const request=p.client.request.bind(p.client);let release,entered;const gate=new Promise(r=>release=r),started=new Promise(r=>entered=r);let once=true;p.client.request=async(type,data)=>{if(type==='device-report'&&once){once=false;entered();await gate;}return request(type,data)};
+ const first=p.reportDiagnostic();await started;p.settings.autoConsistency=false;await p.reportDiagnostic();assert(p.diagnosticResend);release();await first;await wait(()=>p.diagnosticTimer===undefined&&!p.diagnosticBusy);row=(await other.request('device-diagnostics')).devices.find(d=>d.deviceId===p.settings.deviceId);assert.equal(row.details.audit.enabled,false);
+});

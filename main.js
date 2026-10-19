@@ -11290,6 +11290,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   prepareConnection;
   localOperations = 0;
   diagnosticBusy = false;
+  diagnosticResend = false;
   diagnosticLastSent = 0;
   diagnosticTimer;
   diagnosticError = "";
@@ -11791,15 +11792,19 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.renderProgress();
   }
   scheduleDiagnostic() {
-    if (!this.client?.ready || this.uiUnloaded || this.diagnosticTimer !== void 0 || Date.now() - this.diagnosticLastSent < 2e3) return;
+    if (!this.client?.ready || this.uiUnloaded || this.diagnosticTimer !== void 0) return;
     this.diagnosticTimer = window.setTimeout(() => {
       this.diagnosticTimer = void 0;
       void this.reportDiagnostic();
-    }, 300);
+    }, Math.max(300, 2e3 - (Date.now() - this.diagnosticLastSent)));
   }
   async reportDiagnostic() {
     const c = this.client;
-    if (this.uiUnloaded || this.diagnosticBusy || !c?.ready || !this.settings.deviceId || !c.serverCapabilities?.includes(DIAGNOSTICS_CAPABILITY)) return;
+    if (this.diagnosticBusy) {
+      this.diagnosticResend = true;
+      return;
+    }
+    if (this.uiUnloaded || !c?.ready || !this.settings.deviceId || !c.serverCapabilities?.includes(DIAGNOSTICS_CAPABILITY)) return;
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
@@ -11810,6 +11815,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     } finally {
       this.diagnosticLastSent = Date.now();
       this.diagnosticBusy = false;
+      if (this.diagnosticResend) {
+        this.diagnosticResend = false;
+        this.scheduleDiagnostic();
+      }
     }
   }
   async openDeviceDiagnostics() {
@@ -12103,6 +12112,22 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (!this.settings.pathSafety?.items.length && !review) m.contentEl.createEl("p", { text: "\u6CA1\u6709\u5F85\u786E\u8BA4\u7684\u8DEF\u5F84\u64CD\u4F5C\u3002" });
     new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
     m.open();
+  }
+  async setAutoConsistency(value) {
+    this.settings.autoConsistency = value;
+    this.consistencyNextAt = 0;
+    try {
+      await this.persistConfig();
+    } catch (e) {
+      this.operationError = "\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF1A" + this.safeError(e);
+      new import_obsidian.Notice("\u81EA\u52A8\u6838\u5BF9\u8BBE\u7F6E\u5C1A\u672A\u4FDD\u5B58\uFF0C\u8BF7\u4FDD\u7559\u5F53\u524D\u5E93\u5E76\u68C0\u67E5\u5B58\u50A8");
+      this.renderProgress();
+      await this.reportDiagnostic();
+      return;
+    }
+    this.renderProgress();
+    await this.reportDiagnostic();
+    if (value) void this.runSafeConsistency();
   }
   async persistConfig() {
     if (this.legacyConfig) throw Error("\u65E7\u8BBE\u7F6E\u5C1A\u672A\u5907\u4EFD\uFF1B\u62D2\u7EDD\u8986\u76D6");
@@ -13132,12 +13157,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
       await this.p.persistConfig();
       this.p.renderProgress();
     }));
-    new import_obsidian.Setting(e).setName("\u81EA\u52A8\u4E00\u81F4\u6027\u6838\u5BF9\u4E0E\u5B89\u5168\u8865\u4F20").setDesc("\u9ED8\u8BA4\u5173\u95ED\u3002\u524D\u53F0\u7A7A\u95F2\u65F6\u6BCF10\u5206\u949F\u6838\u5BF9\uFF1B\u4EC5\u8865\u7F3A\u5931\u6587\u4EF6\uFF0C\u4E0D\u8986\u76D6\u5DEE\u5F02\u6216\u51B2\u7A81\uFF0C\u4E0D\u590D\u6D3B\u5DF2\u5220\u9664\u8DEF\u5F84\u3002\u66FE\u7ECF\u5B58\u5728\u5374\u6D88\u5931\u7684\u672C\u5730\u6587\u4EF6\u53EA\u63D0\u793A\u590D\u6838\uFF1B\u65E7\u670D\u52A1\u5668\u4E0D\u6267\u884C\u81EA\u52A8\u4E0A\u4F20\u3002").addToggle((t) => t.setValue(!!this.p.settings.autoConsistency).onChange(async (v) => {
-      this.p.settings.autoConsistency = v;
-      await this.p.persistConfig();
-      this.p.consistencyNextAt = 0;
-      this.p.renderProgress();
-    }));
+    new import_obsidian.Setting(e).setName("\u81EA\u52A8\u4E00\u81F4\u6027\u6838\u5BF9\u4E0E\u5B89\u5168\u8865\u4F20").setDesc("\u9ED8\u8BA4\u5173\u95ED\u3002\u524D\u53F0\u7A7A\u95F2\u65F6\u6BCF10\u5206\u949F\u6838\u5BF9\uFF1B\u4EC5\u8865\u7F3A\u5931\u6587\u4EF6\uFF0C\u4E0D\u8986\u76D6\u5DEE\u5F02\u6216\u51B2\u7A81\uFF0C\u4E0D\u590D\u6D3B\u5DF2\u5220\u9664\u8DEF\u5F84\u3002\u66FE\u7ECF\u5B58\u5728\u5374\u6D88\u5931\u7684\u672C\u5730\u6587\u4EF6\u53EA\u63D0\u793A\u590D\u6838\uFF1B\u65E7\u670D\u52A1\u5668\u4E0D\u6267\u884C\u81EA\u52A8\u4E0A\u4F20\u3002").addToggle((t) => t.setValue(!!this.p.settings.autoConsistency).onChange((v) => void this.p.setAutoConsistency(v)));
     new import_obsidian.Setting(e).setName("\u5B89\u5168\u8865\u9F50\u7F3A\u5931\u6587\u4EF6").addButton((b) => b.setButtonText("\u6838\u5BF9\u5E76\u5B89\u5168\u8865\u4F20").onClick(() => void this.p.runSafeConsistency()));
     new import_obsidian.Setting(e).setName("\u6587\u4EF6\u4E00\u81F4\u6027").addButton((b) => b.setButtonText("\u9010\u6587\u4EF6\u6838\u9A8C\u4E0E\u4FEE\u590D").onClick(() => void this.p.openConsistency()));
     new import_obsidian.Setting(e).addButton((b) => b.setButtonText("\u5237\u65B0\u72B6\u6001").onClick(() => this.p.renderProgress())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.p.retryQueue()));

@@ -11,4 +11,4 @@ export function transientTransferFailure(error){
 // A native adapter timeout does not cancel its original operation. Retry a whole
 // reconciliation pass after backoff, never blindly repeat an individual mutation.
 export function transientFilesystemFailure(error){return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message||error));}
-export function recoverableSyncFailure(error){return transientFilesystemFailure(error)||transientTransferFailure(error);}
+export function recoverableSyncFailure(error){return /^(?:Error: )?Cache staging busy$/.test(String(error?.message||error))||transientFilesystemFailure(error)||transientTransferFailure(error);}

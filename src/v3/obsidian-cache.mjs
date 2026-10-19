@@ -4,7 +4,7 @@ const ROOT='.realtime-lab-v3-cache';
 // Mobile-compatible adapter: each cache file is at most 32 KiB. Unlike repeated
 // vault.readBinary(file), a chunk read never loads the original full attachment.
 export class ObsidianBlobCache{
- constructor(adapter,{onOperation=(ms,failed)=>{},onStart=()=>((bytes,failed)=>{})}={}){this.onStart=onStart;this.onOperation=onOperation;this.adapter=adapter;this.busy=false;this.quota=null;this.reservations=Promise.resolve();this.metrics={quotaScans:0,quotaRecords:0,reservations:0,operations:0,failures:0,maxOperationMs:0,lastOperation:null};}
+ constructor(adapter,{onOperation=(ms,failed)=>{},onStart=()=>((bytes,failed)=>{})}={}){this.onStart=onStart;this.onOperation=onOperation;this.adapter=adapter;this.busy=false;this.staging=Promise.resolve();this.quota=null;this.reservations=Promise.resolve();this.metrics={quotaScans:0,quotaRecords:0,reservations:0,operations:0,failures:0,maxOperationMs:0,lastOperation:null};}
  // The cache is private to this plugin instance. Rebuild once on open, including
  // incomplete and retained blobs; never trust a durable quota counter after a crash.
  async scanQuota(){await this.mkdir(ROOT);const listing=await this.io('list',ROOT);let bytes=0,count=0;for(const folder of listing.folders){const p=folder+'/state.json';if(!await this.io('exists',p))continue;const m=JSON.parse(await this.io('read',p));if(!Number.isSafeInteger(m.size)||m.size<0||m.size>MAX_BLOB_BYTES)throw Error('Invalid cache quota metadata');bytes+=m.size;count++;this.metrics.quotaRecords++;}this.metrics.quotaScans++;return {bytes,count};}
@@ -22,6 +22,9 @@ export class ObsidianBlobCache{
  async finish(ref){await this.reserve(ref);if((await this.state(ref)).offset!==ref.size)throw Error('Cache incomplete');if(await hashSource(this.source(ref))!==ref.hash)throw Error('Cache hash mismatch');await this.io('write',this.base(ref)+'/state.json',JSON.stringify({size:ref.size,offset:ref.size,complete:true}));}
  source(ref){this.check(ref);return {size:ref.size,read:(p,n)=>this.read(ref,p,n)};}
  sink(ref){return {length:async()=>(await this.state(ref)).offset,write:(p,b)=>this.append(ref,p,b),read:(p,n)=>this.read(ref,p,n),commit:()=>this.finish(ref)};}
- async stage(source,{signal}={}){if(this.busy)throw Error('Cache staging busy');this.busy=true;try{if(source.size>MAX_BLOB_BYTES)throw Error('Image exceeds 16 MiB');const ref={size:source.size,hash:await hashSource(source,signal)};let s=await this.state(ref);while(!s.complete&&s.offset<ref.size){signal?.throwIfAborted();const b=await source.read(s.offset,Math.min(CHUNK_BYTES,ref.size-s.offset));await this.append(ref,s.offset,b);s=await this.state(ref);}if(!s.complete)await this.finish(ref);return ref;}finally{this.busy=false;}}
+ stage(source,{signal}={}){const job=this.staging.then(()=>this.stageExclusive(source,{signal}));this.staging=job.catch(()=>{});return job;}
+ // Queue local staging callers rather than failing legitimate overlapping reads.
+ // A rejected/aborted job must release the lane without discarding retained blobs.
+ async stageExclusive(source,{signal}={}){signal?.throwIfAborted();this.busy=true;try{if(source.size>MAX_BLOB_BYTES)throw Error('Image exceeds 16 MiB');const ref={size:source.size,hash:await hashSource(source,signal)};let s=await this.state(ref);while(!s.complete&&s.offset<ref.size){signal?.throwIfAborted();const b=await source.read(s.offset,Math.min(CHUNK_BYTES,ref.size-s.offset));await this.append(ref,s.offset,b);s=await this.state(ref);}if(!s.complete)await this.finish(ref);return ref;}finally{this.busy=false;}}
  async materialize(ref){if(!await this.has(ref))throw Error('Cache not verified');const out=new Uint8Array(ref.size);for(let p=0;p<ref.size;p+=CHUNK_BYTES)out.set(await this.read(ref,p,Math.min(CHUNK_BYTES,ref.size-p)),p);if(await hashSource({size:ref.size,read:async(p,n)=>out.subarray(p,p+n)})!==ref.hash)throw Error('Cache changed');return out.buffer;}
 }

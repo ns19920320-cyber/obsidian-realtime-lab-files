@@ -10013,6 +10013,7 @@ var ObsidianBlobCache = class {
     this.onOperation = onOperation;
     this.adapter = adapter;
     this.busy = false;
+    this.staging = Promise.resolve();
     this.quota = null;
     this.reservations = Promise.resolve();
     this.metrics = { quotaScans: 0, quotaRecords: 0, reservations: 0, operations: 0, failures: 0, maxOperationMs: 0, lastOperation: null };
@@ -10123,8 +10124,16 @@ var ObsidianBlobCache = class {
   sink(ref) {
     return { length: async () => (await this.state(ref)).offset, write: (p, b) => this.append(ref, p, b), read: (p, n) => this.read(ref, p, n), commit: () => this.finish(ref) };
   }
-  async stage(source, { signal } = {}) {
-    if (this.busy) throw Error("Cache staging busy");
+  stage(source, { signal } = {}) {
+    const job = this.staging.then(() => this.stageExclusive(source, { signal }));
+    this.staging = job.catch(() => {
+    });
+    return job;
+  }
+  // Queue local staging callers rather than failing legitimate overlapping reads.
+  // A rejected/aborted job must release the lane without discarding retained blobs.
+  async stageExclusive(source, { signal } = {}) {
+    signal?.throwIfAborted();
     this.busy = true;
     try {
       if (source.size > MAX_BLOB_BYTES) throw Error("Image exceeds 16 MiB");
@@ -10199,7 +10208,7 @@ function transientFilesystemFailure(error) {
   return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
 }
 function recoverableSyncFailure(error) {
-  return transientFilesystemFailure(error) || transientTransferFailure(error);
+  return /^(?:Error: )?Cache staging busy$/.test(String(error?.message || error)) || transientFilesystemFailure(error) || transientTransferFailure(error);
 }
 
 function changedPaths(doc2, transaction) {
@@ -11619,8 +11628,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       await this.flushLocalFiles();
       if (c.pending.length) await c.flushPending();
       await this.flushPathSafety();
-      await c.confirmUploads();
+      const confirmed = await c.confirmUploads();
       await this.reflect();
+      if (confirmed && !this.operationError && !this.fileFailures.size && !this.pendingRows().length) this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
       this.updateProgress();
     });
   }

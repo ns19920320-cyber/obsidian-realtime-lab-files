@@ -11,7 +11,7 @@ export function errorCode(error){const s=String(error?.message||error||'');if(!s
  if(/quota|capacity|容量/i.test(s))return 'quota';
  if(/snapshot|persist|本地保存|快照/i.test(s))return 'persistence';
  if(/invalid|无效|校验/i.test(s))return 'invalid-data';
- if(/Connect verified V3 metadata|METADATA_NOT_READY/.test(s))return 'metadata-not-ready';
+ if(/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s))return 'metadata-not-ready';
  if(/File system operation timed out|\b(?:EBUSY|EAGAIN|EMFILE|ENFILE)\b/i.test(s))return 'filesystem-transient';
  if(/network|fetch|load failed|disconnected|timeout|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s))return 'network-transient';
  return 'unknown-error';}

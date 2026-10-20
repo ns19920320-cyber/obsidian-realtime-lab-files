@@ -6,3 +6,4 @@ test('automatic retry is restricted to transient transport failures',()=>{
  for(const s of ['Identity request failed (401)','Server identity mismatch','Local snapshot save failed','quota exceeded','Invalid pending reference','Blob request failed (413)'])assert(!retry(Error(s)),s);
 });
 test('only the blob writer busy 409 is transient; publication conflict 409 is not retried blindly',()=>{assert(retry(Error('Blob request failed (409)')));assert(!retry(Error('Publish request failed (409)')));});
+test('cached resume prerequisite is transient but missing cache configuration is not',()=>{assert(retry(Error('Connect before resuming cached uploads')));assert(!retry(Error('Invalid cached upload configuration')));});

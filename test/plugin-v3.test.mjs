@@ -464,3 +464,23 @@ test('alpha37 isolated server restart drains hidden desktop queue and retains hi
  await wait(()=>c.ready&&!p.initializing&&c.pending.length===0&&content(next.doc,'synthetic-background/after-restart.json')?.version===version,7000);await p.queue;await p.backgroundTick();
  const history=await c.request('history',{path:'synthetic-background/history.json'});assert(history.length>=2);assert.equal(c.doc,doc);assert.equal(c.serverId,id);assert.equal(p.pendingRows().length,0);assert.equal(p.fileFailures.size,0);assert.deepEqual(new Uint8Array(mem.data.get('synthetic-background/history.json')),new Uint8Array([2]));
 });
+
+test('cached resume stale error clears only after confirmation without clearing queues or conflicts',async t=>{
+ const {p}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);await p.queue;
+ p.operationError='Connect before resuming cached uploads';p.retryAfter=0;await p.recoverQueue();await p.queue;
+ assert.equal(p.operationError,'');assert.equal(p.client.pending.length,0);
+ p.operationError='Invalid cached upload configuration';p.retryAfter=0;await p.recoverQueue();await p.queue;
+ assert.equal(p.operationError,'Invalid cached upload configuration');
+});
+test('queued retry rechecks connection before running cached upload recovery',async t=>{
+ const {p}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);await p.queue;
+ let release;const gate=new Promise(r=>release=r);t.after(()=>release?.());p.enqueue(()=>gate);
+ let called=0;const original=p.flushLocalFiles.bind(p);p.flushLocalFiles=async()=>{called++;return original()};
+ await p.retryQueue(false);p.client.ready=false;release();await p.queue;assert.equal(called,0);assert.equal(p.operationError,'');
+});
+test('cached resume error remains visible until a fresh server confirmation succeeds',async t=>{
+ const {p}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);await p.queue;
+ const confirm=p.client.confirmUploads.bind(p.client);p.client.confirmUploads=async()=>false;
+ p.operationError='Connect before resuming cached uploads';await p.retryQueue(false);await p.queue;assert.equal(p.operationError,'Connect before resuming cached uploads');
+ p.client.confirmUploads=confirm;await p.retryQueue(false);await p.queue;assert.equal(p.operationError,'');
+});

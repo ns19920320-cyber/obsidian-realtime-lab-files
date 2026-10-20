@@ -26,3 +26,13 @@ See `SOURCE-MAP.md` for source ownership and the release checklist, and `V3-FILE
 ## Server backups
 
 See [SERVER-BACKUPS.md](SERVER-BACKUPS.md) for the independent verified snapshot, retention, scheduled watcher and restore drill. These local server tools do not require a phone plugin update and do not enable backups in existing production services automatically.
+
+## Desktop background sync
+
+From alpha.37, desktop clients use a native Node timer to check connections and
+refresh remote diagnostics about every 10 seconds even when the window is hidden.
+Due retries retain their original ledger and versions. Mobile clients still need
+the foreground. OS sleep, process suspension and quitting Obsidian stop execution;
+no power blocker or background service is installed. Diagnostic reports keep the
+real visibility flag; an older server's completion summary may still require the
+foreground even when background connection and queue reports are fresh.

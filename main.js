@@ -11689,6 +11689,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   deviceLabel(d) {
     return this.settings.deviceLabels?.[d.deviceId] || (d.deviceId === this.settings.deviceId ? this.settings.deviceName : "") || d.platform + " \xB7 " + d.deviceId.slice(0, 8);
   }
+  auditMutation(path, folder = false) {
+    if (supportedFile(path) || folder && ([...this.app.vault.getFiles()].some((f) => f.path.startsWith(path + "/") && supportedFile(f.path)) || [...this.client?.doc.getMap("files").keys() || []].some((p) => p.startsWith(path + "/") && supportedFile(p)))) this.consistencyEpoch++;
+  }
   noteConsistencyPath(path) {
     if (supportedFile(path) && this.consistencySeen.size < 8192) this.consistencySeen.add(byteDigest(new TextEncoder().encode(path)));
   }
@@ -11725,7 +11728,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       if (this.conflictError) throw Error("\u51B2\u7A81\u72B6\u6001\u5C1A\u672A\u6838\u5B9E\uFF0C\u672A\u81EA\u52A8\u8865\u4F20");
       const report = await this.scanConsistency();
       this.consistencyReport = report;
-      if (!report.stable || !idle()) throw Error("\u6838\u5BF9\u671F\u95F4\u6587\u4EF6\u6216\u961F\u5217\u53D8\u5316\uFF0C\u7B49\u5F85\u4E0B\u6B21\u6838\u5BF9");
+      if (!report.stable) throw Error("\u6838\u5BF9\u671F\u95F4\u540C\u6B65\u5185\u5BB9\u53D8\u5316\uFF0C\u7B49\u5F85\u4E0B\u6B21\u6838\u5BF9");
+      if (!idle()) {
+        this.consistencyPhase = "waiting";
+        this.consistencyReason = this.isForeground() ? "queue-active" : "none";
+        this.consistencyStatus = this.isForeground() ? "\u6838\u5BF9\u6682\u7F13\uFF1A\u7B49\u5F85\u540C\u6B65\u961F\u5217\u7A7A\u95F2\u540E\u590D\u6838" : "\u6838\u5BF9\u6682\u7F13\uFF1A\u7B49\u5F85\u5F53\u524D\u5E93\u56DE\u5230\u524D\u53F0\u590D\u6838";
+        return;
+      }
       if (this.settings.consistencySeen && (!Array.isArray(this.settings.consistencySeen) || this.settings.consistencySeen.length > 8192 || this.settings.consistencySeen.some((v) => !/^[a-f0-9]{64}$/.test(v)))) throw Error("\u4E00\u81F4\u6027\u57FA\u7EBF\u65E0\u6548\uFF0C\u672A\u6267\u884C\u8865\u4F20");
       const confirmedHolds = /* @__PURE__ */ new Set();
       for (const row of report.rows.filter((r2) => r2.status === "equal" && (this.settings.consistencyHolds || []).includes(r2.path) && !this.conflicts.some((c2) => c2.path === r2.path))) {
@@ -11798,7 +11807,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.consistencyStatus = "\u6838\u5BF9\u6682\u7F13\uFF1A" + this.safeError(e);
     } finally {
       this.consistencyBusy = false;
-      this.consistencyNextAt = Date.now() + 6e5;
+      this.consistencyNextAt = Date.now() + (this.consistencyPhase === "complete" ? 6e5 : this.consistencyReason === "changed" ? 3e4 : 6e4);
       this.updateProgress();
     }
   }
@@ -12486,7 +12495,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.addCommand({ id: "history", name: "\u67E5\u770B\u4E0E\u6062\u590D\u5386\u53F2\u7248\u672C", callback: () => void this.history() });
     this.addCommand({ id: "stop", name: "\u65AD\u5F00\u6D4B\u8BD5\u5E93\u540C\u6B65", callback: () => this.stop() });
     for (const event of ["create", "modify", "delete"]) this.registerEvent(this.app.vault.on(event, (f) => {
-      this.consistencyEpoch++;
+      this.auditMutation(f.path, !(f instanceof import_obsidian.TFile));
       if (this.settings.autoConsistency && event !== "delete") this.noteConsistencyPath(f.path);
       if (f instanceof import_obsidian.TFile) this.fingerprints.delete(f.path);
       if (!this.client || !this.syncedOnce || this.initializing) return;
@@ -12506,7 +12515,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.fileUploads.request();
     }));
     this.registerEvent(this.app.vault.on("rename", (f, old) => {
-      this.consistencyEpoch++;
+      this.auditMutation(old, !(f instanceof import_obsidian.TFile));
+      this.auditMutation(f.path, !(f instanceof import_obsidian.TFile));
       if (this.settings.autoConsistency) {
         this.noteConsistencyPath(old);
         this.noteConsistencyPath(f.path);
@@ -12527,12 +12537,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       }
     }));
     this.registerEvent(this.app.workspace.on("editor-change", (editor, view) => {
-      this.consistencyEpoch++;
       const c = this.client, p = view.file?.path;
       if (!c || this.stopping || !this.syncedOnce || !p || this.writing.has(p) || this.pathBlocked(p) || !supportedFile(p) || content(c.doc, p)?.kind !== "text") return;
       const data = editor.getValue();
       if (new TextEncoder().encode(data).length > MAX_INLINE_NOTE) return;
       if (c.doc.getText("text:" + p).toString() === data) return;
+      this.auditMutation(p);
       try {
         const trial = new Doc();
         try {

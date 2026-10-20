@@ -501,3 +501,25 @@ test('own popout foreground is observed while another vault popout cannot enable
  window.activeDocument={hidden:false,defaultView:{app:p.app}};assert(p.isForeground());p.settings.autoConsistency=true;p.consistencyNextAt=0;let runs=0;p.runSafeConsistency=async()=>runs++;p.resumeForeground=()=>{};p.reportDiagnostic=async()=>{};p.refreshConflicts=async()=>{};p.foregroundTick();assert.equal(runs,1);
  window.activeDocument={hidden:false,defaultView:{app:{}}};assert(!p.isForeground());p.consistencyNextAt=0;p.foregroundTick();assert.equal(runs,1);
 });
+
+test('excluded file events do not invalidate an equal audit while real note changes still do',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('synthetic-audit.md',bytesSource(new TextEncoder().encode('same')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;await wait(()=>!p.reflection.queued);p.settings.autoConsistency=true;
+ const epoch=p.consistencyEpoch,read=mem.v.readBinary;let events=0;mem.v.readBinary=async f=>{if(f.path==='synthetic-audit.md'){events++;await mem.v.create('excluded-'+events+'.canvas','{}');}return read(f)};
+ await p.runSafeConsistency();assert(events>=2);assert.equal(p.consistencyEpoch,epoch);assert.equal(p.consistencyPhase,'complete');assert.equal(p.consistencyReason,'none');await p.reportDiagnostic();const d=(await other.request('device-diagnostics')).devices.find(d=>d.deviceId===p.settings.deviceId);assert(d.details.audit.current);assert.equal(d.details.audit.counts.equal,1);
+ p.auditMutation('synthetic-audit.md');assert.equal(p.consistencyEpoch,epoch+1);
+});
+test('visibility loss after a stable scan is waiting rather than changed and rechecks after foreground returns',async t=>{
+ const {p}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;await wait(()=>!p.reflection.queued);let visible=true;p.isForeground=()=>visible;const scan=p.scanConsistency.bind(p);let first=true;p.scanConsistency=async()=>{const r=await scan();if(first){first=false;visible=false;}return r};
+ await p.runSafeConsistency();assert.equal(p.consistencyReport.stable,true);assert.equal(p.consistencyPhase,'waiting');assert.notEqual(p.consistencyReason,'changed');assert(p.consistencyStatus.includes('前台'));assert(p.consistencyNextAt-Date.now()<=60000);
+ visible=true;await p.runSafeConsistency();assert.equal(p.consistencyPhase,'complete');assert.equal(p.consistencyReason,'none');
+});
+test('genuine content mutation defers safely and converges on a bounded retry without writing bodies',async t=>{
+ const {p,mem,other}=await env(t);await other.putFile('synthetic-stable.md',bytesSource(new TextEncoder().encode('preserved')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;await wait(()=>!p.reflection.queued);const read=mem.v.readBinary;let once=true;mem.v.readBinary=async f=>{if(once){once=false;p.auditMutation(f.path);}return read(f)};const before=mem.data.get('synthetic-stable.md'),history=await other.request('history',{path:'synthetic-stable.md'});
+ await p.runSafeConsistency();assert.equal(p.consistencyPhase,'deferred');assert.equal(p.consistencyReason,'changed');assert(p.consistencyNextAt-Date.now()<=30000);
+ await p.runSafeConsistency();assert.equal(p.consistencyPhase,'complete');assert.equal(mem.data.get('synthetic-stable.md'),before);assert.deepEqual(await other.request('history',{path:'synthetic-stable.md'}),history);assert.equal(p.client.pending.length,0);
+});
+test('stable audit interrupted by temporary queue activity reports queue wait then converges',async t=>{
+ const {p}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;await wait(()=>!p.reflection.queued);const scan=p.scanConsistency.bind(p);let once=true;p.scanConsistency=async()=>{const r=await scan();if(once){once=false;p.localOperations++;}return r};
+ await p.runSafeConsistency();assert.equal(p.consistencyReport.stable,true);assert.equal(p.consistencyPhase,'waiting');assert.equal(p.consistencyReason,'queue-active');assert(p.consistencyNextAt-Date.now()<=60000);
+ p.localOperations--;await p.runSafeConsistency();assert.equal(p.consistencyPhase,'complete');assert.equal(p.consistencyReason,'none');
+});

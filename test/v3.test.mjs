@@ -156,3 +156,12 @@ test('two offline devices retain real branches and linear queued revisions acros
  const aa=await e.add({state:stateA,serverId:a.serverId,blobCache:new DiskBlobCache(path.join(e.dir,'cache-a')),pending:pendingA,onPersist:async v=>stateA=v,onPending:async v=>pendingA=structuredClone(v)});await aa.flushPending();await e.restart();await wait(()=>aa.ready);
  const bb=await e.add({state:stateB,serverId:b.serverId,blobCache:new DiskBlobCache(path.join(e.dir,'cache-b')),pending:pendingB,onPersist:async v=>stateB=v,onPending:async v=>pendingB=structuredClone(v)});await bb.flushPending();await bb.request('barrier');const h=await bb.request('history',{path:'offline.md'}),r=(await bb.request('conflicts')).find(r=>r.path==='offline.md');for(const hash of [...aHashes,...bHashes])assert(h.some(v=>v.hash===hash));assert.equal(r.versions.length,2);assert.equal(pendingA.items.length,0);assert.equal(pendingB.items.length,0);const heads=r.versions.map(id=>h.find(v=>v.id===id).hash);assert(heads.includes(aHashes.at(-1))&&heads.includes(bHashes.at(-1)));const final=content(e.server.doc,'offline.md');await e.restart();await wait(()=>bb.ready);assert.deepEqual(content(e.server.doc,'offline.md'),final);assert.equal((await bb.request('conflicts'))[0].versions.length,2);
 });
+
+test('cached upload disconnected prerequisite preserves durable versions and resumes after verification',async t=>{
+ const {DiskBlobCache}=await import('../src/v3/disk-cache.mjs');const e=await setup(t);let pending,saved;
+ const a=await e.add({blobCache:new DiskBlobCache(path.join(e.dir,'resume-prerequisite')),onPending:async v=>pending=structuredClone(v),onPersist:async v=>saved=v});
+ await a.stageFile('synthetic-resume.md',source(new TextEncoder().encode('synthetic offline version')));const before=structuredClone(pending);
+ a.metadataVerified=false;await assert.rejects(a.flushPending(),e=>e.code==='METADATA_NOT_READY');assert.deepEqual(pending,before);assert.equal(a.pending.length,1);assert.equal(a.binaryBusy,false);
+ a.metadataVerified=true;await a.flushPending();await a.confirmUploads();assert.equal(pending.items.length,0);assert(saved);const h=await a.request('history',{path:'synthetic-resume.md'});assert(h.some(x=>x.version===before.items[0].version));
+ a.ready=false;await a.flushPending();assert.equal(a.pending.length,0);
+});

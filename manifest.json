@@ -1,7 +1,7 @@
 {
   "id": "realtime-lab-v3-files",
   "name": "Realtime Lab Files",
-  "version": "0.5.0-alpha.37",
+  "version": "0.5.0-alpha.38",
   "minAppVersion": "1.7.2",
   "description": "Versioned vault sync with explicit initialization, durable queues and history. Custom vault names supported.",
   "author": "Local development",

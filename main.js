@@ -76,7 +76,7 @@ function transientTransferFailure(error) {
   if (error?.code === "METADATA_NOT_READY") return true;
   if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(String(error?.message || error))) return true;
   const s = String(error?.message || error);
-  if (/^(?:Error: )?Connect verified V3 metadata before transferring blobs$/.test(s)) return true;
+  if (/^(?:Error: )?(?:Connect verified V3 metadata before transferring blobs|Connect before resuming cached uploads)$/.test(s)) return true;
   if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
   return /Foreground reconnect; local edits retained|blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
 }
@@ -101,7 +101,7 @@ function errorCode(error) {
   if (/quota|capacity|容量/i.test(s)) return "quota";
   if (/snapshot|persist|本地保存|快照/i.test(s)) return "persistence";
   if (/invalid|无效|校验/i.test(s)) return "invalid-data";
-  if (/Connect verified V3 metadata|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
+  if (/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
   if (/File system operation timed out|\b(?:EBUSY|EAGAIN|EMFILE|ENFILE)\b/i.test(s)) return "filesystem-transient";
   if (/network|fetch|load failed|disconnected|timeout|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s)) return "network-transient";
   return "unknown-error";
@@ -11368,8 +11368,14 @@ var VaultClientV3 = class extends VaultClient {
     }
   }
   async flushPending(options) {
+    if (!this.pending.length) return;
     if (this.binaryBusy) throw Error("Binary operation busy");
-    if (!this.blobCache || !this.onPending || !this.ready) throw Error("Connect before resuming cached uploads");
+    if (!this.blobCache || !this.onPending) throw Error("Invalid cached upload configuration");
+    if (!this.ready || !this.metadataVerified) {
+      const error = Error("Connect before resuming cached uploads");
+      error.code = "METADATA_NOT_READY";
+      throw error;
+    }
     this.binaryBusy = true;
     const blocked = /* @__PURE__ */ new Set();
     let failure;
@@ -11933,6 +11939,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       return;
     }
     this.enqueue(async () => {
+      if (this.client !== c || this.stopping || !c.ready || !c.metadataVerified) return;
       if (!this.syncedOnce && this.prepareConnection) {
         await this.prepareConnection();
         return;
@@ -12759,7 +12766,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.enqueue(this.prepareConnection);
     } });
     this.prepareConnection = async () => {
-      if (this.client !== c) return;
+      if (this.client !== c || this.stopping || !c.ready || !c.metadataVerified) return;
       this.initializing = true;
       try {
         await this.flushLocalFiles();

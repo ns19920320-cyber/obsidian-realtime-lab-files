@@ -11357,7 +11357,7 @@ var VaultClientV3 = class extends VaultClient {
     this.binaryBusy = true;
     try {
       const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), base: previous ? { kind: fileKind(path), hash: previous.hash, size: previous.size, version: previous.version } : options && Object.hasOwn(options, "base") ? options.base : content(this.doc, path) };
-      if (previous?.hash === ref.hash && previous?.size === ref.size) return ref;
+      if (previous?.hash === ref.hash && previous?.size === ref.size || !previous && sameContent(item.base, { kind: fileKind(path), ...ref })) return ref;
       const next = [...this.pending, item];
       await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
       this.pending = next;

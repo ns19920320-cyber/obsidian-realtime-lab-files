@@ -14,3 +14,7 @@ export function continueConflictReview(review,before,after,list){
  if(!previous||!next||!review.versions.includes(previous.id))return null;
  return {...review,versions:[...new Set(review.versions.map(id=>id===previous.id?next.id:id))]};
 }
+
+// An unchanged historical payload on a stale base is a replay, not a new branch.
+// A deliberate revert based on the current head remains an ordinary publication.
+export function historicalReplay(current,incoming,base,list){return !!current&&!sameContent(current,base??null)&&!sameContent(current,incoming)&&list.some(v=>!v.deleted&&sameContent(v,incoming));}

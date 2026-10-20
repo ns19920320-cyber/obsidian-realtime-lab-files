@@ -33,6 +33,43 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+function desktopBackgroundEnabled(platform) {
+  return !platform?.isMobileApp && !platform?.isIosApp && !platform?.isAndroidApp && !!(platform?.isDesktopApp || platform?.isWin || platform?.isMacOS || platform?.isLinux);
+}
+function startDesktopHeartbeat({ timers, tick, intervalMs = 1e4 }) {
+  let stopped = false, busy = false;
+  const run = async () => {
+    if (stopped || busy) return;
+    busy = true;
+    try {
+      await tick();
+    } catch {
+    } finally {
+      busy = false;
+    }
+  };
+  const timer = timers.setInterval(() => void run(), intervalMs);
+  timer?.unref?.();
+  return () => {
+    stopped = true;
+    timers.clearInterval(timer);
+  };
+}
+async function boundedDesktopCheck({ client, timers, timeoutMs = 2e4, isCurrent = () => true }) {
+  let deadline;
+  try {
+    return await Promise.race([client.checkConnection(), new Promise((resolve) => {
+      deadline = timers.setTimeout(() => {
+        if (isCurrent() && !client.stopped && !client.transportBlocked && !client.terminalCloseCode) client.resume();
+        resolve(false);
+      }, timeoutMs);
+      deadline?.unref?.();
+    })]);
+  } finally {
+    timers.clearTimeout(deadline);
+  }
+}
+
 var RECOVERY_DIAGNOSTICS_CAPABILITY = "device-recovery-diagnostics-v1";
 
 function transientTransferFailure(error) {
@@ -11431,7 +11468,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (removed || progress) this.lastQueueProgressAt = Date.now();
   }
   recoveryStatus() {
-    return stallStatus({ pending: this.pendingRows().length, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden });
+    return stallStatus({ pending: this.pendingRows().length, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden && !desktopBackgroundEnabled(import_obsidian.Platform) });
   }
   performance = new PerformanceCounters();
   settings = { protocol: 3, capability: FILE_REFS_CAPABILITY, url: "ws://127.0.0.1:17241", token: "", state: "", enabled: false };
@@ -11463,6 +11500,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   diagnosticLastSent = 0;
   diagnosticTimer;
   diagnosticError = "";
+  desktopHeartbeatStop;
+  desktopTimers;
   uiUnloaded = false;
   lastForegroundTick = Date.now();
   lastWakeAt = 0;
@@ -11579,7 +11618,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A" + this.conflicts.length });
     if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
-    if ([this.operationError, ...this.fileFailures.values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u8BF7\u4FDD\u6301 Obsidian \u5728\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
+    if ([this.operationError, ...this.fileFailures.values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u684C\u9762\u7AEF\u4FDD\u6301 Obsidian \u8FD0\u884C\u5373\u53EF\uFF0C\u624B\u673A\u7AEF\u9700\u4FDD\u6301\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
     if (this.pendingRows().length || this.ledger()?.items.size) e.createEl("p", { text: stallText(this.recoveryStatus()) });
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
     if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
@@ -11599,6 +11638,29 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     } else void c.checkConnection();
     void this.recoverQueue();
     this.updateProgress();
+  }
+  async backgroundTick() {
+    const c = this.client;
+    if (!desktopBackgroundEnabled(import_obsidian.Platform) || !document.hidden || this.uiUnloaded || this.stopping || !c || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
+    await boundedDesktopCheck({ client: c, timers: this.desktopTimers, isCurrent: () => this.client === c && !this.uiUnloaded && !this.stopping });
+    if (this.client !== c || this.uiUnloaded || this.stopping || !c.ready) return;
+    void c.confirmUploads().catch(() => {
+    });
+    void this.recoverQueue().catch(() => {
+    });
+    void this.refreshConflicts().catch(() => {
+    });
+    await this.reportDiagnostic();
+  }
+  startDesktopHeartbeat() {
+    if (!desktopBackgroundEnabled(import_obsidian.Platform)) return;
+    this.desktopHeartbeatStop?.();
+    try {
+      this.desktopTimers = require("timers");
+    } catch {
+      this.desktopTimers = window;
+    }
+    this.desktopHeartbeatStop = startDesktopHeartbeat({ timers: this.desktopTimers, tick: () => this.backgroundTick() });
   }
   foregroundTick() {
     if (document.hidden) return;
@@ -12466,6 +12528,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       void this.reportDiagnostic();
     });
     this.registerInterval(window.setInterval(() => this.foregroundTick(), 1e4));
+    this.startDesktopHeartbeat();
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.enabled) void this.start();
       else this.setConnectionStatus("\u672A\u8FDE\u63A5\uFF08\u81EA\u52A8\u8FDE\u63A5\u5DF2\u5173\u95ED\uFF09");
@@ -13384,6 +13447,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   onunload() {
     this.uiUnloaded = true;
+    this.desktopHeartbeatStop?.();
     window.clearTimeout(this.safetyTimer);
     window.clearTimeout(this.diagnosticTimer);
     this.badgeObserver?.disconnect();

@@ -165,3 +165,20 @@ test('cached upload disconnected prerequisite preserves durable versions and res
  a.metadataVerified=true;await a.flushPending();await a.confirmUploads();assert.equal(pending.items.length,0);assert(saved);const h=await a.request('history',{path:'synthetic-resume.md'});assert(h.some(x=>x.version===before.items[0].version));
  a.ready=false;await a.flushPending();assert.equal(a.pending.length,0);
 });
+
+test('stale historical replay keeps current head and history without creating another conflict, including after restart',async t=>{
+ const e=await setup(t),a=await e.add(),s=x=>source(new TextEncoder().encode(x)),p='synthetic-replay.md';await a.putFile(p,s('morning old body'),{base:null});const old=content(a.doc,p);await a.putFile(p,s('new body with additional paragraphs'),{base:old});const latest=content(a.doc,p),history=await a.request('history',{path:p});const version=crypto.randomUUID();
+ await a.putFile(p,s('morning old body'),{base:null,version});await a.request('barrier');assert.deepEqual(content(e.server.doc,p),latest);assert.deepEqual(await a.request('history',{path:p}),history);assert.deepEqual(await a.request('conflicts'),[]);assert(a.doc.getMap('blobVersions').has(version));
+ await e.restart();await wait(()=>a.ready);await a.putFile(p,s('morning old body'),{base:null,version});assert.deepEqual(content(e.server.doc,p),latest);assert.deepEqual(await a.request('history',{path:p}),history);assert.deepEqual(await a.request('conflicts'),[]);
+ // Explicitly restoring historical bytes from the current head is still allowed.
+ await a.putFile(p,s('morning old body'),{base:content(a.doc,p)});assert.equal(content(e.server.doc,p).hash,old.hash);assert.deepEqual(await a.request('conflicts'),[]);
+});
+test('duplicate payload on a stale base does not multiply history or conflict flags',async t=>{
+ const e=await setup(t),a=await e.add(),s=x=>source(new TextEncoder().encode(x)),p='synthetic-repeat.md';await a.putFile(p,s('base'),{base:null});const base=content(a.doc,p);await a.putFile(p,s('latest'),{base});const latest=content(a.doc,p),history=await a.request('history',{path:p});for(let i=0;i<3;i++)await a.putFile(p,s('latest'),{base});assert.deepEqual(content(e.server.doc,p),latest);assert.deepEqual(await a.request('history',{path:p}),history);assert.deepEqual(await a.request('conflicts'),[]);
+});
+test('genuinely new offline content still preserves both conflict branches and existing review is never auto-cleared',async t=>{
+ const e=await setup(t),a=await e.add(),s=x=>source(new TextEncoder().encode(x)),p='synthetic-real-fork.md';await a.putFile(p,s('base'),{base:null});const base=content(a.doc,p);await a.putFile(p,s('edit one'),{base});await a.putFile(p,s('independent offline edit'),{base});const reviews=await a.request('conflicts'),history=await a.request('history',{path:p}),head=content(a.doc,p);assert.equal(reviews.length,1);assert.equal(reviews[0].versions.length,2);await a.putFile(p,s('base'),{base:null});assert.deepEqual(await a.request('conflicts'),reviews);assert.deepEqual(await a.request('history',{path:p}),history);assert.deepEqual(content(a.doc,p),head);
+});
+test('unchanged cached base does not enter the durable upload queue',async t=>{
+ const {DiskBlobCache}=await import('../src/v3/disk-cache.mjs');const e=await setup(t);let pending,writes=0;const a=await e.add({blobCache:new DiskBlobCache(path.join(e.dir,'unchanged-cache')),onPending:async v=>{pending=structuredClone(v);writes++},onPersist:async()=>{}}),b=new TextEncoder().encode('same');await a.putFile('synthetic-same.md',source(b),{base:null});const before=writes;await a.stageFile('synthetic-same.md',source(b));assert.equal(a.pending.length,0);assert.equal(writes,before);
+});

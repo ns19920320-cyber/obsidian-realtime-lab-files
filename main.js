@@ -11632,7 +11632,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   resumeForeground(force = true) {
     const c = this.client;
-    if (document.hidden || !c || this.stopping || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
+    if (!this.isForeground() || !c || this.stopping || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
     const now = Date.now();
     if (force && now - this.lastWakeAt < 1500) return;
     this.lastForegroundTick = now;
@@ -11648,6 +11648,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   async backgroundTick() {
     const c = this.client;
     if (!desktopBackgroundEnabled(import_obsidian.Platform) || !document.hidden || this.uiUnloaded || this.stopping || !c || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
+    if (this.isForeground()) {
+      this.foregroundTick();
+      return;
+    }
     await boundedDesktopCheck({ client: c, timers: this.desktopTimers, isCurrent: () => this.client === c && !this.uiUnloaded && !this.stopping });
     if (this.client !== c || this.uiUnloaded || this.stopping || !c.ready) return;
     void c.confirmUploads().catch(() => {
@@ -11669,7 +11673,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.desktopHeartbeatStop = startDesktopHeartbeat({ timers: this.desktopTimers, tick: () => this.backgroundTick() });
   }
   foregroundTick() {
-    if (document.hidden) return;
+    if (!this.isForeground()) return;
     const gap = Date.now() - this.lastForegroundTick;
     this.lastForegroundTick = Date.now();
     this.resumeForeground(gap > 2e4);
@@ -11702,8 +11706,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   async runSafeConsistency() {
     const c = this.client;
-    if (this.consistencyBusy || !c?.ready || this.stopping || this.uiUnloaded || document.hidden || !this.syncedOnce || this.initializing) return;
-    const idle = () => this.client === c && c.ready && !this.stopping && !this.uiUnloaded && !document.hidden && !this.pendingRows().length && !this.reflection.queued && !this.downloadPaths.size && !this.localOperations && !c.binaryBusy;
+    if (this.consistencyBusy || !c?.ready || this.stopping || this.uiUnloaded || !this.isForeground() || !this.syncedOnce || this.initializing) return;
+    const idle = () => this.client === c && c.ready && !this.stopping && !this.uiUnloaded && this.isForeground() && !this.pendingRows().length && !this.reflection.queued && !this.downloadPaths.size && !this.localOperations && !c.binaryBusy;
     if (!idle()) {
       this.consistencyPhase = "waiting";
       this.consistencyReason = "queue-active";
@@ -12074,7 +12078,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.diagnosticBusy = true;
     try {
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: !document.hidden, ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: this.isForeground(), ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -12398,7 +12402,33 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
     m.open();
   }
+  currentRuntime() {
+    const active = this.app?.plugins?.plugins?.["realtime-lab-v3-files"];
+    return active && active.app === this.app ? active : this;
+  }
+  isForeground() {
+    if (!document.hidden) return true;
+    const d = window.activeDocument;
+    return !!d && d !== document && !d.hidden && d.defaultView?.app === this.app;
+  }
+  async onExternalSettingsChange() {
+    if (this.uiUnloaded || this.currentRuntime() !== this) return;
+    await this.configWrites;
+    const saved = await this.loadData();
+    if (!saved || saved.protocol !== 3 || saved.capability !== FILE_REFS_CAPABILITY || saved.deviceId !== this.settings.deviceId || saved.serverId !== this.settings.serverId || saved.url !== this.settings.url || typeof saved.autoConsistency !== "boolean" || saved.autoConsistency === !!this.settings.autoConsistency) return;
+    this.settings.autoConsistency = saved.autoConsistency;
+    this.consistencyNextAt = 0;
+    this.renderProgress();
+    await this.reportDiagnostic();
+    if (saved.autoConsistency) void this.runSafeConsistency();
+  }
   async setAutoConsistency(value) {
+    const current = this.currentRuntime();
+    if (current !== this) return current.setAutoConsistency(value);
+    if (this.uiUnloaded) {
+      new import_obsidian.Notice("\u8BBE\u7F6E\u9875\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u5F53\u524D\u63D2\u4EF6\u8BBE\u7F6E");
+      return;
+    }
     this.settings.autoConsistency = value;
     this.consistencyNextAt = 0;
     try {
@@ -13468,9 +13498,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
 };
 var Settings = class extends import_obsidian.PluginSettingTab {
-  constructor(app, p) {
-    super(app, p);
-    this.p = p;
+  constructor(app, owner) {
+    super(app, owner);
+    this.owner = owner;
+  }
+  get p() {
+    return this.owner.currentRuntime();
   }
   display() {
     const e = this.containerEl;

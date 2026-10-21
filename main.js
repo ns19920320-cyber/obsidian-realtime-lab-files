@@ -11645,7 +11645,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   resumeForeground(force = true) {
     const c = this.client;
-    if (!this.isForeground() || !c || this.stopping || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
+    if (!this.isForeground() || !c || !c.connectionStartedAt || this.stopping || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
     const now = Date.now();
     if (force && now - this.lastWakeAt < 1500) return;
     this.lastForegroundTick = now;
@@ -11660,7 +11660,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   async backgroundTick() {
     const c = this.client;
-    if (!desktopBackgroundEnabled(import_obsidian.Platform) || this.uiUnloaded || this.stopping || !c || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
+    if (!desktopBackgroundEnabled(import_obsidian.Platform) || this.uiUnloaded || this.stopping || !c || !c.connectionStartedAt || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
     await boundedDesktopCheck({ client: c, timers: this.desktopTimers, isCurrent: () => this.client === c && !this.uiUnloaded && !this.stopping });
     if (this.client !== c || this.uiUnloaded || this.stopping || !c.ready) return;
     void c.confirmUploads().catch(() => {

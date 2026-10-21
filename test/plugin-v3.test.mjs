@@ -545,3 +545,8 @@ test('new remote path snapshot atomically retains receive intent before reflecti
  await other.putFile('synthetic-receive/new.md',bytesSource(new TextEncoder().encode('durable new remote body')));await wait(()=>entered&&content(p.client.doc,'synthetic-receive/new.md'));p.client.flushPersist(true);assert(await p.client.persistence.wait());
  assert(p.saved.receivePending.paths.includes('synthetic-receive/new.md'));assert(!mem.files.has('synthetic-receive/new.md'));release();await p.reflection.idle?.();
 });
+
+test('foreground and native heartbeat cannot bypass missing-file startup confirmation',async t=>{
+ const {p,mem}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;const f=await mem.v.create('synthetic-confirm.md','preserved original');await p.queue;await p.stop();mem.files.delete(f.path);mem.data.delete(f.path);
+ let decide,asked=false;p.resolveMissing=async()=>{asked=true;return await new Promise(r=>decide=r);};t.after(()=>decide?.('cancel'));const starting=p.start();await wait(()=>asked);const c=p.client;assert(!c.ws);p.resumeForeground(true);await p.backgroundTick();assert(!c.ws,'no handshake before explicit recovery direction');decide('restore');await starting;await wait(()=>c.ready&&p.syncedOnce);assert.equal(c.serverId,p.settings.serverId);
+});

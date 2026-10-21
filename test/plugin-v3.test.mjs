@@ -528,3 +528,20 @@ test('historical replay drains only after confirmation and retains local recover
  const {p,mem,other}=await env(t),name='synthetic-stale-body.md',old='synthetic historical body',latest='synthetic historical body\nnew additional content';await other.putFile(name,bytesSource(new TextEncoder().encode(old)),{base:null});const base=content(other.doc,name);await other.putFile(name,bytesSource(new TextEncoder().encode(latest)),{base});await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has(name));await p.queue;await wait(()=>!p.reflection.queued);const history=await other.request('history',{path:name});
  mem.data.set(name,old);mem.files.get(name).stat.size=old.length;p.fingerprints.delete(name);await p.client.stageFile(name,bytesSource(new TextEncoder().encode(old)),{base:null});assert.equal(p.client.pending.length,1);await p.client.flushPending();await p.client.confirmUploads();await p.reflect();await p.queue;assert.equal(p.client.pending.length,0);assert.equal(p.saved.pending.items.length,0);assert.equal(mem.data.get(name),latest);assert.deepEqual(await other.request('history',{path:name}),history);assert.deepEqual(await other.request('conflicts'),[]);assert([...mem.data].some(([n,v])=>n.startsWith('.realtime-lab-v3-recovery/')&&(typeof v==='string'?v:new TextDecoder().decode(v))===old));
 });
+
+test('desktop native watchdog recovers foreground silent disconnection without browser ticks or input',async t=>{
+ const native=await import('node:timers');const {p,mem,server,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;
+ const c=p.client,doc=c.doc,old=c.ws;p.desktopHeartbeatStop?.();globalThis.document.hidden=false;
+ c.ws.send=()=>{};await c.stageFile('synthetic-foreground/pending.json',bytesSource(new Uint8Array([42,43])));const version=c.pending[0].version;
+ p.desktopTimers={...native,setTimeout:(f,n)=>native.setTimeout(f,Math.min(n,40))};
+ await p.backgroundTick();await wait(()=>c.ws!==old&&c.ready);await p.backgroundTick();
+ await wait(()=>!p.initializing&&c.pending.length===0&&content(server.doc,'synthetic-foreground/pending.json')?.version===version,5000);await p.queue;await p.backgroundTick();
+ const row=(await other.request('device-diagnostics')).devices.find(d=>d.deviceId===p.settings.deviceId);assert(row.connected&&row.fresh);assert.equal(row.queued,0);assert.equal(row.failed,0);assert.equal(row.foreground,true);assert.equal(c.doc,doc);
+});
+
+test('new remote path snapshot atomically retains receive intent before reflection can start',async t=>{
+ const {p,mem,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;
+ const original=p.reflect.bind(p);let release,entered=false;const gate=new Promise(r=>release=r);p.reflect=async()=>{entered=true;await gate;return original();};t.after(()=>release?.());
+ await other.putFile('synthetic-receive/new.md',bytesSource(new TextEncoder().encode('durable new remote body')));await wait(()=>entered&&content(p.client.doc,'synthetic-receive/new.md'));p.client.flushPersist(true);assert(await p.client.persistence.wait());
+ assert(p.saved.receivePending.paths.includes('synthetic-receive/new.md'));assert(!mem.files.has('synthetic-receive/new.md'));release();await p.reflection.idle?.();
+});

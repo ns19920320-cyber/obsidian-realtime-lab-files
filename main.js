@@ -33,241 +33,6 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
-function desktopBackgroundEnabled(platform) {
-  return !platform?.isMobileApp && !platform?.isIosApp && !platform?.isAndroidApp && !!(platform?.isDesktopApp || platform?.isWin || platform?.isMacOS || platform?.isLinux);
-}
-function startDesktopHeartbeat({ timers, tick, intervalMs = 1e4 }) {
-  let stopped = false, busy = false;
-  const run = async () => {
-    if (stopped || busy) return;
-    busy = true;
-    try {
-      await tick();
-    } catch {
-    } finally {
-      busy = false;
-    }
-  };
-  const timer = timers.setInterval(() => void run(), intervalMs);
-  timer?.unref?.();
-  return () => {
-    stopped = true;
-    timers.clearInterval(timer);
-  };
-}
-async function boundedDesktopCheck({ client, timers, timeoutMs = 2e4, isCurrent = () => true }) {
-  let deadline;
-  try {
-    return await Promise.race([client.checkConnection(), new Promise((resolve) => {
-      deadline = timers.setTimeout(() => {
-        if (isCurrent() && !client.stopped && !client.transportBlocked && !client.terminalCloseCode) client.resume();
-        resolve(false);
-      }, timeoutMs);
-      deadline?.unref?.();
-    })]);
-  } finally {
-    timers.clearTimeout(deadline);
-  }
-}
-
-var RECOVERY_DIAGNOSTICS_CAPABILITY = "device-recovery-diagnostics-v1";
-
-function transientTransferFailure(error) {
-  if (error?.code === "METADATA_NOT_READY") return true;
-  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(String(error?.message || error))) return true;
-  const s = String(error?.message || error);
-  if (/^(?:Error: )?(?:Connect verified V3 metadata before transferring blobs|Connect before resuming cached uploads)$/.test(s)) return true;
-  if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
-  return /Foreground reconnect; local edits retained|blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
-}
-function transientFilesystemFailure(error) {
-  return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
-}
-function recoverableSyncFailure(error) {
-  return /^(?:Error: )?Cache staging busy$/.test(String(error?.message || error)) || transientFilesystemFailure(error) || transientTransferFailure(error);
-}
-
-var DIAGNOSTIC_DETAILS_CAPABILITY = "device-diagnostic-details-v1";
-var REASON_CODES = ["cache-staging-busy", "filesystem-transient", "network-transient", "metadata-not-ready", "authentication", "identity", "quota", "persistence", "invalid-data", "unknown-error", "initializing", "receiving", "uploading", "local-operation", "transferring", "saving", "recovering", "stopping", "conflict-check", "conflict", "path-review", "consistency-hold", "consistency-difference"];
-function errorCode(error) {
-  const s = String(error?.message || error || "");
-  if (!s) return null;
-  if (/Blob request failed \((?:409|429)\)/i.test(s)) return "transferring";
-  if (/request failed \((?:408|5\d\d)\)/i.test(s)) return "network-transient";
-  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s)) return "transferring";
-  if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
-  if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
-  if (/identity mismatch|身份/i.test(s)) return "identity";
-  if (/quota|capacity|容量/i.test(s)) return "quota";
-  if (/snapshot|persist|本地保存|快照/i.test(s)) return "persistence";
-  if (/invalid|无效|校验/i.test(s)) return "invalid-data";
-  if (/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
-  if (/File system operation timed out|\b(?:EBUSY|EAGAIN|EMFILE|ENFILE)\b/i.test(s)) return "filesystem-transient";
-  if (/network|fetch|load failed|disconnected|timeout|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s)) return "network-transient";
-  return "unknown-error";
-}
-var auditCounts = ["equal", "missing", "different", "local-only", "queued", "excluded", "read-error", "downloaded", "uploaded", "refused"];
-var phases = ["never", "running", "waiting", "complete", "deferred"];
-var auditReasons = ["none", "queue-active", "changed", "conflict-unverified", "baseline-invalid", "unknown-error"];
-function validateDiagnosticDetails(v) {
-  const exact = (o, keys2) => o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length === keys2.length && Object.keys(o).every((k) => keys2.includes(k));
-  const count = (n) => Number.isSafeInteger(n) && n >= 0 && n <= 1e5;
-  if (!exact(v, ["reasons", "audit"]) || !Array.isArray(v.reasons) || v.reasons.length > REASON_CODES.length || new Set(v.reasons).size !== v.reasons.length || v.reasons.some((r2) => !REASON_CODES.includes(r2))) throw Error("Invalid diagnostic details");
-  const a = v.audit;
-  if (!exact(a, ["enabled", "phase", "reason", "checkedAt", "stable", "current", "limited", "counts"]) || typeof a.enabled !== "boolean" || !phases.includes(a.phase) || !auditReasons.includes(a.reason) || ![a.stable, a.current, a.limited].every((x) => typeof x === "boolean") || !(a.checkedAt === null || Number.isSafeInteger(a.checkedAt) && a.checkedAt >= 0 && a.checkedAt <= 864e13) || !exact(a.counts, auditCounts) || !auditCounts.every((k) => count(a.counts[k]))) throw Error("Invalid audit diagnostics");
-  return { reasons: [...v.reasons], audit: { ...a, counts: { ...a.counts } } };
-}
-function diagnosticDetails(p) {
-  const c = p.client, reasons = /* @__PURE__ */ new Set();
-  for (const e of [p.operationError, c?.lastError, p.conflictError, ...p.fileFailures.values()]) {
-    const code = errorCode(e);
-    if (code) reasons.add(code);
-  }
-  const flags = { "initializing": p.initializing || !p.syncedOnce, "receiving": p.reflection.queued || p.downloadPaths.size, "uploading": p.fileUploads.queued, "local-operation": p.localOperations || p.writing.size, "transferring": c?.binaryBusy, "saving": p.receiveAcks.size || p.receiptFlush || c?.persistence.dirty || c?.persistence.inFlight, "recovering": p.recoveryBusy, "stopping": p.stopping, "conflict-check": p.conflictError, "conflict": p.conflicts.length, "path-review": p.settings.pathSafety?.items.length || p.settings.remoteDeleteReview?.paths.length, "consistency-hold": p.settings.consistencyHolds?.length, "consistency-difference": p.consistencyIssues() };
-  for (const [k, on] of Object.entries(flags)) if (on) reasons.add(k);
-  const r2 = p.consistencyReport, counts = Object.fromEntries(auditCounts.map((k) => [k, k === "refused" ? r2?.refused?.length || 0 : r2?.counts?.[k] ?? r2?.[k] ?? 0]));
-  return validateDiagnosticDetails({ reasons: [...reasons], audit: { enabled: !!p.settings.autoConsistency, phase: p.consistencyBusy ? "running" : p.consistencyPhase || "never", reason: p.consistencyReason || "none", checkedAt: r2?.checkedAt ?? null, stable: !!r2?.stable, current: !!r2?.stable && r2.serverId === c?.serverId && p.consistencyDigest === p.currentDigest() && p.consistencyAuditEpoch === p.consistencyEpoch, limited: !!r2?.limited, counts } });
-}
-function diagnosticDetailsText(d) {
-  if (!d) return "\u8BE6\u7EC6\u8BCA\u65AD\uFF1A\u8BBE\u5907\u6216\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301";
-  const a = d.audit;
-  return "\u5F02\u5E38/\u5FD9\u788C\u539F\u56E0\uFF1A" + (d.reasons.map((r2) => ({ "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "metadata-not-ready": "\u5143\u6570\u636E\u672A\u5C31\u7EEA", "authentication": "\u9274\u6743\u5931\u8D25", "identity": "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", "quota": "\u5BB9\u91CF\u9650\u5236", "persistence": "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "invalid-data": "\u6570\u636E\u6821\u9A8C\u5F02\u5E38", "unknown-error": "\u672A\u5206\u7C7B\u9519\u8BEF\uFF08\u9700\u672C\u673A\u8BE6\u60C5\uFF09", "initializing": "\u521D\u59CB\u5316\u4E2D", "receiving": "\u63A5\u6536\u4E2D", "uploading": "\u4E0A\u4F20\u4E2D", "local-operation": "\u672C\u5730\u5904\u7406", "transferring": "\u4F20\u8F93\u4E2D", "saving": "\u4FDD\u5B58\u4E2D", "recovering": "\u91CD\u8BD5\u6062\u590D\u4E2D", "stopping": "\u6B63\u5728\u65AD\u5F00", "conflict-check": "\u51B2\u7A81\u68C0\u67E5\u672A\u786E\u8BA4", "conflict": "\u6709\u51B2\u7A81", "path-review": "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u786E\u8BA4", "consistency-hold": "\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D", "consistency-difference": "\u4E00\u81F4\u6027\u6709\u5DEE\u5F02" })[r2] || r2).join("\u3001") || "\u65E0") + "\uFF1B\u81EA\u52A8\u6838\u5BF9\uFF1A" + (a.enabled ? "\u5F00\u542F" : "\u5173\u95ED") + "\uFF1B\u9636\u6BB5\uFF1A" + a.phase + "\uFF1B\u6838\u5BF9\u65F6\u95F4\uFF1A" + (a.checkedAt ? new Date(a.checkedAt).toISOString() : "\u5C1A\u672A\u6838\u5BF9") + "\uFF1B\u7ED3\u679C\u4ECD\u9002\u7528\uFF1A" + a.current + "\uFF1B\u7ED3\u679C\uFF1A" + JSON.stringify(a.counts) + "\uFF1B\u6682\u7F13\u539F\u56E0\uFF1A" + a.reason;
-}
-
-var RetryLedger = class {
-  /** @param {any} options */
-  constructor({ state, serverId, now = Date.now, random: random2 = Math.random } = {}) {
-    this.now = now;
-    this.random = random2;
-    this.serverId = serverId;
-    this.items = /* @__PURE__ */ new Map();
-    if (state) {
-      if (state.serverId !== serverId || !Array.isArray(state.items) || state.items.length > 8192) throw Error("Invalid retry ledger identity");
-      for (const r2 of state.items) {
-        if (!r2 || typeof r2.key !== "string" || r2.key.length > 4096 || !Number.isSafeInteger(r2.attempts) || r2.attempts < 1 || r2.attempts > 1e5 || !Number.isSafeInteger(r2.nextAt) || r2.nextAt < 0 || r2.nextAt > now() + 6e4 || !Number.isSafeInteger(r2.lastAt) || r2.lastAt < 0 || typeof r2.retryable !== "boolean" || !REASON_CODES.includes(r2.code) || this.items.has(r2.key) || Object.keys(r2).some((k) => !["key", "attempts", "nextAt", "lastAt", "retryable", "code"].includes(k))) throw Error("Invalid retry ledger");
-        this.items.set(r2.key, { ...r2 });
-      }
-    }
-  }
-  due(key) {
-    const r2 = this.items.get(key);
-    return !r2 || r2.retryable && r2.nextAt <= this.now();
-  }
-  fail(key, error) {
-    if (!this.items.has(key) && this.items.size >= 8192) throw Error("Retry ledger capacity reached; queue retained");
-    const attempts = Math.min(1e5, (this.items.get(key)?.attempts || 0) + 1), retryable = recoverableSyncFailure(error), delay = Math.min(6e4, 1e3 * 2 ** Math.min(attempts - 1, 6)) * (0.75 + 0.25 * this.random());
-    this.items.set(key, { key, attempts, retryable, code: errorCode(error) || "unknown-error", lastAt: this.now(), nextAt: retryable ? Math.round(this.now() + delay) : 0 });
-  }
-  success(key) {
-    return this.items.delete(key);
-  }
-  order(keys2) {
-    return [...keys2].sort((a, b) => (this.items.get(a)?.lastAt || 0) - (this.items.get(b)?.lastAt || 0));
-  }
-  snapshot() {
-    return { serverId: this.serverId, items: [...this.items.values()].map((r2) => ({ ...r2 })) };
-  }
-  summary() {
-    const rows = [...this.items.values()], retry = rows.filter((r2) => r2.retryable);
-    return { retrying: retry.length, blocked: rows.length - retry.length, nextAt: retry.length ? Math.min(...retry.map((r2) => r2.nextAt)) : 0, reasons: [...new Set(rows.map((r2) => r2.code))] };
-  }
-};
-function stallStatus({ pending = 0, lastProgressAt, now = Date.now(), active = [], retry, ready = true, hidden = false }) {
-  const oldest = [...active].sort((a, b) => a.startedAt - b.startedAt)[0], age = Math.max(0, now - lastProgressAt, oldest ? now - oldest.startedAt : 0);
-  let reason = hidden ? "background" : !ready ? "connection" : oldest?.kind || retry?.reasons?.[0] || (retry?.blocked ? "manual-review" : retry?.retrying ? "retry-backoff" : "queue");
-  return { stalled: !!pending && !hidden && age >= 6e4, idleSeconds: Math.min(604800, Math.floor(age / 1e3)), reason, pending, retrying: retry?.retrying || 0, blocked: retry?.blocked || 0, nextRetrySeconds: retry?.nextAt ? Math.min(60, Math.max(0, Math.ceil((retry.nextAt - now) / 1e3))) : 0 };
-}
-function stallText(s) {
-  const names = { background: "\u5E94\u7528\u5728\u540E\u53F0", connection: "\u8FDE\u63A5\u6216\u9274\u6743\u672A\u5C31\u7EEA", network: "\u7F51\u7EDC\u8BF7\u6C42\u7B49\u5F85", cache: "\u7F13\u5B58\u8BFB\u5199\u7B49\u5F85", vault: "\u6587\u4EF6\u5199\u76D8\u7B49\u5F85", config: "\u672C\u5730\u961F\u5217\u4FDD\u5B58\u7B49\u5F85", queue: "\u7B49\u5F85\u961F\u5217\u8C03\u5EA6", "retry-backoff": "\u9000\u907F\u91CD\u8BD5\u7B49\u5F85", "manual-review": "\u9700\u624B\u52A8\u590D\u6838", "transferring": "\u4F20\u8F93\u901A\u9053\u5FD9\u788C", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", authentication: "\u9274\u6743\u5931\u8D25", identity: "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", quota: "\u5BB9\u91CF\u9650\u5236", persistence: "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "unknown-error": "\u672A\u77E5\u9519\u8BEF\uFF0C\u9700\u67E5\u770B\u672C\u673A\u8BE6\u60C5" };
-  return (s.stalled ? "\u8D85\u8FC760\u79D2\u672A\u89C1\u5B8C\u6210\u8FDB\u5C55\uFF1B" : "") + (names[s.reason] || s.reason) + "\uFF1B\u81EA\u52A8\u91CD\u8BD5 " + s.retrying + " \u9879\uFF0C\u9700\u590D\u6838 " + s.blocked + " \u9879" + (s.retrying ? "\uFF1B\u8DDD\u4E0B\u6B21\u91CD\u8BD5 " + s.nextRetrySeconds + " \u79D2" : "") + "\u3002\u4E0D\u4F1A\u6E05\u7A7A\u961F\u5217\u6216\u81EA\u52A8\u8986\u76D6\u51B2\u7A81\u3002";
-}
-
-function pathReviewGroups(items = []) {
-  return items.map((i) => ({ id: i.op.id, title: (i.op.kind === "rename" ? "\u91CD\u547D\u540D" : "\u5220\u9664") + " \xB7 " + i.op.entries.length + " \u9879", count: i.op.entries.length, affected: new Set(i.op.entries.flatMap((e) => e.to ? [e.from, e.to] : [e.from])).size, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: i.error || "", lines: i.op.entries.map((e) => e.to ? e.from + " \u2192 " + e.to : e.from), reviewed: { id: i.op.id, plan: JSON.stringify(i.op) } }));
-}
-function syncSections(options = {}) {
-  const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0 } = options;
-  const transfer = progress?.available ? (ready ? "" : "\u79BB\u7EBF\u53C2\u8003 \xB7 ") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u91CD\u8BD5 " + progress.retry + " \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions : "\u91CD\u8FDE\u540E\u6838\u5BF9\u8FDB\u5EA6 \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions;
-  let auditText = "\u5C1A\u672A\u6838\u5BF9";
-  if (audit) {
-    auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
-  }
-  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
-}
-
-var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
-var r = (v, n) => v >>> n | v << 32 - n;
-var Sha256 = class {
-  constructor() {
-    this.h = new Uint32Array([1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]);
-    this.block = new Uint8Array(64);
-    this.w = new Uint32Array(64);
-    this.used = 0;
-    this.length = 0;
-    this.done = false;
-  }
-  compress() {
-    const w = this.w, b = this.block;
-    for (let i = 0; i < 16; i++) w[i] = b[i * 4] << 24 | b[i * 4 + 1] << 16 | b[i * 4 + 2] << 8 | b[i * 4 + 3];
-    for (let i = 16; i < 64; i++) {
-      const x = w[i - 15], y = w[i - 2];
-      w[i] = w[i - 16] + (r(x, 7) ^ r(x, 18) ^ x >>> 3) + w[i - 7] + (r(y, 17) ^ r(y, 19) ^ y >>> 10) >>> 0;
-    }
-    let [a, c, d, e, f, g, h, j] = this.h;
-    for (let i = 0; i < 64; i++) {
-      const t = j + (r(f, 6) ^ r(f, 11) ^ r(f, 25)) + (f & g ^ ~f & h) + K[i] + w[i] >>> 0, u = (r(a, 2) ^ r(a, 13) ^ r(a, 22)) + (a & c ^ a & d ^ c & d) >>> 0;
-      j = h;
-      h = g;
-      g = f;
-      f = e + t >>> 0;
-      e = d;
-      d = c;
-      c = a;
-      a = t + u >>> 0;
-    }
-    const v = [a, c, d, e, f, g, h, j];
-    for (let i = 0; i < 8; i++) this.h[i] = this.h[i] + v[i] >>> 0;
-  }
-  update(bytes) {
-    if (this.done) throw Error("Hash already finished");
-    this.length += bytes.byteLength;
-    for (let p = 0; p < bytes.length; ) {
-      const n = Math.min(64 - this.used, bytes.length - p);
-      this.block.set(bytes.subarray(p, p + n), this.used);
-      this.used += n;
-      p += n;
-      if (this.used === 64) {
-        this.compress();
-        this.used = 0;
-      }
-    }
-    return this;
-  }
-  hex() {
-    if (this.done) throw Error("Hash already finished");
-    const n = this.length;
-    this.update(new Uint8Array([128]));
-    while (this.used !== 56) this.update(new Uint8Array([0]));
-    const bits = n * 8, tail = new Uint8Array(8), v = new DataView(tail.buffer);
-    v.setUint32(0, Math.floor(bits / 4294967296));
-    v.setUint32(4, bits >>> 0);
-    this.update(tail);
-    this.done = true;
-    return Array.from(this.h, (v2) => v2.toString(16).padStart(8, "0")).join("");
-  }
-};
-var CHUNK_BYTES = 32 * 1024;
-async function hashSource(source, signal) {
-  const h = new Sha256();
-  for (let p = 0; p < source.size; p += CHUNK_BYTES) {
-    signal?.throwIfAborted();
-    const n = Math.min(CHUNK_BYTES, source.size - p), bytes = await source.read(p, n);
-    if (!(bytes instanceof Uint8Array) || bytes.length !== n) throw Error("Source changed or short read");
-    h.update(bytes);
-  }
-  return h.hex();
-}
-
 var create = () => /* @__PURE__ */ new Map();
 var copy = (m) => {
   const r2 = create();
@@ -9248,6 +9013,97 @@ if (glo[importIdentifier] === true) {
 }
 glo[importIdentifier] = true;
 
+var SnapshotScheduler = class {
+  constructor({ capture, persist, delayMs = 0, lastState = "", onError = () => {
+  } }) {
+    Object.assign(this, { capture, persist, delayMs, lastState, onError });
+    this.dirty = false;
+    this.closed = false;
+    this.inFlight = false;
+    this.pending = void 0;
+    this.timer = null;
+    this.error = null;
+    this.job = Promise.resolve();
+  }
+  changed() {
+    if (!this.persist || this.closed) return;
+    this.dirty = true;
+    if (!this.inFlight && this.delayMs === 0) this.flush();
+    else this.arm();
+  }
+  arm() {
+    if (!this.persist || this.closed || this.inFlight || this.timer !== null) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flush();
+    }, this.delayMs);
+  }
+  flush(force = false) {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (!this.persist) return this.lastState;
+    if (!this.dirty && !force) return this.lastState;
+    const state = this.capture();
+    this.lastState = state;
+    this.dirty = false;
+    if (this.inFlight) this.pending = state;
+    else this.write(state);
+    return state;
+  }
+  write(state) {
+    let value;
+    try {
+      value = this.persist(state);
+    } catch (e) {
+      this.failed(e);
+      return;
+    }
+    if (value && typeof value.then === "function") {
+      this.inFlight = true;
+      this.job = Promise.resolve(value).then(() => this.finish(true), (e) => {
+        this.failed(e);
+        this.finish(false);
+      });
+    } else this.finish(true);
+  }
+  failed(e) {
+    this.error = e;
+    this.dirty = true;
+    this.onError(e);
+  }
+  finish(ok) {
+    this.inFlight = false;
+    if (ok) this.error = null;
+    if (this.pending !== void 0) {
+      const state = this.pending;
+      this.pending = void 0;
+      this.write(state);
+    } else if (ok && this.dirty && !this.closed) this.arm();
+  }
+  async wait() {
+    while (this.inFlight) await this.job;
+    return !this.error;
+  }
+  close() {
+    this.closed = true;
+    this.flush();
+    return this.wait();
+  }
+};
+
+var encode = (bytes) => {
+  const chunks = [];
+  for (let offset = 0; offset < bytes.length; offset += 8192) chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 8192)));
+  return btoa(chunks.join(""));
+};
+var decode = (value) => {
+  const binary = atob(value), bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+};
+
 var MAX_IMAGE = 5 * 1024 * 1024;
 var MAX_TEXT = 1024 * 1024;
 var MAX_TOTAL = 50 * 1024 * 1024;
@@ -9298,6 +9154,351 @@ function decodeTextPreview(bytes) {
   } catch {
     return null;
   }
+}
+
+var markdown = (p) => /\.md$/i.test(p);
+function content(doc2, p) {
+  const m = doc2.getMap("files").get(p);
+  if (!m || m.deleted || doc2.getMap("deleted").has(p)) return null;
+  return m.kind === "text" ? { kind: "text", data: doc2.getText("text:" + p).toString() } : { kind: m.kind, hash: m.hash, size: m.size, version: m.version };
+}
+function entries(doc2) {
+  const out = {};
+  for (const p of doc2.getMap("files").keys()) {
+    const c = content(doc2, p);
+    if (c) out[p] = c;
+  }
+  return out;
+}
+function put(doc2, p, c, origin) {
+  if (!supportedFile(p)) throw Error("Unsupported path");
+  if (c.kind !== "text" && c.version && doc2.getMap("blobVersions").has(c.version)) {
+    const v = doc2.getMap("blobVersions").get(c.version);
+    if (v.path !== p) c = { ...c, version: crypto.randomUUID() };
+    else {
+      if (v.hash !== c.hash || v.size !== c.size) throw Error("Immutable version mismatch");
+      return;
+    }
+  }
+  doc2.transact(() => {
+    const files = doc2.getMap("files");
+    doc2.getMap("deleted").delete(p);
+    if (c.kind === "text") {
+      if (!markdown(p)) throw Error("Inline text requires Markdown");
+      if (files.get(p)?.kind === "file" && origin !== "explicit-history-restore") throw Error("Whole-file Markdown cannot silently switch to inline CRDT");
+      patchText(doc2, p, c.data, origin);
+      const prior = files.get(p);
+      if (!prior || prior.deleted || prior.kind !== "text") files.set(p, { kind: "text", deleted: false });
+    } else {
+      const version = c.version || crypto.randomUUID(), v = { path: p, hash: c.hash, size: c.size };
+      validateRef(v);
+      const kind = c.kind === "image" ? "image" : "file";
+      if (markdown(p) && kind !== "file" || imagePath(p) && kind !== "image" || !imagePath(p) && kind !== "file") throw Error("File kind/path mismatch");
+      doc2.getMap("blobVersions").set(version, v);
+      files.set(p, { kind, hash: c.hash, size: c.size, version, deleted: false });
+      if (markdown(p)) {
+        const text2 = doc2.getText("text:" + p);
+        if (text2.length) text2.delete(0, text2.length);
+      }
+    }
+  }, origin);
+}
+function remove(doc2, p, origin) {
+  if (!supportedFile(p)) throw Error("Unsupported path");
+  doc2.transact(() => {
+    doc2.getMap("deleted").set(p, true);
+    doc2.getMap("files").set(p, { kind: doc2.getMap("files").get(p)?.kind || (markdown(p) ? "text" : imagePath(p) ? "image" : "file"), deleted: true });
+  }, origin);
+}
+function validateRef(v) {
+  if (!v || !supportedFile(v.path) || !/^[a-f0-9]{64}$/.test(v.hash) || !Number.isSafeInteger(v.size) || v.size < 0 || v.size > maxFileSize(v.path) || Object.keys(v).some((k) => !["path", "hash", "size"].includes(k))) throw Error("Invalid blob reference or per-file size limit");
+}
+function validate(doc2, hasBlob) {
+  let total = 0, count = 0, active = 0, inline = 0;
+  const names = /* @__PURE__ */ new Set();
+  for (const name of doc2.share.keys()) {
+    if (!["files", "deleted", "blobVersions"].includes(name) && !(name.startsWith("text:") && supportedFile(name.slice(5)) && markdown(name))) throw Error("Invalid V3 document root");
+    if (name.startsWith("text:")) {
+      const n = new TextEncoder().encode(doc2.getText(name).toString()).length;
+      if (n > MAX_INLINE_NOTE) throw Error("Inline note exceeds 16 KiB; explicit whole-file mode required");
+      inline += n;
+    }
+  }
+  if (inline > MAX_INLINE_TOTAL) throw Error("Inline CRDT budget exceeds 128 KiB; explicit whole-file mode required");
+  for (const [id2, v] of doc2.getMap("blobVersions")) {
+    if (!/^[a-f0-9-]{36}$/.test(id2)) throw Error("Invalid version id");
+    validateRef(v);
+    if (hasBlob && !hasBlob(v.hash, v.size)) throw Error("Referenced blob is not durably uploaded");
+  }
+  if (doc2.getMap("deleted").size > MAX_PATHS) throw Error("Tombstone limit 8192");
+  for (const [p, v] of doc2.getMap("deleted")) if (!supportedFile(p) || v !== true) throw Error("Invalid tombstone");
+  for (const [p, m] of doc2.getMap("files")) {
+    if (!supportedFile(p) || !m || !["text", "image", "file"].includes(m.kind) || typeof m.deleted !== "boolean" || m.kind === "text" && !markdown(p) || m.kind === "image" && !imagePath(p) || m.kind === "file" && imagePath(p) || Object.keys(m).some((k) => !["kind", "deleted", "hash", "size", "version"].includes(k))) throw Error("Invalid V3 file metadata");
+    const canonical = p.toLowerCase();
+    if (names.has(canonical)) throw Error("Case-insensitive path collision");
+    names.add(canonical);
+    if (++count > MAX_PATHS) throw Error("Tracked path limit 8192 including tombstones");
+    if (m.deleted || doc2.getMap("deleted").has(p)) continue;
+    if (++active > MAX_ACTIVE_PATHS) throw Error("Active path limit 6000");
+    if (m.kind === "text") total += new TextEncoder().encode(doc2.getText("text:" + p).toString()).length;
+    else {
+      validateRef({ path: p, hash: m.hash, size: m.size });
+      const v = doc2.getMap("blobVersions").get(m.version);
+      if (!v || v.path !== p || v.hash !== m.hash || v.size !== m.size) throw Error("Missing immutable blob version");
+      total += m.size;
+    }
+    if (total > MAX_LIVE_BYTES) throw Error("Active logical content exceeds 256 MiB; server/cache disk also capped");
+  }
+  if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata/text state exceeds 2 MiB");
+  return total;
+}
+
+function newlyReceivedPaths(previous, next, isMissing) {
+  const before = new Doc(), after = new Doc();
+  try {
+    if (previous) applyUpdate(before, decode(previous));
+    applyUpdate(after, decode(next));
+    const known = before.getMap("files");
+    return Object.keys(entries(after)).filter((p) => !known.has(p) && isMissing(p));
+  } finally {
+    before.destroy();
+    after.destroy();
+  }
+}
+
+function desktopBackgroundEnabled(platform) {
+  return !platform?.isMobileApp && !platform?.isIosApp && !platform?.isAndroidApp && !!(platform?.isDesktopApp || platform?.isWin || platform?.isMacOS || platform?.isLinux);
+}
+function startDesktopHeartbeat({ timers, tick, intervalMs = 1e4 }) {
+  let stopped = false, busy = false;
+  const run = async () => {
+    if (stopped || busy) return;
+    busy = true;
+    try {
+      await tick();
+    } catch {
+    } finally {
+      busy = false;
+    }
+  };
+  const timer = timers.setInterval(() => void run(), intervalMs);
+  timer?.unref?.();
+  return () => {
+    stopped = true;
+    timers.clearInterval(timer);
+  };
+}
+async function boundedDesktopCheck({ client, timers, timeoutMs = 2e4, isCurrent = () => true }) {
+  let deadline;
+  try {
+    return await Promise.race([client.checkConnection(), new Promise((resolve) => {
+      deadline = timers.setTimeout(() => {
+        if (isCurrent() && !client.stopped && !client.transportBlocked && !client.terminalCloseCode) client.resume();
+        resolve(false);
+      }, timeoutMs);
+      deadline?.unref?.();
+    })]);
+  } finally {
+    timers.clearTimeout(deadline);
+  }
+}
+
+var RECOVERY_DIAGNOSTICS_CAPABILITY = "device-recovery-diagnostics-v1";
+
+function transientTransferFailure(error) {
+  if (error?.code === "METADATA_NOT_READY") return true;
+  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(String(error?.message || error))) return true;
+  const s = String(error?.message || error);
+  if (/^(?:Error: )?(?:Connect verified V3 metadata before transferring blobs|Connect before resuming cached uploads)$/.test(s)) return true;
+  if (/身份|identity mismatch|认证|401|403|quota|capacity|容量|快照|snapshot|persist|storage|磁盘|本地保存|invalid|unsupported/i.test(s)) return false;
+  return /Foreground reconnect; local edits retained|blob request failed \(409\)|failed to fetch|fetch failed|load failed|network|网络|ECONN|ENOTFOUND|ETIMEDOUT|disconnected|request timeout|request failed \((?:408|429|5\d\d)\)/i.test(s);
+}
+function transientFilesystemFailure(error) {
+  return /File system operation timed out|(?:^|\W)(?:EBUSY|EAGAIN|EMFILE|ENFILE)(?:\W|$)/i.test(String(error?.message || error));
+}
+function recoverableSyncFailure(error) {
+  return /^(?:Error: )?Cache staging busy$/.test(String(error?.message || error)) || transientFilesystemFailure(error) || transientTransferFailure(error);
+}
+
+var DIAGNOSTIC_DETAILS_CAPABILITY = "device-diagnostic-details-v1";
+var REASON_CODES = ["cache-staging-busy", "filesystem-transient", "network-transient", "metadata-not-ready", "authentication", "identity", "quota", "persistence", "invalid-data", "unknown-error", "initializing", "receiving", "uploading", "local-operation", "transferring", "saving", "recovering", "stopping", "conflict-check", "conflict", "path-review", "consistency-hold", "consistency-difference"];
+function errorCode(error) {
+  const s = String(error?.message || error || "");
+  if (!s) return null;
+  if (/Blob request failed \((?:409|429)\)/i.test(s)) return "transferring";
+  if (/request failed \((?:408|5\d\d)\)/i.test(s)) return "network-transient";
+  if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s)) return "transferring";
+  if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
+  if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
+  if (/identity mismatch|身份/i.test(s)) return "identity";
+  if (/quota|capacity|容量/i.test(s)) return "quota";
+  if (/snapshot|persist|本地保存|快照/i.test(s)) return "persistence";
+  if (/invalid|无效|校验/i.test(s)) return "invalid-data";
+  if (/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
+  if (/File system operation timed out|\b(?:EBUSY|EAGAIN|EMFILE|ENFILE)\b/i.test(s)) return "filesystem-transient";
+  if (/network|fetch|load failed|disconnected|timeout|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s)) return "network-transient";
+  return "unknown-error";
+}
+var auditCounts = ["equal", "missing", "different", "local-only", "queued", "excluded", "read-error", "downloaded", "uploaded", "refused"];
+var phases = ["never", "running", "waiting", "complete", "deferred"];
+var auditReasons = ["none", "queue-active", "changed", "conflict-unverified", "baseline-invalid", "unknown-error"];
+function validateDiagnosticDetails(v) {
+  const exact = (o, keys2) => o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length === keys2.length && Object.keys(o).every((k) => keys2.includes(k));
+  const count = (n) => Number.isSafeInteger(n) && n >= 0 && n <= 1e5;
+  if (!exact(v, ["reasons", "audit"]) || !Array.isArray(v.reasons) || v.reasons.length > REASON_CODES.length || new Set(v.reasons).size !== v.reasons.length || v.reasons.some((r2) => !REASON_CODES.includes(r2))) throw Error("Invalid diagnostic details");
+  const a = v.audit;
+  if (!exact(a, ["enabled", "phase", "reason", "checkedAt", "stable", "current", "limited", "counts"]) || typeof a.enabled !== "boolean" || !phases.includes(a.phase) || !auditReasons.includes(a.reason) || ![a.stable, a.current, a.limited].every((x) => typeof x === "boolean") || !(a.checkedAt === null || Number.isSafeInteger(a.checkedAt) && a.checkedAt >= 0 && a.checkedAt <= 864e13) || !exact(a.counts, auditCounts) || !auditCounts.every((k) => count(a.counts[k]))) throw Error("Invalid audit diagnostics");
+  return { reasons: [...v.reasons], audit: { ...a, counts: { ...a.counts } } };
+}
+function diagnosticDetails(p) {
+  const c = p.client, reasons = /* @__PURE__ */ new Set();
+  for (const e of [p.operationError, c?.lastError, p.conflictError, ...p.fileFailures.values()]) {
+    const code = errorCode(e);
+    if (code) reasons.add(code);
+  }
+  const flags = { "initializing": p.initializing || !p.syncedOnce, "receiving": p.reflection.queued || p.downloadPaths.size, "uploading": p.fileUploads.queued, "local-operation": p.localOperations || p.writing.size, "transferring": c?.binaryBusy, "saving": p.receiveAcks.size || p.receiptFlush || c?.persistence.dirty || c?.persistence.inFlight, "recovering": p.recoveryBusy, "stopping": p.stopping, "conflict-check": p.conflictError, "conflict": p.conflicts.length, "path-review": p.settings.pathSafety?.items.length || p.settings.remoteDeleteReview?.paths.length, "consistency-hold": p.settings.consistencyHolds?.length, "consistency-difference": p.consistencyIssues() };
+  for (const [k, on] of Object.entries(flags)) if (on) reasons.add(k);
+  const r2 = p.consistencyReport, counts = Object.fromEntries(auditCounts.map((k) => [k, k === "refused" ? r2?.refused?.length || 0 : r2?.counts?.[k] ?? r2?.[k] ?? 0]));
+  return validateDiagnosticDetails({ reasons: [...reasons], audit: { enabled: !!p.settings.autoConsistency, phase: p.consistencyBusy ? "running" : p.consistencyPhase || "never", reason: p.consistencyReason || "none", checkedAt: r2?.checkedAt ?? null, stable: !!r2?.stable, current: !!r2?.stable && r2.serverId === c?.serverId && p.consistencyDigest === p.currentDigest() && p.consistencyAuditEpoch === p.consistencyEpoch, limited: !!r2?.limited, counts } });
+}
+function diagnosticDetailsText(d) {
+  if (!d) return "\u8BE6\u7EC6\u8BCA\u65AD\uFF1A\u8BBE\u5907\u6216\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301";
+  const a = d.audit;
+  return "\u5F02\u5E38/\u5FD9\u788C\u539F\u56E0\uFF1A" + (d.reasons.map((r2) => ({ "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "metadata-not-ready": "\u5143\u6570\u636E\u672A\u5C31\u7EEA", "authentication": "\u9274\u6743\u5931\u8D25", "identity": "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", "quota": "\u5BB9\u91CF\u9650\u5236", "persistence": "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "invalid-data": "\u6570\u636E\u6821\u9A8C\u5F02\u5E38", "unknown-error": "\u672A\u5206\u7C7B\u9519\u8BEF\uFF08\u9700\u672C\u673A\u8BE6\u60C5\uFF09", "initializing": "\u521D\u59CB\u5316\u4E2D", "receiving": "\u63A5\u6536\u4E2D", "uploading": "\u4E0A\u4F20\u4E2D", "local-operation": "\u672C\u5730\u5904\u7406", "transferring": "\u4F20\u8F93\u4E2D", "saving": "\u4FDD\u5B58\u4E2D", "recovering": "\u91CD\u8BD5\u6062\u590D\u4E2D", "stopping": "\u6B63\u5728\u65AD\u5F00", "conflict-check": "\u51B2\u7A81\u68C0\u67E5\u672A\u786E\u8BA4", "conflict": "\u6709\u51B2\u7A81", "path-review": "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u786E\u8BA4", "consistency-hold": "\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D", "consistency-difference": "\u4E00\u81F4\u6027\u6709\u5DEE\u5F02" })[r2] || r2).join("\u3001") || "\u65E0") + "\uFF1B\u81EA\u52A8\u6838\u5BF9\uFF1A" + (a.enabled ? "\u5F00\u542F" : "\u5173\u95ED") + "\uFF1B\u9636\u6BB5\uFF1A" + a.phase + "\uFF1B\u6838\u5BF9\u65F6\u95F4\uFF1A" + (a.checkedAt ? new Date(a.checkedAt).toISOString() : "\u5C1A\u672A\u6838\u5BF9") + "\uFF1B\u7ED3\u679C\u4ECD\u9002\u7528\uFF1A" + a.current + "\uFF1B\u7ED3\u679C\uFF1A" + JSON.stringify(a.counts) + "\uFF1B\u6682\u7F13\u539F\u56E0\uFF1A" + a.reason;
+}
+
+var RetryLedger = class {
+  /** @param {any} options */
+  constructor({ state, serverId, now = Date.now, random: random2 = Math.random } = {}) {
+    this.now = now;
+    this.random = random2;
+    this.serverId = serverId;
+    this.items = /* @__PURE__ */ new Map();
+    if (state) {
+      if (state.serverId !== serverId || !Array.isArray(state.items) || state.items.length > 8192) throw Error("Invalid retry ledger identity");
+      for (const r2 of state.items) {
+        if (!r2 || typeof r2.key !== "string" || r2.key.length > 4096 || !Number.isSafeInteger(r2.attempts) || r2.attempts < 1 || r2.attempts > 1e5 || !Number.isSafeInteger(r2.nextAt) || r2.nextAt < 0 || r2.nextAt > now() + 6e4 || !Number.isSafeInteger(r2.lastAt) || r2.lastAt < 0 || typeof r2.retryable !== "boolean" || !REASON_CODES.includes(r2.code) || this.items.has(r2.key) || Object.keys(r2).some((k) => !["key", "attempts", "nextAt", "lastAt", "retryable", "code"].includes(k))) throw Error("Invalid retry ledger");
+        this.items.set(r2.key, { ...r2 });
+      }
+    }
+  }
+  due(key) {
+    const r2 = this.items.get(key);
+    return !r2 || r2.retryable && r2.nextAt <= this.now();
+  }
+  fail(key, error) {
+    if (!this.items.has(key) && this.items.size >= 8192) throw Error("Retry ledger capacity reached; queue retained");
+    const attempts = Math.min(1e5, (this.items.get(key)?.attempts || 0) + 1), retryable = recoverableSyncFailure(error), delay = Math.min(6e4, 1e3 * 2 ** Math.min(attempts - 1, 6)) * (0.75 + 0.25 * this.random());
+    this.items.set(key, { key, attempts, retryable, code: errorCode(error) || "unknown-error", lastAt: this.now(), nextAt: retryable ? Math.round(this.now() + delay) : 0 });
+  }
+  success(key) {
+    return this.items.delete(key);
+  }
+  order(keys2) {
+    return [...keys2].sort((a, b) => (this.items.get(a)?.lastAt || 0) - (this.items.get(b)?.lastAt || 0));
+  }
+  snapshot() {
+    return { serverId: this.serverId, items: [...this.items.values()].map((r2) => ({ ...r2 })) };
+  }
+  summary() {
+    const rows = [...this.items.values()], retry = rows.filter((r2) => r2.retryable);
+    return { retrying: retry.length, blocked: rows.length - retry.length, nextAt: retry.length ? Math.min(...retry.map((r2) => r2.nextAt)) : 0, reasons: [...new Set(rows.map((r2) => r2.code))] };
+  }
+};
+function stallStatus({ pending = 0, lastProgressAt, now = Date.now(), active = [], retry, ready = true, hidden = false }) {
+  const oldest = [...active].sort((a, b) => a.startedAt - b.startedAt)[0], age = Math.max(0, now - lastProgressAt, oldest ? now - oldest.startedAt : 0);
+  let reason = hidden ? "background" : !ready ? "connection" : oldest?.kind || retry?.reasons?.[0] || (retry?.blocked ? "manual-review" : retry?.retrying ? "retry-backoff" : "queue");
+  return { stalled: !!pending && !hidden && age >= 6e4, idleSeconds: Math.min(604800, Math.floor(age / 1e3)), reason, pending, retrying: retry?.retrying || 0, blocked: retry?.blocked || 0, nextRetrySeconds: retry?.nextAt ? Math.min(60, Math.max(0, Math.ceil((retry.nextAt - now) / 1e3))) : 0 };
+}
+function stallText(s) {
+  const names = { background: "\u5E94\u7528\u5728\u540E\u53F0", connection: "\u8FDE\u63A5\u6216\u9274\u6743\u672A\u5C31\u7EEA", network: "\u7F51\u7EDC\u8BF7\u6C42\u7B49\u5F85", cache: "\u7F13\u5B58\u8BFB\u5199\u7B49\u5F85", vault: "\u6587\u4EF6\u5199\u76D8\u7B49\u5F85", config: "\u672C\u5730\u961F\u5217\u4FDD\u5B58\u7B49\u5F85", queue: "\u7B49\u5F85\u961F\u5217\u8C03\u5EA6", "retry-backoff": "\u9000\u907F\u91CD\u8BD5\u7B49\u5F85", "manual-review": "\u9700\u624B\u52A8\u590D\u6838", "transferring": "\u4F20\u8F93\u901A\u9053\u5FD9\u788C", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", authentication: "\u9274\u6743\u5931\u8D25", identity: "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", quota: "\u5BB9\u91CF\u9650\u5236", persistence: "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "unknown-error": "\u672A\u77E5\u9519\u8BEF\uFF0C\u9700\u67E5\u770B\u672C\u673A\u8BE6\u60C5" };
+  return (s.stalled ? "\u8D85\u8FC760\u79D2\u672A\u89C1\u5B8C\u6210\u8FDB\u5C55\uFF1B" : "") + (names[s.reason] || s.reason) + "\uFF1B\u81EA\u52A8\u91CD\u8BD5 " + s.retrying + " \u9879\uFF0C\u9700\u590D\u6838 " + s.blocked + " \u9879" + (s.retrying ? "\uFF1B\u8DDD\u4E0B\u6B21\u91CD\u8BD5 " + s.nextRetrySeconds + " \u79D2" : "") + "\u3002\u4E0D\u4F1A\u6E05\u7A7A\u961F\u5217\u6216\u81EA\u52A8\u8986\u76D6\u51B2\u7A81\u3002";
+}
+
+function pathReviewGroups(items = []) {
+  return items.map((i) => ({ id: i.op.id, title: (i.op.kind === "rename" ? "\u91CD\u547D\u540D" : "\u5220\u9664") + " \xB7 " + i.op.entries.length + " \u9879", count: i.op.entries.length, affected: new Set(i.op.entries.flatMap((e) => e.to ? [e.from, e.to] : [e.from])).size, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: i.error || "", lines: i.op.entries.map((e) => e.to ? e.from + " \u2192 " + e.to : e.from), reviewed: { id: i.op.id, plan: JSON.stringify(i.op) } }));
+}
+function syncSections(options = {}) {
+  const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0 } = options;
+  const transfer = progress?.available ? (ready ? "" : "\u79BB\u7EBF\u53C2\u8003 \xB7 ") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u91CD\u8BD5 " + progress.retry + " \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions : "\u91CD\u8FDE\u540E\u6838\u5BF9\u8FDB\u5EA6 \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions;
+  let auditText = "\u5C1A\u672A\u6838\u5BF9";
+  if (audit) {
+    auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
+  }
+  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
+}
+
+var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
+var r = (v, n) => v >>> n | v << 32 - n;
+var Sha256 = class {
+  constructor() {
+    this.h = new Uint32Array([1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]);
+    this.block = new Uint8Array(64);
+    this.w = new Uint32Array(64);
+    this.used = 0;
+    this.length = 0;
+    this.done = false;
+  }
+  compress() {
+    const w = this.w, b = this.block;
+    for (let i = 0; i < 16; i++) w[i] = b[i * 4] << 24 | b[i * 4 + 1] << 16 | b[i * 4 + 2] << 8 | b[i * 4 + 3];
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15], y = w[i - 2];
+      w[i] = w[i - 16] + (r(x, 7) ^ r(x, 18) ^ x >>> 3) + w[i - 7] + (r(y, 17) ^ r(y, 19) ^ y >>> 10) >>> 0;
+    }
+    let [a, c, d, e, f, g, h, j] = this.h;
+    for (let i = 0; i < 64; i++) {
+      const t = j + (r(f, 6) ^ r(f, 11) ^ r(f, 25)) + (f & g ^ ~f & h) + K[i] + w[i] >>> 0, u = (r(a, 2) ^ r(a, 13) ^ r(a, 22)) + (a & c ^ a & d ^ c & d) >>> 0;
+      j = h;
+      h = g;
+      g = f;
+      f = e + t >>> 0;
+      e = d;
+      d = c;
+      c = a;
+      a = t + u >>> 0;
+    }
+    const v = [a, c, d, e, f, g, h, j];
+    for (let i = 0; i < 8; i++) this.h[i] = this.h[i] + v[i] >>> 0;
+  }
+  update(bytes) {
+    if (this.done) throw Error("Hash already finished");
+    this.length += bytes.byteLength;
+    for (let p = 0; p < bytes.length; ) {
+      const n = Math.min(64 - this.used, bytes.length - p);
+      this.block.set(bytes.subarray(p, p + n), this.used);
+      this.used += n;
+      p += n;
+      if (this.used === 64) {
+        this.compress();
+        this.used = 0;
+      }
+    }
+    return this;
+  }
+  hex() {
+    if (this.done) throw Error("Hash already finished");
+    const n = this.length;
+    this.update(new Uint8Array([128]));
+    while (this.used !== 56) this.update(new Uint8Array([0]));
+    const bits = n * 8, tail = new Uint8Array(8), v = new DataView(tail.buffer);
+    v.setUint32(0, Math.floor(bits / 4294967296));
+    v.setUint32(4, bits >>> 0);
+    this.update(tail);
+    this.done = true;
+    return Array.from(this.h, (v2) => v2.toString(16).padStart(8, "0")).join("");
+  }
+};
+var CHUNK_BYTES = 32 * 1024;
+async function hashSource(source, signal) {
+  const h = new Sha256();
+  for (let p = 0; p < source.size; p += CHUNK_BYTES) {
+    signal?.throwIfAborted();
+    const n = Math.min(CHUNK_BYTES, source.size - p), bytes = await source.read(p, n);
+    if (!(bytes instanceof Uint8Array) || bytes.length !== n) throw Error("Source changed or short read");
+    h.update(bytes);
+  }
+  return h.hex();
 }
 
 var byteDigest = (bytes) => new Sha256().update(bytes).hex();
@@ -10407,103 +10608,6 @@ function textDifference(a, b) {
 }
 var KEEP_CURRENT_CAPABILITY = "conflict-keep-current-history-v1";
 
-var markdown = (p) => /\.md$/i.test(p);
-function content(doc2, p) {
-  const m = doc2.getMap("files").get(p);
-  if (!m || m.deleted || doc2.getMap("deleted").has(p)) return null;
-  return m.kind === "text" ? { kind: "text", data: doc2.getText("text:" + p).toString() } : { kind: m.kind, hash: m.hash, size: m.size, version: m.version };
-}
-function entries(doc2) {
-  const out = {};
-  for (const p of doc2.getMap("files").keys()) {
-    const c = content(doc2, p);
-    if (c) out[p] = c;
-  }
-  return out;
-}
-function put(doc2, p, c, origin) {
-  if (!supportedFile(p)) throw Error("Unsupported path");
-  if (c.kind !== "text" && c.version && doc2.getMap("blobVersions").has(c.version)) {
-    const v = doc2.getMap("blobVersions").get(c.version);
-    if (v.path !== p) c = { ...c, version: crypto.randomUUID() };
-    else {
-      if (v.hash !== c.hash || v.size !== c.size) throw Error("Immutable version mismatch");
-      return;
-    }
-  }
-  doc2.transact(() => {
-    const files = doc2.getMap("files");
-    doc2.getMap("deleted").delete(p);
-    if (c.kind === "text") {
-      if (!markdown(p)) throw Error("Inline text requires Markdown");
-      if (files.get(p)?.kind === "file" && origin !== "explicit-history-restore") throw Error("Whole-file Markdown cannot silently switch to inline CRDT");
-      patchText(doc2, p, c.data, origin);
-      const prior = files.get(p);
-      if (!prior || prior.deleted || prior.kind !== "text") files.set(p, { kind: "text", deleted: false });
-    } else {
-      const version = c.version || crypto.randomUUID(), v = { path: p, hash: c.hash, size: c.size };
-      validateRef(v);
-      const kind = c.kind === "image" ? "image" : "file";
-      if (markdown(p) && kind !== "file" || imagePath(p) && kind !== "image" || !imagePath(p) && kind !== "file") throw Error("File kind/path mismatch");
-      doc2.getMap("blobVersions").set(version, v);
-      files.set(p, { kind, hash: c.hash, size: c.size, version, deleted: false });
-      if (markdown(p)) {
-        const text2 = doc2.getText("text:" + p);
-        if (text2.length) text2.delete(0, text2.length);
-      }
-    }
-  }, origin);
-}
-function remove(doc2, p, origin) {
-  if (!supportedFile(p)) throw Error("Unsupported path");
-  doc2.transact(() => {
-    doc2.getMap("deleted").set(p, true);
-    doc2.getMap("files").set(p, { kind: doc2.getMap("files").get(p)?.kind || (markdown(p) ? "text" : imagePath(p) ? "image" : "file"), deleted: true });
-  }, origin);
-}
-function validateRef(v) {
-  if (!v || !supportedFile(v.path) || !/^[a-f0-9]{64}$/.test(v.hash) || !Number.isSafeInteger(v.size) || v.size < 0 || v.size > maxFileSize(v.path) || Object.keys(v).some((k) => !["path", "hash", "size"].includes(k))) throw Error("Invalid blob reference or per-file size limit");
-}
-function validate(doc2, hasBlob) {
-  let total = 0, count = 0, active = 0, inline = 0;
-  const names = /* @__PURE__ */ new Set();
-  for (const name of doc2.share.keys()) {
-    if (!["files", "deleted", "blobVersions"].includes(name) && !(name.startsWith("text:") && supportedFile(name.slice(5)) && markdown(name))) throw Error("Invalid V3 document root");
-    if (name.startsWith("text:")) {
-      const n = new TextEncoder().encode(doc2.getText(name).toString()).length;
-      if (n > MAX_INLINE_NOTE) throw Error("Inline note exceeds 16 KiB; explicit whole-file mode required");
-      inline += n;
-    }
-  }
-  if (inline > MAX_INLINE_TOTAL) throw Error("Inline CRDT budget exceeds 128 KiB; explicit whole-file mode required");
-  for (const [id2, v] of doc2.getMap("blobVersions")) {
-    if (!/^[a-f0-9-]{36}$/.test(id2)) throw Error("Invalid version id");
-    validateRef(v);
-    if (hasBlob && !hasBlob(v.hash, v.size)) throw Error("Referenced blob is not durably uploaded");
-  }
-  if (doc2.getMap("deleted").size > MAX_PATHS) throw Error("Tombstone limit 8192");
-  for (const [p, v] of doc2.getMap("deleted")) if (!supportedFile(p) || v !== true) throw Error("Invalid tombstone");
-  for (const [p, m] of doc2.getMap("files")) {
-    if (!supportedFile(p) || !m || !["text", "image", "file"].includes(m.kind) || typeof m.deleted !== "boolean" || m.kind === "text" && !markdown(p) || m.kind === "image" && !imagePath(p) || m.kind === "file" && imagePath(p) || Object.keys(m).some((k) => !["kind", "deleted", "hash", "size", "version"].includes(k))) throw Error("Invalid V3 file metadata");
-    const canonical = p.toLowerCase();
-    if (names.has(canonical)) throw Error("Case-insensitive path collision");
-    names.add(canonical);
-    if (++count > MAX_PATHS) throw Error("Tracked path limit 8192 including tombstones");
-    if (m.deleted || doc2.getMap("deleted").has(p)) continue;
-    if (++active > MAX_ACTIVE_PATHS) throw Error("Active path limit 6000");
-    if (m.kind === "text") total += new TextEncoder().encode(doc2.getText("text:" + p).toString()).length;
-    else {
-      validateRef({ path: p, hash: m.hash, size: m.size });
-      const v = doc2.getMap("blobVersions").get(m.version);
-      if (!v || v.path !== p || v.hash !== m.hash || v.size !== m.size) throw Error("Missing immutable blob version");
-      total += m.size;
-    }
-    if (total > MAX_LIVE_BYTES) throw Error("Active logical content exceeds 256 MiB; server/cache disk also capped");
-  }
-  if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata/text state exceeds 2 MiB");
-  return total;
-}
-
 var PATH_SAFETY_CAPABILITY = "protected-paths-v1";
 var UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 function validatePathOperation(op) {
@@ -10622,97 +10726,6 @@ body.is-mobile .rl-sync-row .rl-sync-badge{font-size:11px;min-height:28px;line-h
 .rl-sync-overview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0 20px}.rl-sync-section,.rl-review-card{border:1px solid var(--background-modifier-border);border-radius:10px;padding:12px 14px;background:var(--background-secondary)}.rl-sync-section strong{display:block;font-size:var(--font-ui-small);color:var(--text-muted);margin-bottom:6px}.rl-sync-section div{line-height:1.6;overflow-wrap:anywhere}.rl-sync-section[data-tone=error],.rl-review-error{color:var(--text-error)}.rl-sync-section[data-tone=warning]{color:var(--text-warning)}.rl-review-card{margin:12px 0}.rl-review-card h3{margin:0 0 8px}.rl-review-paths{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;font-size:var(--font-smaller);line-height:1.6}.rl-review-card summary{cursor:pointer;color:var(--text-muted);padding:6px 0}body.is-mobile .rl-sync-overview{grid-template-columns:1fr}
 .rl-sync-details-note{color:var(--text-muted);font-size:var(--font-ui-small);line-height:1.6}
 `;
-
-var SnapshotScheduler = class {
-  constructor({ capture, persist, delayMs = 0, lastState = "", onError = () => {
-  } }) {
-    Object.assign(this, { capture, persist, delayMs, lastState, onError });
-    this.dirty = false;
-    this.closed = false;
-    this.inFlight = false;
-    this.pending = void 0;
-    this.timer = null;
-    this.error = null;
-    this.job = Promise.resolve();
-  }
-  changed() {
-    if (!this.persist || this.closed) return;
-    this.dirty = true;
-    if (!this.inFlight && this.delayMs === 0) this.flush();
-    else this.arm();
-  }
-  arm() {
-    if (!this.persist || this.closed || this.inFlight || this.timer !== null) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.flush();
-    }, this.delayMs);
-  }
-  flush(force = false) {
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    if (!this.persist) return this.lastState;
-    if (!this.dirty && !force) return this.lastState;
-    const state = this.capture();
-    this.lastState = state;
-    this.dirty = false;
-    if (this.inFlight) this.pending = state;
-    else this.write(state);
-    return state;
-  }
-  write(state) {
-    let value;
-    try {
-      value = this.persist(state);
-    } catch (e) {
-      this.failed(e);
-      return;
-    }
-    if (value && typeof value.then === "function") {
-      this.inFlight = true;
-      this.job = Promise.resolve(value).then(() => this.finish(true), (e) => {
-        this.failed(e);
-        this.finish(false);
-      });
-    } else this.finish(true);
-  }
-  failed(e) {
-    this.error = e;
-    this.dirty = true;
-    this.onError(e);
-  }
-  finish(ok) {
-    this.inFlight = false;
-    if (ok) this.error = null;
-    if (this.pending !== void 0) {
-      const state = this.pending;
-      this.pending = void 0;
-      this.write(state);
-    } else if (ok && this.dirty && !this.closed) this.arm();
-  }
-  async wait() {
-    while (this.inFlight) await this.job;
-    return !this.error;
-  }
-  close() {
-    this.closed = true;
-    this.flush();
-    return this.wait();
-  }
-};
-
-var encode = (bytes) => {
-  const chunks = [];
-  for (let offset = 0; offset < bytes.length; offset += 8192) chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 8192)));
-  return btoa(chunks.join(""));
-};
-var decode = (value) => {
-  const binary = atob(value), bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-};
 
 var NO_PERSIST = (_state) => {
 };
@@ -11647,11 +11660,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   async backgroundTick() {
     const c = this.client;
-    if (!desktopBackgroundEnabled(import_obsidian.Platform) || !document.hidden || this.uiUnloaded || this.stopping || !c || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
-    if (this.isForeground()) {
-      this.foregroundTick();
-      return;
-    }
+    if (!desktopBackgroundEnabled(import_obsidian.Platform) || this.uiUnloaded || this.stopping || !c || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
     await boundedDesktopCheck({ client: c, timers: this.desktopTimers, isCurrent: () => this.client === c && !this.uiUnloaded && !this.stopping });
     if (this.client !== c || this.uiUnloaded || this.stopping || !c.ready) return;
     void c.confirmUploads().catch(() => {
@@ -12798,6 +12807,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
     }, state: this.settings.state || void 0, onStatus: (s) => this.setConnectionStatus((s === "\u5DF2\u8FDE\u63A5" || s === "\u5DF2\u540C\u6B65") && (!this.syncedOnce || this.initializing) ? "\u5DF2\u9274\u6743\uFF0C\u6B63\u5728\u51C6\u5907\u6D4B\u8BD5\u6587\u4EF6" : s), persistDelayMs: 200, onPersist: async (s) => {
+      const incoming = newlyReceivedPaths(this.settings.state, s, (p) => !this.app.vault.getAbstractFileByPath(p) && !this.pathBlocked(p) && !c.pending.some((v) => v.path === p));
+      if (incoming.length) {
+        const prior = this.settings.receivePending;
+        if (prior && prior.serverId !== c.serverId) throw Error("\u63A5\u6536\u8BA1\u5212\u7ED1\u5B9A\u5176\u4ED6\u670D\u52A1\u5668\uFF0C\u672A\u5E94\u7528");
+        this.settings.receivePending = { serverId: c.serverId, paths: [.../* @__PURE__ */ new Set([...prior?.paths || [], ...incoming])] };
+      }
       this.settings.state = s;
       this.settings.outbox = c.pendingPaths;
       this.settings.stateOrigin = activeOrigin;
@@ -12859,6 +12874,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (hadState) {
       const missing = [.../* @__PURE__ */ new Set([...Object.keys(entries(c.doc)), ...c.pending.map((p) => p.path)])].filter((p) => !this.app.vault.getAbstractFileByPath(p) && !this.pathBlocked(p) && !(this.settings.receivePending?.serverId === c.serverId && this.settings.receivePending?.paths.includes(p)));
       if (missing.length) {
+        this.setConnectionStatus("\u7B49\u5F85\u7F3A\u5931\u6587\u4EF6\u6062\u590D\u786E\u8BA4\uFF0C\u5C1A\u672A\u8FDE\u63A5\uFF1B\u539F\u5185\u5BB9\u548C\u961F\u5217\u4FDD\u7559");
         const choice = await this.resolveMissing(missing);
         if (choice === "cancel") {
           this.stop();

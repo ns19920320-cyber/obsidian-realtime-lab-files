@@ -11128,6 +11128,7 @@ var BlobTransfer = class {
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
     super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], beforeUpload: async (context) => {
+      if (context.isCurrent()) this.connectionProgressAt = Date.now();
       await options.beforeUpload?.(context);
       if (!context.isCurrent()) return;
       if (this.pending.length) {
@@ -11136,7 +11137,10 @@ var VaultClientV3 = class extends VaultClient {
           if (!context.isCurrent()) return;
           if (options.retryDue && !options.retryDue(p.path)) continue;
           try {
-            await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY) });
+            await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY), onProgress: () => {
+              if (context.isCurrent()) this.connectionProgressAt = Date.now();
+            } });
+            if (context.isCurrent()) this.connectionProgressAt = Date.now();
           } catch (e) {
             if (!options.onRetryFailure || /401|403|identity mismatch/i.test(String(e.message || e))) throw e;
             await options.onRetryFailure(p.path, e);
@@ -11198,6 +11202,7 @@ var VaultClientV3 = class extends VaultClient {
     super.connect();
     if (!this.ws || this.ws === previous) return;
     this.connectionStartedAt = Date.now();
+    this.connectionProgressAt = this.connectionStartedAt;
     this.terminalCloseCode = void 0;
     const ws = this.ws, closed = ws.onclose;
     ws.onclose = (e) => {
@@ -11277,7 +11282,7 @@ var VaultClientV3 = class extends VaultClient {
   async checkConnection() {
     if (this.stopped || this.transportBlocked || this.terminalCloseCode) return false;
     if (!this.ready) {
-      if (!this.ws || Date.now() - (this.connectionStartedAt || 0) >= 3e4) this.resume();
+      if (!this.ws || Date.now() - Math.max(this.connectionStartedAt || 0, this.connectionProgressAt || 0) >= 3e4) this.resume();
       return false;
     }
     if (this.healthCheck) return this.healthCheck;

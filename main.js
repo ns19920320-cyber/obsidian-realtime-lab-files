@@ -9336,7 +9336,7 @@ function errorCode(error) {
   if (/invalid|无效|校验/i.test(s)) return "invalid-data";
   if (/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
   if (/File system operation timed out|\b(?:EBUSY|EAGAIN|EMFILE|ENFILE)\b/i.test(s)) return "filesystem-transient";
-  if (/network|fetch|load failed|disconnected|timeout|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s)) return "network-transient";
+  if (/network|fetch|load failed|disconnected|not connected|timeout|timed out|Audit interrupted|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s)) return "network-transient";
   return "unknown-error";
 }
 var auditCounts = ["equal", "missing", "different", "local-only", "queued", "excluded", "read-error", "downloaded", "uploaded", "refused"];
@@ -9352,19 +9352,24 @@ function validateDiagnosticDetails(v) {
 }
 function diagnosticDetails(p) {
   const c = p.client, reasons = /* @__PURE__ */ new Set();
-  for (const e of [p.operationError, c?.lastError, p.conflictError, ...p.fileFailures.values()]) {
+  for (const e of [p.operationError, c?.lastError, p.conflictError, p.consistencyError, ...p.fileFailures.values()]) {
     const code = errorCode(e);
     if (code) reasons.add(code);
   }
   const flags = { "initializing": p.initializing || !p.syncedOnce, "receiving": p.reflection.queued || p.downloadPaths.size, "uploading": p.fileUploads.queued, "local-operation": p.localOperations || p.writing.size, "transferring": c?.binaryBusy, "saving": p.receiveAcks.size || p.receiptFlush || c?.persistence.dirty || c?.persistence.inFlight, "recovering": p.recoveryBusy, "stopping": p.stopping, "conflict-check": p.conflictError, "conflict": p.conflicts.length, "path-review": p.settings.pathSafety?.items.length || p.settings.remoteDeleteReview?.paths.length, "consistency-hold": p.settings.consistencyHolds?.length, "consistency-difference": p.consistencyIssues() };
   for (const [k, on] of Object.entries(flags)) if (on) reasons.add(k);
   const r2 = p.consistencyReport, counts = Object.fromEntries(auditCounts.map((k) => [k, k === "refused" ? r2?.refused?.length || 0 : r2?.counts?.[k] ?? r2?.[k] ?? 0]));
-  return validateDiagnosticDetails({ reasons: [...reasons], audit: { enabled: !!p.settings.autoConsistency, phase: p.consistencyBusy ? "running" : p.consistencyPhase || "never", reason: p.consistencyReason || "none", checkedAt: r2?.checkedAt ?? null, stable: !!r2?.stable, current: !!r2?.stable && r2.serverId === c?.serverId && p.consistencyDigest === p.currentDigest() && p.consistencyAuditEpoch === p.consistencyEpoch, limited: !!r2?.limited, counts } });
+  return validateDiagnosticDetails({ reasons: [...reasons], audit: { enabled: !!p.settings.autoConsistency, phase: p.consistencyBusy ? "running" : p.consistencyPhase || "never", reason: p.consistencyReason || "none", checkedAt: r2?.checkedAt ?? null, stable: !!r2?.stable, current: !p.consistencyBusy && p.consistencyPhase === "complete" && !!r2?.stable && r2.serverId === c?.serverId && p.consistencyDigest === p.currentDigest() && p.consistencyAuditEpoch === p.consistencyEpoch, limited: !!r2?.limited, counts } });
 }
 function diagnosticDetailsText(d) {
   if (!d) return "\u8BE6\u7EC6\u8BCA\u65AD\uFF1A\u8BBE\u5907\u6216\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301";
   const a = d.audit;
   return "\u5F02\u5E38/\u5FD9\u788C\u539F\u56E0\uFF1A" + (d.reasons.map((r2) => ({ "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "metadata-not-ready": "\u5143\u6570\u636E\u672A\u5C31\u7EEA", "authentication": "\u9274\u6743\u5931\u8D25", "identity": "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", "quota": "\u5BB9\u91CF\u9650\u5236", "persistence": "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "invalid-data": "\u6570\u636E\u6821\u9A8C\u5F02\u5E38", "unknown-error": "\u672A\u5206\u7C7B\u9519\u8BEF\uFF08\u9700\u672C\u673A\u8BE6\u60C5\uFF09", "initializing": "\u521D\u59CB\u5316\u4E2D", "receiving": "\u63A5\u6536\u4E2D", "uploading": "\u4E0A\u4F20\u4E2D", "local-operation": "\u672C\u5730\u5904\u7406", "transferring": "\u4F20\u8F93\u4E2D", "saving": "\u4FDD\u5B58\u4E2D", "recovering": "\u91CD\u8BD5\u6062\u590D\u4E2D", "stopping": "\u6B63\u5728\u65AD\u5F00", "conflict-check": "\u51B2\u7A81\u68C0\u67E5\u672A\u786E\u8BA4", "conflict": "\u6709\u51B2\u7A81", "path-review": "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u786E\u8BA4", "consistency-hold": "\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D", "consistency-difference": "\u4E00\u81F4\u6027\u6709\u5DEE\u5F02" })[r2] || r2).join("\u3001") || "\u65E0") + "\uFF1B\u81EA\u52A8\u6838\u5BF9\uFF1A" + (a.enabled ? "\u5F00\u542F" : "\u5173\u95ED") + "\uFF1B\u9636\u6BB5\uFF1A" + a.phase + "\uFF1B\u6838\u5BF9\u65F6\u95F4\uFF1A" + (a.checkedAt ? new Date(a.checkedAt).toISOString() : "\u5C1A\u672A\u6838\u5BF9") + "\uFF1B\u7ED3\u679C\u4ECD\u9002\u7528\uFF1A" + a.current + "\uFF1B\u7ED3\u679C\uFF1A" + JSON.stringify(a.counts) + "\uFF1B\u6682\u7F13\u539F\u56E0\uFF1A" + a.reason;
+}
+function auditFailure(error, stage) {
+  const message = String(error?.message || error), code = stage === "save-baseline" ? "persistence" : errorCode(error);
+  const reason = message.includes("\u51B2\u7A81\u72B6\u6001") ? "conflict-unverified" : message.includes("\u57FA\u7EBF\u65E0\u6548") ? "baseline-invalid" : /变化|Audit interrupted/.test(message) ? "changed" : ["network-transient", "metadata-not-ready", "filesystem-transient", "cache-staging-busy", "transferring"].includes(code) ? "queue-active" : "unknown-error";
+  return { reason, code };
 }
 
 var RetryLedger = class {
@@ -11438,6 +11443,8 @@ var equal = (a, b) => a?.kind === b?.kind && (a?.kind === "text" ? a.data === b?
 var MAX_IMAGE2 = 5 * 1024 * 1024;
 var BACKUP = ".realtime-lab-v3-recovery";
 var RealtimeLab = class extends import_obsidian.Plugin {
+  consistencyError = "";
+  consistencyStage = "idle";
   consistencyPhase = "never";
   consistencyReason = "none";
   consistencyDigest = "";
@@ -11733,6 +11740,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       return;
     }
     this.consistencyReason = "none";
+    this.consistencyError = "";
+    this.consistencyDigest = "";
+    this.consistencyAuditEpoch = -1;
+    this.consistencyStage = "conflict-check";
     this.consistencyBusy = true;
     this.consistencyStatus = "\u6B63\u5728\u9010\u6587\u4EF6\u6838\u5BF9";
     let downloaded = 0, uploaded = 0;
@@ -11740,6 +11751,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     try {
       await this.refreshConflicts();
       if (this.conflictError) throw Error("\u51B2\u7A81\u72B6\u6001\u5C1A\u672A\u6838\u5B9E\uFF0C\u672A\u81EA\u52A8\u8865\u4F20");
+      this.consistencyStage = "scan";
       const report = await this.scanConsistency();
       this.consistencyReport = report;
       if (!report.stable) throw Error("\u6838\u5BF9\u671F\u95F4\u540C\u6B65\u5185\u5BB9\u53D8\u5316\uFF0C\u7B49\u5F85\u4E0B\u6B21\u6838\u5BF9");
@@ -11764,7 +11776,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         for (const path of Object.keys(entries(c.doc))) this.noteConsistencyPath(path);
       } else for (const hash of this.settings.consistencySeen) this.consistencySeen.add(hash);
       for (const f of this.app.vault.getFiles()) this.noteConsistencyPath(f.path);
+      this.consistencyStage = "plan";
       const deleted = [...c.doc.getMap("deleted").keys(), ...[...c.doc.getMap("files")].filter(([, v]) => v.deleted).map(([p]) => p)], plan = safeConsistencyPlan(report, { deleted, conflicts: this.conflicts.map((r2) => r2.path), seen: [...this.consistencySeen] });
+      this.consistencyStage = "repair";
       for (const item of plan.slice(0, 50)) {
         if (!idle()) break;
         try {
@@ -11805,8 +11819,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           refused.push({ path: item.path, error: this.safeError(e) });
         }
       }
+      this.consistencyStage = "save-baseline";
       this.settings.consistencySeen = [...this.consistencySeen];
       await this.persistConfig();
+      this.consistencyStage = "verify";
       const verified = await this.scanConsistency();
       this.consistencyPhase = verified.stable ? "complete" : "deferred";
       this.consistencyReason = verified.stable ? "none" : "changed";
@@ -11815,13 +11831,16 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.consistencyReport = { ...verified, downloaded, uploaded, refused, limited: plan.length > 50 };
       this.consistencyStatus = (verified.stable ? "\u6838\u5BF9\u5B8C\u6210" : "\u672C\u8F6E\u6709\u65B0\u53D8\u5316\uFF0C\u5F85\u4E0B\u8F6E\u6838\u5BF9") + "\uFF1A\u4E00\u81F4" + verified.counts.equal + "\uFF0C\u8865\u6536" + downloaded + "\uFF0C\u8865\u4F20" + uploaded + "\uFF0C\u6B63\u6587\u5DEE\u5F02" + verified.counts.different + "\uFF0C\u672A\u8865\u9F50" + (verified.counts.missing + verified.counts["local-only"]) + "\uFF0C\u6682\u7F13" + refused.length + (plan.length > 50 ? "\uFF08\u5176\u4F59\u4E0B\u8F6E\u7EE7\u7EED\uFF09" : "");
     } catch (e) {
+      const failure = auditFailure(e, this.consistencyStage);
       this.consistencyPhase = "deferred";
-      const message = String(e);
-      this.consistencyReason = message.includes("\u51B2\u7A81\u72B6\u6001") ? "conflict-unverified" : message.includes("\u57FA\u7EBF\u65E0\u6548") ? "baseline-invalid" : /变化/.test(message) ? "changed" : "unknown-error";
-      this.consistencyStatus = "\u6838\u5BF9\u6682\u7F13\uFF1A" + this.safeError(e);
+      this.consistencyReason = failure.reason;
+      this.consistencyError = failure.code === "persistence" ? "\u672C\u5730\u4FDD\u5B58\u5931\u8D25\uFF1A" + this.safeError(e) : this.safeError(e);
+      this.consistencyDigest = "";
+      this.consistencyAuditEpoch = -1;
+      this.consistencyStatus = "\u6838\u5BF9\u6682\u7F13\uFF08" + this.consistencyStage + "\uFF09\uFF1A" + this.safeError(e);
     } finally {
       this.consistencyBusy = false;
-      this.consistencyNextAt = Date.now() + (this.consistencyPhase === "complete" ? 6e5 : this.consistencyReason === "changed" ? 3e4 : 6e4);
+      this.consistencyNextAt = Date.now() + (this.consistencyPhase === "complete" ? 6e5 : ["changed", "queue-active"].includes(this.consistencyReason) ? 3e4 : 6e4);
       this.updateProgress();
     }
   }

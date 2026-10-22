@@ -21,3 +21,11 @@ test('diagnostic details are bounded allowlisted and cannot carry raw errors, pa
  const doc=new Y.Doc(),store=new DeviceDiagnostics(),ws={readyState:1};store.report(ws,{...report(doc),details});assert.equal(store.snapshot(documentDigest(doc),0)[0].completeAtReport,false);store.report(ws,{...report(doc),details:{...details,reasons:[]}});assert(store.snapshot(documentDigest(doc),0)[0].completeAtReport);assert.equal(store.snapshot(documentDigest(doc),0)[0].details.audit.counts.equal,0);
 });
 test('cached upload reconnect prerequisite reports metadata readiness rather than unknown error',async()=>{const {errorCode}=await import('../src/v3/diagnostic-details.mjs');assert.equal(errorCode('Connect before resuming cached uploads'),'metadata-not-ready');});
+
+test('audit prerequisites and interrupted scans use retry causes without leaking raw failure details',async()=>{
+ const {auditFailure,errorCode}=await import('../src/v3/diagnostic-details.mjs');
+ for(const message of ['Not connected','Request timeout','Disconnected','Network operation timed out']){const f=auditFailure(Error(message),'verify');assert.equal(f.reason,'queue-active');assert.equal(f.code,'network-transient');}
+ assert.equal(auditFailure(Error('Audit interrupted; files preserved'),'scan').reason,'changed');
+ assert.deepEqual(auditFailure(Error('/synthetic/private/path token=secret'),'save-baseline'),{reason:'unknown-error',code:'persistence'});
+ assert.equal(errorCode('本地保存失败：synthetic failure'),'persistence');
+});

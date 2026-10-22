@@ -550,3 +550,15 @@ test('foreground and native heartbeat cannot bypass missing-file startup confirm
  const {p,mem}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;const f=await mem.v.create('synthetic-confirm.md','preserved original');await p.queue;await p.stop();mem.files.delete(f.path);mem.data.delete(f.path);
  let decide,asked=false;p.resolveMissing=async()=>{asked=true;return await new Promise(r=>decide=r);};t.after(()=>decide?.('cancel'));const starting=p.start();await wait(()=>asked);const c=p.client;assert(!c.ws);p.resumeForeground(true);await p.backgroundTick();assert(!c.ws,'no handshake before explicit recovery direction');decide('restore');await starting;await wait(()=>c.ready&&p.syncedOnce);assert.equal(c.serverId,p.settings.serverId);
 });
+
+test('audit timeout and disconnect report a concrete cause, retain data and retry to a fresh complete result',async t=>{
+ const {diagnosticDetails}=await import('../src/v3/diagnostic-details.mjs');
+ const {p,mem,other,server}=await env(t);await other.putFile('合成核对.md',bytesSource(new TextEncoder().encode('正文必须保留')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;await p.client.confirmUploads();await p.runSafeConsistency();assert.equal(p.consistencyPhase,'complete');
+ const scan=p.scanConsistency.bind(p),persist=p.persistConfig.bind(p),data=structuredClone([...mem.data]),history=JSON.stringify(await other.request('history',{path:'合成核对.md'})),pending=JSON.stringify(p.client.pending),plans=JSON.stringify(p.settings.pathSafety);
+ for(const scenario of [{stage:'scan',error:'Not connected',n:1,code:'network-transient'},{stage:'verify',error:'Request timeout',n:2,code:'network-transient'},{stage:'save-baseline',error:'synthetic disk unavailable',code:'persistence'}]){
+  let calls=0;p.scanConsistency=async()=>{if(++calls===scenario.n)throw Error(scenario.error);return scan()};p.persistConfig=async()=>{if(scenario.stage==='save-baseline')throw Error(scenario.error);return persist()};
+  const started=Date.now();await p.runSafeConsistency();let detail=diagnosticDetails(p);assert.equal(detail.audit.phase,'deferred');assert.equal(detail.audit.current,false);assert(detail.reasons.includes(scenario.code));assert(p.consistencyStatus.includes(scenario.stage));assert(p.consistencyNextAt>started);assert(p.consistencyNextAt<Date.now()+61000);assert.equal(p.consistencyBusy,false);
+  assert.deepEqual([...mem.data],data);assert.equal(JSON.stringify(await other.request('history',{path:'合成核对.md'})),history);assert.equal(JSON.stringify(p.client.pending),pending);assert.equal(JSON.stringify(p.settings.pathSafety),plans);
+  p.scanConsistency=scan;p.persistConfig=persist;p.settings.autoConsistency=true;p.consistencyNextAt=0;p.foregroundTick();await wait(()=>!p.consistencyBusy&&p.consistencyPhase==='complete');detail=diagnosticDetails(p);assert.equal(detail.audit.current,true);assert.equal(detail.audit.reason,'none');assert.equal(detail.audit.counts.equal,1);assert.equal(p.consistencyError,'');assert(!detail.reasons.includes(scenario.code));
+ }
+});

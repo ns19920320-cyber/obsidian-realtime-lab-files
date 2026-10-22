@@ -95,11 +95,11 @@ test('optional numeric performance diagnostics coexist with old reports and pres
 test('V3 watchdog recovers a stale CLOSING transport without touching document or pending queues',async t=>{
  const e=await setup(t),a=await e.add(),old=a.ws,doc=a.doc,id=a.serverId;
  const pending=a.pending,outbox=a.localOutbox;old.onclose=null;old.onopen=null;old.onmessage=null;old.onerror=null;old.terminate();
- a.ready=false;a.ws={readyState:2,close(){}};a.connectionStartedAt=Date.now()-31000;
+ a.ready=false;a.ws={readyState:2,close(){}};a.connectionStartedAt=Date.now()-31000;a.connectionProgressAt=a.connectionStartedAt;
  await a.checkConnection();await wait(()=>a.ready);assert.equal(a.doc,doc);assert.equal(a.serverId,id);assert.equal(a.pending,pending);assert.equal(a.localOutbox,outbox);
 });
 test('V3 watchdog recovers a missing welcome and does not bypass terminal authentication rejection',async t=>{
- const e=await setup(t),a=await e.add(),old=a.ws;a.ready=false;a.connectionStartedAt=Date.now()-31000;
+ const e=await setup(t),a=await e.add(),old=a.ws;a.ready=false;a.connectionStartedAt=Date.now()-31000;a.connectionProgressAt=a.connectionStartedAt;
  await a.checkConnection();await wait(()=>a.ready&&a.ws!==old);
  a.terminalCloseCode=4401;const ws=a.ws;a.ready=false;a.connectionStartedAt=0;assert.equal(a.resume(),false);await a.checkConnection();assert.equal(a.ws,ws);
 });
@@ -181,4 +181,12 @@ test('genuinely new offline content still preserves both conflict branches and e
 });
 test('unchanged cached base does not enter the durable upload queue',async t=>{
  const {DiskBlobCache}=await import('../src/v3/disk-cache.mjs');const e=await setup(t);let pending,writes=0;const a=await e.add({blobCache:new DiskBlobCache(path.join(e.dir,'unchanged-cache')),onPending:async v=>{pending=structuredClone(v);writes++},onPersist:async()=>{}}),b=new TextEncoder().encode('same');await a.putFile('synthetic-same.md',source(b),{base:null});const before=writes;await a.stageFile('synthetic-same.md',source(b));assert.equal(a.pending.length,0);assert.equal(writes,before);
+});
+
+test('productive cached preparation exceeding handshake age keeps its socket and drains all retained versions',async t=>{
+ const {DiskBlobCache}=await import('../src/v3/disk-cache.mjs'),e=await setup(t),cache=new DiskBlobCache(path.join(e.dir,'productive-prepare')),items=[];
+ for(let i=0;i<29;i++){const ref=await cache.stage(source(new Uint8Array([44,i,1])));items.push({path:'synthetic-prepare/'+i+'.json',...ref,version:crypto.randomUUID(),base:null});}
+ let saved;const c=new VaultClientV3({url:'ws://127.0.0.1:'+e.server.port,token,WebSocketImpl:WebSocket,serverId:e.server.serverId,pending:{protocol:3,serverId:e.server.serverId,items},blobCache:cache,onPending:async p=>saved=structuredClone(p),onPersist:async()=>{}});t.after(()=>c.close());
+ const upload=c.blobs.upload.bind(c.blobs);let preparations=0,ws;c.blobs.upload=async(...args)=>{if(preparations){c.connectionStartedAt=Date.now()-31000;await c.checkConnection();assert.equal(c.ws,ws,'completed preparation must renew handshake inactivity deadline');}else ws=c.ws;const result=await upload(...args);preparations++;return result;};
+ c.connect();await wait(()=>c.ready);assert.equal(preparations,29);assert.equal(c.ws,ws);assert.equal(c.pending.length,29);await c.flushPending();assert.equal(saved.items.length,0);for(const p of items){assert.equal(content(e.server.doc,p.path)?.hash,p.hash);assert.deepEqual(await cache.source(p).read(0,p.size),new Uint8Array([44,Number(p.path.split('/').at(-1).split('.')[0]),1]));}
 });

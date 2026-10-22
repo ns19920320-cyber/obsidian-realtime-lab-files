@@ -59,4 +59,4 @@ jobs:
           (cd work/release && zip -q plugin.zip main.js manifest.json)
           git archive --format=zip --output=work/release/source.zip HEAD
           (cd work/release && sha256sum main.js manifest.json plugin.zip README.md source.zip versions.json > SHA256SUMS)
-          gh release create "$version" work/release/* --target "$GITHUB_SHA" --latest --title "$version" --notes-file RELEASE-NOTES-alpha43.md
+          gh release create "$version" work/release/* --target "$GITHUB_SHA" --latest --title "$version" --notes-file RELEASE-NOTES-alpha44.md

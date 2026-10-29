@@ -8,3 +8,16 @@ test('text difference is bounded and does not render Markdown or HTML',()=>{asse
 test('offline change after remote deletion remains deleted until explicit decision and both versions stay recoverable',async t=>{const e=await env(t),a=await e.add();await a.putFile('删改.md',source('before delete'));const base=content(a.doc,'删改.md');remove(a.doc,'删改.md');await a.request('barrier');await a.putFile('删改.md',source('offline changed'),{base,preserveDeleted:true});assert.equal(content(e.server.doc,'删改.md'),null);const [review]=await a.request('conflicts');assert(review);assert.equal(review.versions.length,2);await a.request('resolve-conflict',{path:review.path,reviewId:review.id,expected:null,strategy:'keep-both'});assert.equal(content(e.server.doc,'删改.md'),null);assert.equal([...e.server.doc.getMap('files').keys()].filter(p=>p.startsWith('冲突副本/')).length,2);});
 
 test('replay of an acknowledged immutable publication does not create duplicate conflicts or writes',async t=>{const e=await env(t),a=await e.add();await a.putFile('重试.md',source('one'));const base=content(a.doc,'重试.md');await a.putFile('重试.md',source('two'));const version=crypto.randomUUID();await a.putFile('重试.md',source('three'),{base,version});const rows=await a.request('conflicts'),writes=e.server.writeCount;await a.putFile('重试.md',source('three'),{base,version});assert.equal(e.server.writeCount,writes);assert.deepEqual(await a.request('conflicts'),rows);});
+
+test('same-name concurrent recreation accepts one generation and preserves the other source for review',async t=>{
+ const {deletionGeneration}=await import('../src/v3/deletion-generation.mjs');const e=await env(t),a=await e.add(),b=await e.add(),p='同名新建.md';
+ await a.putFile(p,source('old incarnation'));remove(a.doc,p);await a.request('barrier');await wait(()=>b.doc.getMap('deleted').has(p));
+ const generation=deletionGeneration(a.doc,p),version=crypto.randomUUID();
+ await a.putFile(p,source('device A new body'),{base:null,preserveDeleted:true,recreateAfter:generation,version});
+ const writes=e.server.writeCount;await a.putFile(p,source('device A new body'),{base:null,preserveDeleted:true,recreateAfter:generation,version});assert.equal(e.server.writeCount,writes);
+ await assert.rejects(b.putFile(p,source('device B new body'),{base:null,preserveDeleted:true,recreateAfter:generation}),/generation changed/);
+ assert.equal(new TextDecoder().decode(e.server.blobs.read(content(e.server.doc,p).hash,0)),'device A new body');
+ assert((await a.request('history',{path:p})).some(v=>v.deleted));
+ remove(a.doc,p);await a.request('barrier');assert.notEqual(deletionGeneration(a.doc,p),generation);
+ await assert.rejects(b.putFile(p,source('stale delayed recreation'),{base:null,preserveDeleted:true,recreateAfter:generation}),/generation changed/);assert.equal(content(e.server.doc,p),null);
+});

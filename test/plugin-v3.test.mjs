@@ -22,6 +22,18 @@ async function env(t){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'v3-plugin-
 test('V3 plugin adapter receives image via chunk cache and text updates do not reread original binary',async t=>{const {p,other,mem}=await env(t);const bytes=new Uint8Array(32768*3+7).fill(61),ref=await other.putImage('图片/手机.png',bytesSource(bytes));put(other.doc,'文字.md',{kind:'text',data:'first'});await p.start();await wait(()=>mem.files.has('图片/手机.png')&&mem.data.get('文字.md')==='first');assert.deepEqual(new Uint8Array(mem.data.get('图片/手机.png')),bytes);const reads=mem.binaryReads;for(let i=0;i<5;i++){put(other.doc,'文字.md',{kind:'text',data:'文字'+i});await wait(()=>mem.data.get('文字.md')==='文字'+i);}assert.equal(mem.binaryReads,reads);assert(mem.maxChunk<=32768);assert.equal(content(p.client.doc,'图片/手机.png').hash,ref.hash);assert(p.saved.protocol===3);});
 test('V3 plugin reads local source once, uploads refs and keeps binary out of settings',async t=>{const {p,other,mem,server}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);const bytes=new Uint8Array(32768*2+9).fill(47),before=mem.binaryReads;await mem.v.createBinary('电脑.png',bytes.buffer);await wait(()=>content(other.doc,'电脑.png'));assert.equal(mem.binaryReads-before,1);await p.stop();assert(p.saved.state.length<5000);assert(!p.saved.state.includes('Ly8vLy8v'));assert(server.blobs.has(content(other.doc,'电脑.png').hash,bytes.length));assert(mem.maxChunk<=32768);});
 test('V3 plugin backs up binary before remote deletion and excludes private cache paths',async t=>{const {p,other,mem,server}=await env(t);const bytes=new Uint8Array([1,3,5,7]);await other.putImage('恢复.png',bytesSource(bytes));await p.start();await wait(()=>mem.files.has('恢复.png'));remove(other.doc,'恢复.png');await wait(()=>!mem.files.has('恢复.png'));assert([...mem.data].some(([k,v])=>k.startsWith('.realtime-lab-v3-recovery/')&&v instanceof ArrayBuffer&&new Uint8Array(v).length===4));assert([...server.doc.getMap('files').keys()].every(k=>!k.startsWith('.')));});
+test('recreated local file survives a previously observed remote deletion on restart',async t=>{
+ const {p,other,mem,server}=await env(t),path='未命名.md';
+ await other.putFile(path,bytesSource(new TextEncoder().encode('old synthetic file')));
+ await p.start();await wait(()=>p.syncedOnce&&mem.files.has(path));
+ remove(other.doc,path);await wait(()=>!mem.files.has(path)&&!content(server.doc,path));
+ await p.stop();await p.queue;const saved=structuredClone(p.saved);
+ await mem.v.create(path,'new synthetic file');
+ const next=new bundle.default();next.app=p.app;await next.onload();next.settings=saved;
+ t.after(async()=>{await next.stop();await next.queue;});
+ await next.start();await wait(()=>next.syncedOnce&&!next.initializing);
+ assert.equal(mem.data.get(path),'new synthetic file','old deletion must not trash a newly created file');
+});
 test('V3 plugin refuses legacy settings and V2 markers; explicit rejected-settings backup preserves old state',async t=>{const {p,mem}=await env(t);const old={state:'old-encoded-state',token:'synthetic-legacy-only',url:'ws://127.0.0.1:1'};p.legacyConfig=old;await p.start();assert.equal(p.client,null);await assert.rejects(p.persistConfig(),/拒绝覆盖/);await p.backupRejectedState();assert.equal(p.legacyConfig,null);assert.equal(p.saved.protocol,3);assert([...mem.data].some(([k,v])=>k.includes('rejected-old-settings')&&JSON.parse(v).state===old.state));mem.data.set('realtime-lab-v2.json','{"isolatedLab":true,"protocol":2}');assert.equal(await p.allowed(),false);await p.start();assert.equal(p.client,null);});
 test('mobile-compatible chunk cache survives reopen with partial progress and checks quota before writing',async()=>{const {ObsidianBlobCache}=await import('../src/v3/obsidian-cache.mjs'),{hashSource}=await import('../src/v3/sha256.mjs'),m=vault(),b=new Uint8Array(32768*2+7).fill(17),ref={hash:await hashSource(bytesSource(b)),size:b.length};let cache=new ObsidianBlobCache(m.v.adapter);await cache.sink(ref).write(0,b.subarray(0,32768));cache=new ObsidianBlobCache(m.v.adapter);assert.equal(await cache.sink(ref).length(),32768);await cache.sink(ref).write(32768,b.subarray(32768,65536));await cache.sink(ref).write(65536,b.subarray(65536));await cache.sink(ref).commit();assert.deepEqual(new Uint8Array(await cache.materialize(ref)),b);assert(m.maxChunk<=32768);m.data.set('.realtime-lab-v3-cache/quota/state.json',JSON.stringify({size:5*1024*1024}));for(let i=0;i<104;i++){await m.v.adapter.mkdir('.realtime-lab-v3-cache/quota'+i);m.data.set('.realtime-lab-v3-cache/quota'+i+'/state.json',JSON.stringify({size:5*1024*1024}));}cache=new ObsidianBlobCache(m.v.adapter);await assert.rejects(cache.stage(bytesSource(new Uint8Array([1]))),/quota/);});
 test('V3 plugin cold restart publishes offline image edits from private chunk cache',async t=>{const {p,mem,other,server}=await env(t);await p.start();await wait(()=>p.client?.ready&&p.syncedOnce);const f=await mem.v.createBinary('重启.png',new Uint8Array([1,2,3]).buffer);await wait(()=>content(other.doc,'重启.png'));p.client.stopped=true;p.client.ws.close();await wait(()=>!p.client.ready);await mem.v.modifyBinary(f,new Uint8Array([4,5,6]).buffer);await p.queue;assert(p.settings.pending?.items.length);await p.stop();const next=new bundle.default();next.app=p.app;await next.onload();next.settings=structuredClone(p.saved);t.after(async()=>{await next.stop();await next.queue;});await next.start();await wait(()=>next.client?.ready&&next.syncedOnce&&next.settings.pending.items.length===0);const ref=content(other.doc,'重启.png');await wait(()=>content(server.doc,'重启.png')?.hash===content(next.client.doc,'重启.png')?.hash);assert.deepEqual([...server.blobs.read(content(server.doc,'重启.png').hash,0)],[4,5,6]);assert([...mem.data.keys()].some(k=>k.startsWith('.realtime-lab-v3-cache/')));});
@@ -561,4 +573,48 @@ test('audit timeout and disconnect report a concrete cause, retain data and retr
   assert.deepEqual([...mem.data],data);assert.equal(JSON.stringify(await other.request('history',{path:'合成核对.md'})),history);assert.equal(JSON.stringify(p.client.pending),pending);assert.equal(JSON.stringify(p.settings.pathSafety),plans);
   p.scanConsistency=scan;p.persistConfig=persist;p.settings.autoConsistency=true;p.consistencyNextAt=0;p.foregroundTick();await wait(()=>!p.consistencyBusy&&p.consistencyPhase==='complete');detail=diagnosticDetails(p);assert.equal(detail.audit.current,true);assert.equal(detail.audit.reason,'none');assert.equal(detail.audit.counts.equal,1);assert.equal(p.consistencyError,'');assert(!detail.reasons.includes(scenario.code));
  }
+});
+
+test('observed create event recreates deleted filename with guarded generation and retains history',async t=>{
+ const {p,other,mem,server}=await env(t),path='新建代次.md';
+ await other.putFile(path,bytesSource(new TextEncoder().encode('old synthetic body')));
+ await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has(path));
+ remove(other.doc,path);await wait(()=>!mem.files.has(path));
+ await mem.v.create(path,'new synthetic body');await p.queue;
+ await wait(()=>content(server.doc,path)&&p.client.pending.length===0);await p.queue;
+ assert.equal(mem.data.get(path),'new synthetic body');
+ assert.equal(new TextDecoder().decode(server.blobs.read(content(server.doc,path).hash,0)),'new synthetic body');
+ assert((await other.request('history',{path})).some(v=>v.deleted));
+});
+
+test('offline same-name recreation persists generation and resumes after cold restart',async t=>{
+ const {p,other,mem,server}=await env(t),path='离线新建代次.md';
+ await other.putFile(path,bytesSource(new TextEncoder().encode('old body')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has(path));
+ remove(other.doc,path);await wait(()=>!mem.files.has(path));p.client.stopped=true;p.client.ws.close();await wait(()=>!p.client.ready);
+ await mem.v.create(path,'offline new body');await p.queue;assert(p.settings.pending.items[0].recreateAfter);await p.stop();await p.queue;
+ const next=new bundle.default();next.app=p.app;await next.onload();next.settings=structuredClone(p.saved);t.after(async()=>{await next.stop();await next.queue;});
+ await next.start();await wait(()=>next.syncedOnce&&!next.initializing&&next.client.pending.length===0&&content(server.doc,path));
+ assert.equal(mem.data.get(path),'offline new body');assert.equal(new TextDecoder().decode(server.blobs.read(content(server.doc,path).hash,0)),'offline new body');
+});
+
+test('concurrent same-name recreation keeps losing device body and durable pending version after restart',async t=>{
+ const {deletionGeneration}=await import('../src/v3/deletion-generation.mjs');const {p,other,mem,server}=await env(t),path='并发新建代次.md';
+ await other.putFile(path,bytesSource(new TextEncoder().encode('old')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has(path));
+ remove(other.doc,path);await other.request('barrier');await wait(()=>!mem.files.has(path));const generation=deletionGeneration(other.doc,path);
+ p.client.stopped=true;p.client.ws.close();await wait(()=>!p.client.ready);await mem.v.create(path,'local offline new body');await p.queue;const pending=structuredClone(p.settings.pending.items);assert.equal(pending.length,1);
+ await other.putFile(path,bytesSource(new TextEncoder().encode('other device new body')),{base:null,preserveDeleted:true,recreateAfter:generation});await p.stop();await p.queue;
+ const next=new bundle.default();next.app=p.app;await next.onload();next.settings=structuredClone(p.saved);t.after(async()=>{await next.stop();await next.queue;});await next.start();await wait(()=>next.syncedOnce&&!next.initializing);await next.queue;
+ assert.equal(mem.data.get(path),'local offline new body');assert.equal(new TextDecoder().decode(server.blobs.read(content(server.doc,path).hash,0)),'other device new body');assert.deepEqual(next.client.pending,pending);assert.match([...next.fileFailures.values()].join(' '),/generation changed/);
+ assert.equal(new TextDecoder().decode(await next.cache.materialize(pending[0])),'local offline new body');
+});
+
+test('first join preserves ambiguous legacy local file against an existing remote tombstone',async t=>{
+ const {p,other,mem}=await env(t),path='首次加入旧记录.md';await other.putFile(path,bytesSource(new TextEncoder().encode('old')));remove(other.doc,path);await other.request('barrier');await mem.v.create(path,'local body without creation evidence');
+ await p.start();await wait(()=>p.syncedOnce&&!p.initializing);await p.queue;assert.equal(mem.data.get(path),'local body without creation evidence');assert(p.settings.consistencyHolds.includes(path));assert.equal(content(other.doc,path),null);
+});
+
+test('older server capability leaves recreated body and pending cache intact without unsafe fallback',async t=>{
+ const {p,other,mem,server}=await env(t),path='旧服务兼容新建.md';await other.putFile(path,bytesSource(new TextEncoder().encode('old')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has(path));remove(other.doc,path);await other.request('barrier');await wait(()=>!mem.files.has(path));
+ p.client.serverCapabilities=p.client.serverCapabilities.filter(c=>c!=='deletion-generation-v1');await mem.v.create(path,'new body waiting for upgrade');await p.queue;
+ assert.equal(content(server.doc,path),null);assert.equal(mem.data.get(path),'new body waiting for upgrade');assert.equal(p.client.pending.length,1);assert(p.client.pending[0].recreateAfter);assert.equal(new TextDecoder().decode(await p.cache.materialize(p.client.pending[0])),'new body waiting for upgrade');assert.match([...p.fileFailures.values()].join(' '),/upgraded server/);
 });

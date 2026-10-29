@@ -36,3 +36,7 @@ the foreground. OS sleep, process suspension and quitting Obsidian stop executio
 no power blocker or background service is installed. Diagnostic reports keep the
 real visibility flag; an older server's completion summary may still require the
 foreground even when background connection and queue reports are fresh.
+
+## Deleted-name recreation (alpha.46)
+
+Newly created files retain the exact observed deletion generation in the durable pending manifest. A matching alpha.46 server is required to publish these recreations. Older servers leave the local file and cached pending version intact. Concurrent recreation or a newer deletion requires review and does not overwrite another device. Legacy files with no creation evidence are retained under consistency protection. Existing history and caches are preserved.

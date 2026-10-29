@@ -33,6 +33,18 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var DELETION_GENERATION_CAPABILITY = "deletion-generation-v1";
+function deletionGeneration(doc2, path) {
+  const map2 = doc2.getMap("deleted");
+  if (!map2.has(path)) return null;
+  const item = map2._map.get(path), id2 = item?.id;
+  if (!id2 || !Number.isSafeInteger(id2.client) || !Number.isSafeInteger(id2.clock)) throw Error("Deletion generation unavailable; preserve local file");
+  return `${id2.client}:${id2.clock}`;
+}
+function validDeletionGeneration(value) {
+  return typeof value === "string" && /^\d{1,16}:\d{1,16}$/.test(value);
+}
+
 var create = () => /* @__PURE__ */ new Map();
 var copy = (m) => {
   const r2 = create();
@@ -11142,7 +11154,7 @@ var VaultClientV3 = class extends VaultClient {
           if (!context.isCurrent()) return;
           if (options.retryDue && !options.retryDue(p.path)) continue;
           try {
-            await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY), onProgress: () => {
+            await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, ...p.recreateAfter ? { recreateAfter: p.recreateAfter } : {}, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY), onProgress: () => {
               if (context.isCurrent()) this.connectionProgressAt = Date.now();
             } });
             if (context.isCurrent()) this.connectionProgressAt = Date.now();
@@ -11328,8 +11340,10 @@ var VaultClientV3 = class extends VaultClient {
   }
   checkPending(p) {
     if (!p || !p.version || !/^[a-f0-9-]{36}$/.test(p.version) || !supportedFile(p.path) || !/^[a-f0-9]{64}$/.test(p.hash) || !Number.isSafeInteger(p.size) || p.size < 0 || p.size > maxFileSize(p.path)) throw Error("Invalid pending image reference");
+    if (p.recreateAfter !== void 0 && !validDeletionGeneration(p.recreateAfter)) throw Error("Invalid deletion generation");
   }
   async putFile(path, source, options = {}) {
+    if (options.recreateAfter !== void 0 && (!validDeletionGeneration(options.recreateAfter) || !this.serverCapabilities?.includes(DELETION_GENERATION_CAPABILITY))) throw Error("Deletion generation requires upgraded server; cached source retained");
     if (options.ifAbsent && (!this.serverCapabilities?.includes(SAFE_PUBLISH_CAPABILITY) || !this.serverCapabilities?.includes(CONFLICT_CAPABILITY))) throw Error("Server does not support safe absent-only publication");
     if (!supportedFile(path) || source.size > maxFileSize(path)) throw Error("Unsupported file or per-type size limit");
     const transport = this.ws, base = Object.hasOwn(options, "base") ? options.base : content(this.doc, path), version = options.version || crypto.randomUUID();
@@ -11344,7 +11358,7 @@ var VaultClientV3 = class extends VaultClient {
     if (options.ifAbsent && (this.ws !== transport || !this.metadataVerified || !this.ready)) throw Object.assign(Error("Disconnected before checked publication"), { code: "METADATA_NOT_READY" });
     if (this.serverCapabilities?.includes(CONFLICT_CAPABILITY) && !this.ready) throw Error("Disconnected before version publication; cached source retained");
     if (this.ready && this.serverCapabilities?.includes(CONFLICT_CAPABILITY)) {
-      await this.request("publish-file", { path, ref, version, base, preserveDeleted: !!options.preserveDeleted, ...options.ifAbsent ? { ifAbsent: true } : {} });
+      await this.request("publish-file", { path, ref, version, base, preserveDeleted: !!options.preserveDeleted, ...options.recreateAfter ? { recreateAfter: options.recreateAfter } : {}, ...options.ifAbsent ? { ifAbsent: true } : {} });
       return ref;
     }
     this.doc.transact(() => {
@@ -11379,7 +11393,7 @@ var VaultClientV3 = class extends VaultClient {
     if (this.pending.length >= 6e3) throw Error("Pending reference limit");
     this.binaryBusy = true;
     try {
-      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), base: previous ? { kind: fileKind(path), hash: previous.hash, size: previous.size, version: previous.version } : options && Object.hasOwn(options, "base") ? options.base : content(this.doc, path) };
+      const ref = await this.blobCache.stage(source, { signal: this.binaryAbort.signal, ...options }), previous = [...this.pending].reverse().find((p) => p.path === path), item = { path, ...ref, version: crypto.randomUUID(), ...options?.recreateAfter ? { recreateAfter: options.recreateAfter } : {}, base: previous ? { kind: fileKind(path), hash: previous.hash, size: previous.size, version: previous.version } : options && Object.hasOwn(options, "base") ? options.base : content(this.doc, path) };
       if (previous?.hash === ref.hash && previous?.size === ref.size || !previous && sameContent(item.base, { kind: fileKind(path), ...ref })) return ref;
       const next = [...this.pending, item];
       await this.onPending({ protocol: 3, serverId: this.serverId, items: next });
@@ -11409,7 +11423,7 @@ var VaultClientV3 = class extends VaultClient {
           continue;
         }
         try {
-          await this.putFile(p.path, this.blobCache.source(p), { ...options, version: p.version, base: p.base, preserveDeleted: true });
+          await this.putFile(p.path, this.blobCache.source(p), { ...options, version: p.version, base: p.base, ...p.recreateAfter ? { recreateAfter: p.recreateAfter } : {}, preserveDeleted: true });
           await this.request("barrier");
           this.flushPersist(true);
           if (!this.persistence.persist || !await this.persistence.wait()) throw Error("Save metadata snapshot before removing pending reference");
@@ -12531,6 +12545,17 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.auditMutation(f.path, !(f instanceof import_obsidian.TFile));
       if (this.settings.autoConsistency && event !== "delete") this.noteConsistencyPath(f.path);
       if (f instanceof import_obsidian.TFile) this.fingerprints.delete(f.path);
+      if (event === "create" && f instanceof import_obsidian.TFile && supportedFile(f.path) && !this.writing.has(f.path) && this.client?.serverId) {
+        const generation = deletionGeneration(this.client.doc, f.path);
+        if (generation) {
+          this.settings.recreateIntents = { ...this.settings.recreateIntents || {}, [f.path]: { serverId: this.client.serverId, generation } };
+          this.dirtyFiles.set(f.path, f);
+          this.enqueue(async () => {
+            await this.persistConfig();
+            this.fileUploads.request();
+          });
+        }
+      }
       if (!this.client || !this.syncedOnce || this.initializing) return;
       if (event === "delete") {
         if (this.writing.has(f.path)) return;
@@ -12687,7 +12712,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   async read(f) {
     const md = /\.md$/i.test(f.path), known = this.client ? content(this.client.doc, f.path) : null;
-    const inline = md && known?.kind !== "file" && (known?.kind === "text" || f.path === "\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md") && f.stat.size <= MAX_INLINE_NOTE;
+    const inline = md && !this.settings.recreateIntents?.[f.path] && known?.kind !== "file" && (known?.kind === "text" || f.path === "\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md") && f.stat.size <= MAX_INLINE_NOTE;
     if (inline) return { kind: "text", data: await this.app.vault.read(f) };
     const limit = maxFileSize(f.path);
     if (f.stat.size > limit) throw Error("\u6587\u4EF6\u8D85\u8FC7\u5F53\u524D\u7C7B\u578B\u4E0A\u9650\uFF0C\u672A\u8BFB\u53D6\u6216\u4E0A\u4F20\uFF1A" + f.path);
@@ -12718,7 +12743,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (equal(old, item)) return;
     if (item.kind !== "text") {
       const source = this.cache.source(item);
-      await c.stageFile(f.path, source);
+      const intent = this.settings.recreateIntents?.[f.path];
+      if (intent && (intent.serverId !== c.serverId || !validDeletionGeneration(intent.generation))) throw Error("\u65B0\u5EFA\u610F\u56FE\u8EAB\u4EFD\u4E0D\u5339\u914D\uFF0C\u4FDD\u7559\u672C\u5730\u6587\u4EF6");
+      await c.stageFile(f.path, source, intent && !c.pending.some((v) => v.path === f.path) ? { base: null, recreateAfter: intent.generation } : void 0);
       if (c.ready) await c.flushPending();
       return;
     }
@@ -12824,6 +12851,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       await this.persistConfig();
     }, onPending: async (pending) => {
       this.settings.pending = pending;
+      for (const path of Object.keys(this.settings.recreateIntents || {})) if (!pending.items.some((v) => v.path === path) && this.client && content(this.client.doc, path)) delete this.settings.recreateIntents[path];
       await this.persistConfig();
     }, onIdentity: async (id2) => {
       this.settings.serverId = id2;
@@ -12863,6 +12891,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
                 if (!equal(local, r2)) await this.backup(f.path, local);
               } else if (meta?.deleted || c.doc.getMap("deleted").has(f.path)) {
                 await this.backup(f.path, local);
+                this.settings.consistencyHolds = [.../* @__PURE__ */ new Set([...this.settings.consistencyHolds || [], f.path])];
+                await this.persistConfig();
               } else if (!hadState || !meta) await this.upload(f);
             }
           });
@@ -12910,7 +12940,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         if (this.pathBlocked(f.path)) continue;
         const local = await this.read(f), known = content(c.doc, f.path), meta = c.doc.getMap("files").get(f.path);
         if (meta?.deleted || c.doc.getMap("deleted").has(f.path)) {
+          if (this.settings.recreateIntents?.[f.path]) {
+            await this.upload(f);
+            continue;
+          }
           await this.backup(f.path, local);
+          this.settings.consistencyHolds = [.../* @__PURE__ */ new Set([...this.settings.consistencyHolds || [], f.path])];
+          await this.persistConfig();
           continue;
         }
         if (known && !equal(known, local)) {
@@ -12944,7 +12980,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           const f = this.app.vault.getAbstractFileByPath(p);
           if (m.deleted || c.doc.getMap("deleted").has(p)) {
             if (f instanceof import_obsidian.TFile) {
-              if (this.fileFailures.size || this.downloadPaths.size || !this.remoteDeleteAllowed(p)) continue;
+              if (this.settings.recreateIntents?.[p] || this.fileFailures.size || this.downloadPaths.size || !this.remoteDeleteAllowed(p)) continue;
               const saved = await this.read(f);
               await this.backup(p, saved);
               if (content(c.doc, p) || this.dirtyFiles.has(p) || !equal(await this.read(f), saved) || !this.remoteDeleteAllowed(p)) continue;

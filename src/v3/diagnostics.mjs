@@ -1,3 +1,4 @@
+import {validateCapacity} from './capacity.mjs';
 import {validateRecovery} from './recovery-diagnostics.mjs';
 import {validateDiagnosticDetails} from './diagnostic-details.mjs';
 import {validateTransferCounters} from './transfer-counters.mjs';
@@ -10,12 +11,12 @@ export const DIAGNOSTICS_FRESH_MS=30000;
 export function documentDigest(doc){const active=entries(doc),deleted=new Set(doc.getMap('deleted').keys());for(const [path,m] of doc.getMap('files'))if(m.deleted)deleted.add(path);const state=['content-v1',Object.keys(active).sort().map(path=>[path,active[path]]),[...deleted].sort()];return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();}
 const counts=['queued','metadata','files','dirty','receiving','failed','conflicts'];
 export function validateDiagnostic(input){
- const keys=['deviceId','platform','version','foreground','ready','busy','confirmedAgeMs','digest',...counts,'performance','transfers','details','recovery'];
+ const keys=['deviceId','platform','version','foreground','ready','busy','confirmedAgeMs','digest',...counts,'performance','transfers','details','recovery','capacity'];
  if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(k=>!keys.includes(k)))throw Error('Invalid diagnostic fields');
  if(!/^[a-f0-9-]{36}$/.test(input.deviceId)||!['ios','android','macos','windows','linux','unknown'].includes(input.platform)||typeof input.version!=='string'||input.version.length>64||!/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/.test(input.version))throw Error('Invalid diagnostic identity');
  if(['foreground','ready','busy'].some(k=>typeof input[k]!=='boolean')||counts.some(k=>!Number.isSafeInteger(input[k])||input[k]<0||input[k]>100000)||!(/^[a-f0-9]{64}$/.test(input.digest)))throw Error('Invalid diagnostic status');
  if(input.confirmedAgeMs!==null&&(!Number.isSafeInteger(input.confirmedAgeMs)||input.confirmedAgeMs<0||input.confirmedAgeMs>604800000))throw Error('Invalid confirmation age');
- const out=Object.fromEntries(keys.filter(k=>k!=='performance'&&k!=='transfers'&&k!=='details'&&k!=='recovery').map(k=>[k,input[k]]));if(input.performance!==undefined)out.performance=validatePerformance(input.performance);if(input.transfers!==undefined)out.transfers=validateTransferCounters(input.transfers);if(input.details!==undefined)out.details=validateDiagnosticDetails(input.details);if(input.recovery!==undefined)out.recovery=validateRecovery(input.recovery);return out;
+ const out=Object.fromEntries(keys.filter(k=>k!=='performance'&&k!=='transfers'&&k!=='details'&&k!=='recovery'&&k!=='capacity').map(k=>[k,input[k]]));if(input.performance!==undefined)out.performance=validatePerformance(input.performance);if(input.transfers!==undefined)out.transfers=validateTransferCounters(input.transfers);if(input.details!==undefined)out.details=validateDiagnosticDetails(input.details);if(input.recovery!==undefined)out.recovery=validateRecovery(input.recovery);if(input.capacity!==undefined)out.capacity=validateCapacity(input.capacity);return out;
 }
 // Memory-only, bounded, authenticated callers only. No paths, content, user names,
 // errors, tokens, IP addresses or Yjs state are retained in diagnostics.

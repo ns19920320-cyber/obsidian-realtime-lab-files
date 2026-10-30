@@ -8,7 +8,7 @@ export function errorCode(error){const s=String(error?.message||error||'');if(!s
  if(/^(?:Error: )?Cache staging busy$/.test(s))return 'cache-staging-busy';
  if(/401|403|Unauthorized|认证/i.test(s))return 'authentication';
  if(/identity mismatch|身份/i.test(s))return 'identity';
- if(/quota|capacity|容量/i.test(s))return 'quota';
+ if(/quota|capacity|容量|Active logical content exceeds|metadata\/text state exceeds|path limit|Protected queue identity or capacity/i.test(s))return 'quota';
  if(/snapshot|persist|本地保存|快照/i.test(s))return 'persistence';
  if(/invalid|无效|校验/i.test(s))return 'invalid-data';
  if(/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s))return 'metadata-not-ready';

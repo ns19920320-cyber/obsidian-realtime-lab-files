@@ -33,6 +33,44 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var CAPACITY_CAPABILITY = "capacity-status-v1";
+var DEFAULT_CAPACITY = { liveBytes: 1024 * 1024 * 1024, diskBytes: 2 * 1024 * 1024 * 1024 };
+function capacityMetric(used, limit) {
+  if (!Number.isSafeInteger(used) || used < 0 || !Number.isSafeInteger(limit) || limit < 1) throw Error("Invalid capacity metric");
+  return { used, limit, level: used >= limit ? "full" : used >= limit * 0.8 ? "warning" : "normal" };
+}
+function validateCapacity(v) {
+  if (!v || !["active,disk,metadata,objects,paths", "active,cache,disk,metadata,objects,paths"].includes(Object.keys(v).sort().join(","))) throw Error("Invalid capacity report");
+  const out = {};
+  for (const key of ["active", "disk", "metadata", "objects", "paths", ...v.cache ? ["cache"] : []]) {
+    const m = v[key];
+    if (!m || Object.keys(m).sort().join(",") !== "level,limit,used") throw Error("Invalid capacity metric");
+    const clean = capacityMetric(m.used, m.limit);
+    if (clean.level !== m.level) throw Error("Capacity warning mismatch");
+    out[key] = clean;
+  }
+  return out;
+}
+function capacityText(v) {
+  if (!v) return "\u5BB9\u91CF\uFF1A\u670D\u52A1\u5668\u5C1A\u672A\u63D0\u4F9B\u5BB9\u91CF\u8BCA\u65AD";
+  const names = { active: "\u5E93\u5185\u5185\u5BB9", disk: "\u542B\u5386\u53F2\u5B58\u50A8", metadata: "\u540C\u6B65\u5143\u6570\u636E", objects: "\u5B58\u50A8\u5BF9\u8C61", paths: "\u6D3B\u52A8\u6587\u4EF6", cache: "\u672C\u673A\u7F13\u5B58\uFF08\u542B\u4FDD\u7559\u7248\u672C\uFF09" };
+  return Object.entries(validateCapacity(v)).map(([k, m]) => names[k] + " " + (["objects", "paths"].includes(k) ? m.used + "/" + m.limit : (m.used / 1048576).toFixed(1) + "/" + (m.limit / 1048576).toFixed(0) + " MiB") + (m.level === "full" ? "\uFF08\u5DF2\u6EE1\uFF09" : m.level === "warning" ? "\uFF08\u63A5\u8FD1\u4E0A\u9650\uFF09" : "")).join("\uFF1B");
+}
+function capacityUploadFits(v, item, current) {
+  return !!v && v.active.used + Math.max(0, item.size - (current?.size || 0)) <= v.active.limit && v.disk.used + item.size <= v.disk.limit && v.objects.used < v.objects.limit && (current || v.paths.used < v.paths.limit) && v.metadata.used + 4096 < v.metadata.limit;
+}
+function rearmCapacityRetries(ledger, pending, report, { current = () => null, blocked = () => false, now = Date.now() } = {}) {
+  let changed = 0;
+  for (const item of pending) {
+    const row = ledger.items.get("upload:" + item.path);
+    if (!row || row.code !== "quota" || row.retryable || blocked(item.path) || !capacityUploadFits(report, item, current(item.path))) continue;
+    row.retryable = true;
+    row.nextAt = now;
+    changed++;
+  }
+  return changed;
+}
+
 var DELETION_GENERATION_CAPABILITY = "deletion-generation-v1";
 function deletionGeneration(doc2, path) {
   const map2 = doc2.getMap("deleted");
@@ -9144,11 +9182,15 @@ var MAX_BINARY = 5 * 1024 * 1024;
 var MAX_FILE_TEXT = 16 * 1024 * 1024;
 var MAX_BLOB_BYTES = MAX_FILE_TEXT;
 var MAX_LIVE_BYTES = 256 * 1024 * 1024;
-var MAX_STATE = 2 * 1024 * 1024;
+var MAX_STATE = 8 * 1024 * 1024;
 var FILE_REFS_CAPABILITY = "versioned-files-v1";
-var MAX_DISK_BYTES = 512 * 1024 * 1024;
+var MAX_DISK_BYTES = 2 * 1024 * 1024 * 1024;
 var MAX_DISK_OBJECTS = 8192;
 var BLOB_RESPONSE_IDENTITY_CAPABILITY = "blob-response-identity-v1";
+var METADATA_CAPACITY_CAPABILITY = "metadata-capacity-8m-v1";
+var MAX_METADATA_WIRE = 16 * 1024 * 1024;
+var MAX_METADATA_INBOX = 32 * 1024 * 1024;
+var LEGACY_METADATA_INBOX = 8 * 1024 * 1024;
 
 var GENERAL_FILES_CAPABILITY = "general-files-v1";
 var GENERAL = /\.(json|csv|jsonl|html?|py|txt|sha256|log|zip|bak|docx)$/i;
@@ -9225,7 +9267,7 @@ function remove(doc2, p, origin) {
 function validateRef(v) {
   if (!v || !supportedFile(v.path) || !/^[a-f0-9]{64}$/.test(v.hash) || !Number.isSafeInteger(v.size) || v.size < 0 || v.size > maxFileSize(v.path) || Object.keys(v).some((k) => !["path", "hash", "size"].includes(k))) throw Error("Invalid blob reference or per-file size limit");
 }
-function validate(doc2, hasBlob) {
+function validate(doc2, hasBlob, { liveBytes = MAX_LIVE_BYTES } = {}) {
   let total = 0, count = 0, active = 0, inline = 0;
   const names = /* @__PURE__ */ new Set();
   for (const name of doc2.share.keys()) {
@@ -9259,9 +9301,9 @@ function validate(doc2, hasBlob) {
       if (!v || v.path !== p || v.hash !== m.hash || v.size !== m.size) throw Error("Missing immutable blob version");
       total += m.size;
     }
-    if (total > MAX_LIVE_BYTES) throw Error("Active logical content exceeds 256 MiB; server/cache disk also capped");
+    if (total > liveBytes) throw Error("Active content capacity reached (" + Math.floor(liveBytes / 1048576) + " MiB); notes and queued versions retained");
   }
-  if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata/text state exceeds 2 MiB");
+  if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata capacity exceeds 8 MiB; local content and pending versions retained");
   return total;
 }
 
@@ -9343,7 +9385,7 @@ function errorCode(error) {
   if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
   if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
   if (/identity mismatch|身份/i.test(s)) return "identity";
-  if (/quota|capacity|容量/i.test(s)) return "quota";
+  if (/quota|capacity|容量|Active logical content exceeds|metadata\/text state exceeds|path limit|Protected queue identity or capacity/i.test(s)) return "quota";
   if (/snapshot|persist|本地保存|快照/i.test(s)) return "persistence";
   if (/invalid|无效|校验/i.test(s)) return "invalid-data";
   if (/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
@@ -10786,13 +10828,13 @@ body.is-mobile .rl-sync-row .rl-sync-badge{font-size:11px;min-height:28px;line-h
 var NO_PERSIST = (_state) => {
 };
 var VaultClient = class {
-  constructor({ url, token, state, mode, room = "realtime-lab-v2", expectedProtocol = void 0, capabilities = [], beforeUpload = async () => {
+  constructor({ url, token, state, mode, room = "realtime-lab-v2", expectedProtocol = void 0, capabilities = [], optionalCapabilities = [], beforeUpload = async () => {
   }, retryPreparation = () => false, persistDelayMs = 0, maxBufferedBytes = 32 * 1024 * 1024, maxInboxBytes = 32 * 1024 * 1024, serverId, onIdentity = (_id, _mode) => {
   }, WebSocketImpl = globalThis.WebSocket, onStatus = (_s) => {
   }, onReady = () => {
   }, onPersist = NO_PERSIST }) {
     if (state && !serverId) throw Error("Saved state requires verified server identity");
-    Object.assign(this, { url, token, WS: WebSocketImpl, onStatus, onReady, onPersist, mode, serverId, onIdentity, maxBufferedBytes, maxInboxBytes, room, expectedProtocol, capabilities, beforeUpload, retryPreparation });
+    Object.assign(this, { url, token, WS: WebSocketImpl, onStatus, onReady, onPersist, mode, serverId, onIdentity, maxBufferedBytes, maxInboxBytes, room, expectedProtocol, capabilities, optionalCapabilities, beforeUpload, retryPreparation });
     this.doc = new Doc();
     if (state) applyUpdate(this.doc, decode(state));
     this.ready = false;
@@ -10856,7 +10898,7 @@ var VaultClient = class {
     this.onStatus("\u8FDE\u63A5\u4E2D");
     const ws = new this.WS(this.url);
     this.ws = ws;
-    ws.onopen = () => this.send({ type: "hello", room: this.room, capabilities: this.capabilities, token: this.token, mode: this.mode });
+    ws.onopen = () => this.send({ type: "hello", room: this.room, capabilities: [...this.capabilities, ...this.optionalCapabilities], token: this.token, mode: this.mode });
     let inbox = Promise.resolve(), inboxBytes = 0;
     ws.onmessage = (e) => {
       if (this.transportBlocked || this.stopped) return;
@@ -11183,7 +11225,7 @@ var BlobTransfer = class {
 
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
-    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], beforeUpload: async (context) => {
+    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], optionalCapabilities: [METADATA_CAPACITY_CAPABILITY], beforeUpload: async (context) => {
       if (context.isCurrent()) this.connectionProgressAt = Date.now();
       await options.beforeUpload?.(context);
       if (!context.isCurrent()) return;
@@ -11191,7 +11233,7 @@ var VaultClientV3 = class extends VaultClient {
         if (!this.blobCache) throw Error("Pending file cache required");
         for (const p of this.pending) {
           if (!context.isCurrent()) return;
-          if (options.retryDue && !options.retryDue(p.path)) continue;
+          if (options.canPublishPending && !options.canPublishPending(p.path) || options.retryDue && !options.retryDue(p.path)) continue;
           try {
             await this.putFile(p.path, this.blobCache.source(p), { version: p.version, base: p.base, ...p.recreateAfter ? { recreateAfter: p.recreateAfter } : {}, preserveDeleted: true, prepareOnly: this.serverCapabilities?.includes(CONFLICT_CAPABILITY), onProgress: () => {
               if (context.isCurrent()) this.connectionProgressAt = Date.now();
@@ -11203,7 +11245,7 @@ var VaultClientV3 = class extends VaultClient {
           }
         }
       }
-    }, maxBufferedBytes: 4 * 1024 * 1024, maxInboxBytes: 8 * 1024 * 1024 });
+    }, maxBufferedBytes: MAX_METADATA_WIRE, maxInboxBytes: MAX_METADATA_INBOX });
     this.blobs = new BlobTransfer({ url: options.url.replace(/^ws/, "http"), token: options.token, fetchImpl: options.fetchImpl, onTransfer: options.onTransfer, rangeReads: () => this.serverCapabilities?.includes(RANGE_CAPABILITY), responseIdentity: () => this.serverCapabilities?.includes(BLOB_RESPONSE_IDENTITY_CAPABILITY), verifyIdentity: async () => {
       if (!this.serverId) throw Error("Verified server identity missing; transfers blocked");
       if (!this.ready && !this.metadataVerified) throw Object.assign(Error("Connect verified V3 metadata before transferring blobs"), { code: "METADATA_NOT_READY" });
@@ -11211,6 +11253,7 @@ var VaultClientV3 = class extends VaultClient {
     } });
     this.blobCache = options.blobCache;
     this.onPending = options.onPending;
+    this.canPublishPending = options.canPublishPending || (() => true);
     this.retryDue = options.retryDue || (() => true);
     this.onRetryFailure = options.onRetryFailure;
     this.onRetrySuccess = options.onRetrySuccess;
@@ -11457,7 +11500,7 @@ var VaultClientV3 = class extends VaultClient {
     let failure;
     try {
       for (const p of [...this.pending]) {
-        if (blocked.has(p.path) || !this.retryDue(p.path)) {
+        if (blocked.has(p.path) || !this.canPublishPending(p.path) || !this.retryDue(p.path)) {
           blocked.add(p.path);
           continue;
         }
@@ -11514,6 +11557,35 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   lastQueueProgressAt = Date.now();
   activePhases = /* @__PURE__ */ new Map();
   phaseSequence = 0;
+  capacityReport;
+  capacityNextAt = 0;
+  capacityBusy = false;
+  capacityAlert = "";
+  async refreshCapacity() {
+    const c = this.client;
+    if (!c?.ready || this.capacityBusy || Date.now() < this.capacityNextAt || !c.serverCapabilities?.includes(CAPACITY_CAPABILITY)) return;
+    this.capacityBusy = true;
+    this.capacityNextAt = Date.now() + 3e4;
+    try {
+      const report = validateCapacity(await c.request("capacity"));
+      if (this.client !== c || !c.ready) return;
+      if (this.cache?.quota) report.cache = capacityMetric(this.cache.quota.bytes, 2 * 1024 * 1024 * 1024);
+      this.capacityReport = report;
+      const warning = Object.entries(report).filter(([, m]) => m.level !== "normal").map(([k, m]) => k + ":" + m.level).join(",");
+      if (warning && warning !== this.capacityAlert) new import_obsidian.Notice("\u540C\u6B65\u5BB9\u91CF\u9884\u8B66\uFF1A" + capacityText(report), 1e4);
+      this.capacityAlert = warning;
+      const ledger = this.ledger();
+      if (ledger && rearmCapacityRetries(ledger, c.pending, report, { current: (p) => content(c.doc, p), blocked: (p) => this.pathBlocked(p) })) {
+        this.settings.retryState = ledger.snapshot();
+        await this.persistConfig();
+        this.scheduleRetry();
+      }
+      this.renderProgress();
+    } catch {
+    } finally {
+      this.capacityBusy = false;
+    }
+  }
   ledger() {
     const serverId = this.client?.serverId || this.settings.serverId;
     if (!serverId) return null;
@@ -11706,6 +11778,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
     if ([this.operationError, ...this.fileFailures.values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u684C\u9762\u7AEF\u4FDD\u6301 Obsidian \u8FD0\u884C\u5373\u53EF\uFF0C\u624B\u673A\u7AEF\u9700\u4FDD\u6301\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
+    if (this.capacityReport) e.createEl("p", { text: capacityText(this.capacityReport) });
     if (this.pendingRows().length || this.ledger()?.items.size) e.createEl("p", { text: stallText(this.recoveryStatus()) });
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
     if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
@@ -12175,8 +12248,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.uiUnloaded || !c?.ready || !this.settings.deviceId || !c.serverCapabilities?.includes(DIAGNOSTICS_CAPABILITY)) return;
     this.diagnosticBusy = true;
     try {
+      await this.refreshCapacity();
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: this.isForeground(), ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: this.isForeground(), ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(CAPACITY_CAPABILITY) && this.capacityReport ? { capacity: this.capacityReport } : {}, ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -12209,6 +12283,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.settings.deviceLabels = { ...this.settings.deviceLabels, [d.deviceId]: v.trim().slice(0, 64) };
           await this.persistConfig();
         }));
+        for (const d of result.devices) if (d.capacity) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + capacityText(d.capacity) });
         for (const d of result.devices) if (d.recovery) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + stallText(d.recovery) });
         for (const d of result.devices) if (d.performance) {
           const p = d.performance;
@@ -12901,7 +12976,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl, void 0, () => this.performance.begin("network")), onTransfer: (kind, bytes, failed, files) => {
       this.transfers.record(kind, bytes, failed, files);
       if (!failed && bytes) this.lastQueueProgressAt = Date.now();
-    }, mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, retryDue: (path) => this.ledger()?.due("upload:" + path) ?? true, onRetryFailure: async (path, e) => {
+    }, mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, canPublishPending: (path) => !this.pathBlocked(path) || !!this.settings.pathSafety?.items.some((i) => i.approved && i.op.entries.some((e) => e.from === path)), retryDue: (path) => this.ledger()?.due("upload:" + path) ?? true, onRetryFailure: async (path, e) => {
       this.fileFailures.set(path, this.safeError(e));
       await this.retryFailure("upload:" + path, e);
     }, onRetrySuccess: async (path) => {
@@ -12931,7 +13006,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.settings.stateOrigin = activeOrigin;
       await this.persistConfig();
     }, onReady: () => {
-      this.enqueue(this.prepareConnection);
+      this.capacityNextAt = 0;
+      this.enqueue(async () => {
+        await this.refreshCapacity();
+        await this.prepareConnection();
+      });
     } });
     this.prepareConnection = async () => {
       if (this.client !== c || this.stopping || !c.ready || !c.metadataVerified) return;
@@ -13670,7 +13749,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(e).setName("\u6587\u4EF6\u4E00\u81F4\u6027").addButton((b) => b.setButtonText("\u9010\u6587\u4EF6\u6838\u9A8C\u4E0E\u4FEE\u590D").onClick(() => void this.p.openConsistency()));
     new import_obsidian.Setting(e).addButton((b) => b.setButtonText("\u5237\u65B0\u72B6\u6001").onClick(() => this.p.renderProgress())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.p.retryQueue()));
     new import_obsidian.Setting(e).setName("\u8BEF\u7F6E\u65E7\u534F\u8BAE\u8BBE\u7F6E").addButton((b) => b.setButtonText("\u5907\u4EFD\u5E76\u6E05\u7A7A\u65E7\u72B6\u6001").onClick(() => void this.p.backupRejectedState()));
-    e.createEl("p", { text: "\u652F\u6301\u81EA\u5B9A\u4E49\u4ED3\u5E93\u540D\uFF1B\u6BCF\u4E2A\u5E93\u9700\u5355\u72EC\u521D\u59CB\u5316\u5E76\u8FDE\u63A5\u72EC\u7ACB\u540C\u6B65\u7A7A\u95F4\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA Word DOCX/JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u6D3B\u52A8\u5185\u5BB9\u2264256 MiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u5404\u2264512 MiB\u3001CRDT\u72B6\u6001\u22642 MiB\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
+    e.createEl("p", { text: "\u652F\u6301\u81EA\u5B9A\u4E49\u4ED3\u5E93\u540D\uFF1B\u6BCF\u4E2A\u5E93\u9700\u5355\u72EC\u521D\u59CB\u5316\u5E76\u8FDE\u63A5\u72EC\u7ACB\u540C\u6B65\u7A7A\u95F4\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA Word DOCX/JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u65B0\u7248\u670D\u52A1\u9ED8\u8BA4\u6D3B\u52A8\u5185\u5BB9\u22641 GiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u9ED8\u8BA4\u5404\u22642 GiB\uFF08\u542B\u5386\u53F2\u53CA\u6062\u590D\u5185\u5BB9\uFF0C\u4E0D\u81EA\u52A8\u5220\u9664\uFF09\u3001CRDT\u72B6\u6001\u22648 MiB\uFF08\u9700\u65B0\u7248\u670D\u52A1\uFF1B\u8D85\u51FA\u65E7\u7248\u63A5\u6536\u80FD\u529B\u65F6\u63D0\u793A\u5347\u7EA7\uFF0C\u4FDD\u7559\u672C\u5730\u961F\u5217\uFF09\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
     new import_obsidian.Setting(e).setName("\u521B\u5EFA\u6216\u52A0\u5165\u5411\u5BFC").addButton((b) => b.setButtonText("\u914D\u7F6E\u8FDE\u63A5").onClick(() => void this.p.setupConnection()));
     new import_obsidian.Setting(e).setName("\u53EA\u8BFB\u6587\u4EF6\u53CA\u9644\u4EF6\u6E05\u5355").addButton((b) => b.setButtonText("\u9884\u89C8\uFF0C\u4E0D\u8FC1\u79FB").onClick(() => void this.p.previewInventory()));
     new import_obsidian.Setting(e).setName("\u521D\u59CB\u5316\u540C\u6B65\u5E93").addButton((b) => b.setButtonText("\u521D\u59CB\u5316").onClick(() => void this.p.initialize()));

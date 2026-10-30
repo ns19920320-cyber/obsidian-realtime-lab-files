@@ -9,7 +9,7 @@ export class RetryLedger {
  success(key){return this.items.delete(key);}
  order(keys){return [...keys].sort((a,b)=>(this.items.get(a)?.lastAt||0)-(this.items.get(b)?.lastAt||0));}
  snapshot(){return {serverId:this.serverId,items:[...this.items.values()].map(r=>({...r}))};}
- summary(){const rows=[...this.items.values()],retry=rows.filter(r=>r.retryable);return {retrying:retry.length,blocked:rows.length-retry.length,nextAt:retry.length?Math.min(...retry.map(r=>r.nextAt)):0,reasons:[...new Set(rows.map(r=>r.code))]};}
+ summary(include=(_key)=>true){const rows=[...this.items.values()].filter(r=>include(r.key)),retry=rows.filter(r=>r.retryable);return {retrying:retry.length,blocked:rows.length-retry.length,nextAt:retry.length?Math.min(...retry.map(r=>r.nextAt)):0,reasons:[...new Set(rows.map(r=>r.code))]};}
 }
 /** @param {any} options */
 export function stallStatus({pending=0,lastProgressAt,now=Date.now(),active=[],retry,ready=true,hidden=false}){const oldest=[...active].sort((a,b)=>a.startedAt-b.startedAt)[0],age=Math.max(0,now-lastProgressAt,oldest?now-oldest.startedAt:0);let reason=hidden?'background':!ready?'connection':oldest?.kind||retry?.reasons?.[0]||(retry?.blocked?'manual-review':retry?.retrying?'retry-backoff':'queue');return {stalled:!!pending&&!hidden&&age>=60000,idleSeconds:Math.min(604800,Math.floor(age/1000)),reason,pending,retrying:retry?.retrying||0,blocked:retry?.blocked||0,nextRetrySeconds:retry?.nextAt?Math.min(60,Math.max(0,Math.ceil((retry.nextAt-now)/1000))):0};}

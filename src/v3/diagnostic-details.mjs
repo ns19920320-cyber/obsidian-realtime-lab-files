@@ -1,7 +1,7 @@
 // Structured, bounded diagnostics. Never transmit raw error text, paths or note content.
 export const DIAGNOSTIC_DETAILS_CAPABILITY='device-diagnostic-details-v1';
 export const REASON_CODES=['cache-staging-busy','filesystem-transient','network-transient','metadata-not-ready','authentication','identity','quota','persistence','invalid-data','unknown-error','initializing','receiving','uploading','local-operation','transferring','saving','recovering','stopping','conflict-check','conflict','path-review','consistency-hold','consistency-difference'];
-export function errorCode(error){const s=String(error?.message||error||'');if(!s)return null;
+export function errorCode(error){const s=String(error?.message||error||'');if(!s)return null;if(REASON_CODES.includes(s))return s;
  if(/Blob request failed \((?:409|429)\)/i.test(s))return 'transferring';
  if(/request failed \((?:408|5\d\d)\)/i.test(s))return 'network-transient';
  if(/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s))return 'transferring';
@@ -25,7 +25,7 @@ export function validateDiagnosticDetails(v){
  const a=v.audit;if(!exact(a,['enabled','phase','reason','checkedAt','stable','current','limited','counts'])||typeof a.enabled!=='boolean'||!phases.includes(a.phase)||!auditReasons.includes(a.reason)||![a.stable,a.current,a.limited].every(x=>typeof x==='boolean')||!(a.checkedAt===null||Number.isSafeInteger(a.checkedAt)&&a.checkedAt>=0&&a.checkedAt<=8640000000000000)||!exact(a.counts,auditCounts)||!auditCounts.every(k=>count(a.counts[k])))throw Error('Invalid audit diagnostics');
  return {reasons:[...v.reasons],audit:{...a,counts:{...a.counts}}};
 }
-export function diagnosticDetails(p){const c=p.client,reasons=new Set();for(const e of [p.operationError,c?.lastError,p.conflictError,p.consistencyError,...p.fileFailures.values()]){const code=errorCode(e);if(code)reasons.add(code);}
+export function diagnosticDetails(p){const c=p.client,reasons=new Set();for(const e of [p.operationError,c?.lastError,p.conflictError,p.consistencyError,...(p.activeFailures?.()||p.fileFailures).values()]){const code=errorCode(e);if(code)reasons.add(code);}
  const flags={'initializing':p.initializing||!p.syncedOnce,'receiving':p.reflection.queued||p.downloadPaths.size,'uploading':p.fileUploads.queued,'local-operation':p.localOperations||p.writing.size,'transferring':c?.binaryBusy,'saving':p.receiveAcks.size||p.receiptFlush||c?.persistence.dirty||c?.persistence.inFlight,'recovering':p.recoveryBusy,'stopping':p.stopping,'conflict-check':p.conflictError,'conflict':p.conflicts.length,'path-review':p.settings.pathSafety?.items.length||p.settings.remoteDeleteReview?.paths.length,'consistency-hold':p.settings.consistencyHolds?.length,'consistency-difference':p.consistencyIssues()};for(const [k,on] of Object.entries(flags))if(on)reasons.add(k);
  const r=p.consistencyReport,counts=Object.fromEntries(auditCounts.map(k=>[k,k==='refused'?(r?.refused?.length||0):r?.counts?.[k]??r?.[k]??0]));
  return validateDiagnosticDetails({reasons:[...reasons],audit:{enabled:!!p.settings.autoConsistency,phase:p.consistencyBusy?'running':p.consistencyPhase||'never',reason:p.consistencyReason||'none',checkedAt:r?.checkedAt??null,stable:!!r?.stable,current:!p.consistencyBusy&&p.consistencyPhase==='complete'&&!!r?.stable&&r.serverId===c?.serverId&&p.consistencyDigest===p.currentDigest()&&p.consistencyAuditEpoch===p.consistencyEpoch,limited:!!r?.limited,counts}});

@@ -33,6 +33,46 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var QUEUE_STATE_CAPABILITY = "queue-state-v1";
+function queueProtection(settings = {}) {
+  const review = /* @__PURE__ */ new Set(), held = new Set(settings.consistencyHolds || []);
+  for (const item of settings.pathSafety?.items || []) if (!item.approved) for (const e of item.op.entries) {
+    review.add(e.from);
+    if (e.to) review.add(e.to);
+  }
+  if (!settings.remoteDeleteReview?.approved) for (const p of settings.remoteDeleteReview?.paths || []) review.add(p);
+  return { review, held };
+}
+function protectionKind(path, protection) {
+  return protection.review.has(path) ? "review" : protection.held.has(path) ? "held" : null;
+}
+function deferredRetryKey(key, protection) {
+  const m = /^(?:upload|download):(.+)$/.exec(key);
+  return !!m && !!protectionKind(m[1], protection);
+}
+function classifyQueues(rows = [], settings = {}, versions = []) {
+  const protection = queueProtection(settings), map2 = new Map(rows.map((r2) => [r2.path, { ...r2 }]));
+  for (const i of settings.pathSafety?.items || []) for (const e of i.op.entries) for (const p of e.to ? [e.from, e.to] : [e.from]) if (!map2.has(p)) map2.set(p, { path: p, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD" : "\u5F85\u786E\u8BA4" });
+  for (const p of protection.review) if (!map2.has(p)) map2.set(p, { path: p, state: "\u4FDD\u7559\u539F\u5185\u5BB9" });
+  const counts = { active: 0, review: 0, held: 0, failed: 0 }, versionCounts = { active: 0, review: 0, held: 0, failed: 0 };
+  for (const row of map2.values()) {
+    row.category = protectionKind(row.path, protection) || (row.error ? "failed" : "active");
+    counts[row.category]++;
+    if (row.category === "review" || row.category === "held") {
+      delete row.error;
+      row.state = row.category === "review" ? "\u5F85\u786E\u8BA4\uFF1A\u5220\u9664\u6216\u91CD\u547D\u540D\u64CD\u4F5C\uFF0C\u672A\u81EA\u52A8\u4F20\u64AD" : "\u4FDD\u62A4\u6682\u7F13\uFF1A\u4FDD\u7559\u6B63\u6587\u3001\u7F13\u5B58\u53CA\u5F85\u4F20\u7248\u672C";
+    }
+  }
+  for (const v of versions) versionCounts[map2.get(v.path)?.category || protectionKind(v.path, protection) || "active"]++;
+  return { rows: [...map2.values()], counts, versionCounts, protection };
+}
+function queueStateText(view) {
+  return "\u5F85\u786E\u8BA4 " + view.counts.review + " \u8DEF\u5F84\uFF08" + view.versionCounts.review + "\u7248\u672C\uFF09 \xB7 \u4FDD\u62A4\u6682\u7F13 " + view.counts.held + " \u8DEF\u5F84\uFF08" + view.versionCounts.held + "\u7248\u672C\uFF09 \xB7 \u771F\u6B63\u5931\u8D25 " + view.counts.failed + " \u8DEF\u5F84 \xB7 \u53EF\u5904\u7406 " + view.counts.active + " \u8DEF\u5F84";
+}
+function queueTelemetry(view) {
+  return { activePaths: view.counts.active, awaitingPaths: view.counts.review, protectedPaths: view.counts.held, failedPaths: view.counts.failed, activeVersions: view.versionCounts.active, awaitingVersions: view.versionCounts.review, protectedVersions: view.versionCounts.held, failedVersions: view.versionCounts.failed };
+}
+
 var CAPACITY_CAPABILITY = "capacity-status-v1";
 var DEFAULT_CAPACITY = { liveBytes: 1024 * 1024 * 1024, diskBytes: 2 * 1024 * 1024 * 1024 };
 function capacityMetric(used, limit) {
@@ -9379,6 +9419,7 @@ var REASON_CODES = ["cache-staging-busy", "filesystem-transient", "network-trans
 function errorCode(error) {
   const s = String(error?.message || error || "");
   if (!s) return null;
+  if (REASON_CODES.includes(s)) return s;
   if (/Blob request failed \((?:409|429)\)/i.test(s)) return "transferring";
   if (/request failed \((?:408|5\d\d)\)/i.test(s)) return "network-transient";
   if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s)) return "transferring";
@@ -9406,7 +9447,7 @@ function validateDiagnosticDetails(v) {
 }
 function diagnosticDetails(p) {
   const c = p.client, reasons = /* @__PURE__ */ new Set();
-  for (const e of [p.operationError, c?.lastError, p.conflictError, p.consistencyError, ...p.fileFailures.values()]) {
+  for (const e of [p.operationError, c?.lastError, p.conflictError, p.consistencyError, ...(p.activeFailures?.() || p.fileFailures).values()]) {
     const code = errorCode(e);
     if (code) reasons.add(code);
   }
@@ -9459,8 +9500,8 @@ var RetryLedger = class {
   snapshot() {
     return { serverId: this.serverId, items: [...this.items.values()].map((r2) => ({ ...r2 })) };
   }
-  summary() {
-    const rows = [...this.items.values()], retry = rows.filter((r2) => r2.retryable);
+  summary(include = (_key) => true) {
+    const rows = [...this.items.values()].filter((r2) => include(r2.key)), retry = rows.filter((r2) => r2.retryable);
     return { retrying: retry.length, blocked: rows.length - retry.length, nextAt: retry.length ? Math.min(...retry.map((r2) => r2.nextAt)) : 0, reasons: [...new Set(rows.map((r2) => r2.code))] };
   }
 };
@@ -9508,8 +9549,12 @@ function pathReviewGroups(items = [], destinations = {}) {
   return groups.map(({ paths, label, ...g }) => g);
 }
 function syncSections(options = {}) {
-  const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0 } = options;
-  const transfer = progress?.available ? (ready ? "" : "\u79BB\u7EBF\u53C2\u8003 \xB7 ") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u91CD\u8BD5 " + progress.retry + " \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions : "\u91CD\u8FDE\u540E\u6838\u5BF9\u8FDB\u5EA6 \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions;
+  const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0, queueState = null } = options;
+  let transfer = progress?.available ? (ready ? "" : "\u79BB\u7EBF\u53C2\u8003 \xB7 ") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u91CD\u8BD5 " + progress.retry + " \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions : "\u91CD\u8FDE\u540E\u6838\u5BF9\u8FDB\u5EA6 \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions;
+  if (queueState) {
+    const q = queueState.counts;
+    transfer += " \xB7 \u771F\u6B63\u5931\u8D25 " + q.failed + " \xB7 \u5F85\u786E\u8BA4 " + q.review + " \xB7 \u4FDD\u62A4\u6682\u7F13 " + q.held;
+  }
   let auditText = "\u5C1A\u672A\u6838\u5BF9";
   if (audit) {
     auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
@@ -10744,7 +10789,7 @@ function documentDigest(doc2) {
   return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
 }
 
-function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0, stalled = false, stallReason = "" }) {
+function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0, stalled = false, stallReason = "", queueState = null }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
     tone = "error";
@@ -10803,6 +10848,22 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
     icon = "alert-circle";
     label = "\u540C\u6B65\u6682\u672A\u63A8\u8FDB";
     display = "Sync: \u26A0 " + ({ network: "\u7B49\u5F85\u7F51\u7EDC", cache: "\u7B49\u5F85\u7F13\u5B58", vault: "\u7B49\u5F85\u5199\u76D8", config: "\u7B49\u5F85\u4FDD\u5B58" }[stallReason] || "\u6682\u672A\u63A8\u8FDB");
+  }
+  if (queueState) {
+    const q = queueState.counts;
+    counts += " \xB7 \u5F85\u786E\u8BA4 " + q.review + " \xB7 \u4FDD\u62A4\u6682\u7F13 " + q.held + " \xB7 \u771F\u6B63\u5931\u8D25 " + q.failed;
+    if (ready && !conflicts) {
+      if (q.failed || error) {
+        tone = "error";
+        label = "\u6709\u5931\u8D25\u9700\u5904\u7406";
+        display = "Sync: \u26A0 " + (q.failed ? "\u5931\u8D25" + q.failed : "\u8FDE\u63A5/\u672C\u5730\u5F02\u5E38");
+      } else if (q.review || q.held) {
+        tone = "waiting";
+        busy = false;
+        label = "\u7B49\u5F85\u786E\u8BA4\u6216\u4FDD\u62A4\u6682\u7F13";
+        display = "Sync: " + (q.review ? "\u5F85\u786E\u8BA4" + q.review : "") + (q.review && q.held ? " \xB7 " : "") + (q.held ? "\u6682\u7F13" + q.held : "");
+      }
+    }
   }
   return { tone, icon, label, display, busy, counts, description: (progress?.available ? counts + "\uFF1B\u5F53\u524D\u63A5\u6536\u5E76\u53D1" + progress.active + "\uFF1B\u5F85\u91CD\u8BD5\u4EC5\u7EDF\u8BA1\u6587\u4EF6\u5931\u8D25\uFF0C\u4E0D\u5305\u542B\u8FDE\u63A5\u9519\u8BEF\u6216\u51B2\u7A81\uFF1B" : "\u8FDB\u5EA6\u5C1A\u672A\u6838\u5BF9\uFF1B") + label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
@@ -11598,7 +11659,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   scheduleRetry() {
     window.clearTimeout(this.recoveryTimer);
     this.recoveryTimer = void 0;
-    const summary = this.ledger()?.summary();
+    const summary = this.runnableRetrySummary();
     if (!summary?.retrying || this.stopping || this.uiUnloaded || !this.client?.ready) return;
     this.recoveryTimer = window.setTimeout(() => {
       this.recoveryTimer = void 0;
@@ -11624,10 +11685,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (removed || progress) this.lastQueueProgressAt = Date.now();
   }
   recoveryStatus() {
-    const reviewPaths = new Set((this.settings.pathSafety?.items || []).filter((i) => !i.approved).flatMap((i) => operationPaths(i.op)).concat(this.settings.remoteDeleteReview?.approved ? [] : this.settings.remoteDeleteReview?.paths || []));
-    const pending = this.pendingRows().filter((r2) => !reviewPaths.has(r2.path)).length;
-    const result = stallStatus({ pending, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden && !desktopBackgroundEnabled(import_obsidian.Platform) });
-    return reviewPaths.size && !pending && this.client?.ready ? { ...result, reason: "manual-review", blocked: result.blocked + reviewPaths.size } : result;
+    const view = this.queueView(), pending = view.counts.active + view.counts.failed;
+    const result = stallStatus({ pending, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.runnableRetrySummary(), ready: !!this.client?.ready, hidden: document.hidden && !desktopBackgroundEnabled(import_obsidian.Platform) });
+    return (view.counts.review || view.counts.held) && !pending && this.client?.ready ? { ...result, reason: "manual-review", blocked: view.counts.review + view.counts.held } : result;
   }
   performance = new PerformanceCounters();
   settings = { protocol: 3, capability: FILE_REFS_CAPABILITY, url: "ws://127.0.0.1:17241", token: "", state: "", enabled: false };
@@ -11701,11 +11761,23 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   legacyConfig = null;
   fingerprints = /* @__PURE__ */ new Map();
   configWrites = Promise.resolve();
+  queueView() {
+    const downloads = [.../* @__PURE__ */ new Set([...this.downloadPaths, ...(this.settings.receivePending?.paths || []).filter((p) => !this.receiveAcks.has(p))])];
+    return classifyQueues(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads }), this.settings, this.client?.pending || this.settings.pending?.items || []);
+  }
   pendingRows() {
-    const rows = new Map(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads: [.../* @__PURE__ */ new Set([...this.downloadPaths, ...(this.settings.receivePending?.paths || []).filter((p) => !this.receiveAcks.has(p))])] }).map((r2) => [r2.path, r2]));
-    for (const i of this.settings.pathSafety?.items || []) for (const path of operationPaths(i.op)) rows.set(path, { path, state: i.error ? "\u8DEF\u5F84\u64CD\u4F5C\u5F85\u590D\u6838\uFF1A" + i.error : "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u4F20\u64AD/\u786E\u8BA4" });
-    for (const path of this.settings.remoteDeleteReview?.paths || []) rows.set(path, { path, state: "\u8FDC\u7AEF\u6279\u91CF\u5220\u9664\u5F85\u786E\u8BA4" });
-    return [...rows.values()];
+    return this.queueView().rows;
+  }
+  activeFailures() {
+    const protection = queueProtection(this.settings);
+    return new Map([...this.fileFailures].filter(([path]) => !protectionKind(path, protection)));
+  }
+  pendingPublishAllowed(path) {
+    return !protectionKind(path, queueProtection(this.settings));
+  }
+  runnableRetrySummary() {
+    const protection = queueProtection(this.settings);
+    return this.ledger()?.summary((key) => !deferredRetryKey(key, protection));
   }
   safeError(error) {
     return String(error || "").replaceAll(this.settings.token || "__no_token__", "[\u4EE4\u724C\u5DF2\u9690\u85CF]").slice(0, 240);
@@ -11726,13 +11798,12 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client;
     if (this.pendingRows().length && this.recoveryStatus().stalled) return "\u540C\u6B65\u6682\u672A\u63A8\u8FDB\uFF1A" + stallText(this.recoveryStatus());
     if (!c?.ready) return this.connectionStatus + "\uFF1B\u5F85\u4F20\u6587\u4EF6\u7248\u672C" + (c?.pending.length ?? this.settings.pending?.items?.length ?? 0) + "\uFF1B\u51B2\u7A81" + this.conflicts.length;
-    if (this.settings.pathSafety?.items.length) return "\u6709" + this.settings.pathSafety.items.length + "\u9879\u5220\u9664\u6216\u91CD\u547D\u540D\u7B49\u5F85\u786E\u8BA4/\u91CD\u8BD5";
-    if (this.settings.remoteDeleteReview) return "\u6709" + this.settings.remoteDeleteReview.paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\u7B49\u5F85\u786E\u8BA4";
+    if (this.queueView().counts.review || this.queueView().counts.held) return queueStateText(this.queueView());
     if (this.conflicts.length) return "\u6709" + this.conflicts.length + "\u9879\u51B2\u7A81\u5F85\u5904\u7406\uFF0C\u53CC\u65B9\u7248\u672C\u5DF2\u4FDD\u7559";
     if (this.conflictError) return "\u5DF2\u8FDE\u63A5\uFF0C\u51B2\u7A81\u72B6\u6001\u5C1A\u672A\u786E\u8BA4";
-    if (this.fileFailures.size && this.downloadPaths.size && [...this.fileFailures.values()].every(recoverableSyncFailure) && !c.lastError && !this.operationError) return "\u6B63\u5728\u6062\u590D\u540C\u6B65\uFF0C\u5931\u8D25\u9879\u76EE\u9010\u9879\u91CD\u8BD5";
-    if (this.ledger()?.items.size) return stallText(this.recoveryStatus());
-    if (c.lastError || this.fileFailures.size || this.operationError) return "\u5DF2\u8FDE\u63A5\uFF0C\u6709\u5931\u8D25\u9879\u76EE\uFF0C\u5185\u5BB9\u4FDD\u7559";
+    if (this.activeFailures().size && this.downloadPaths.size && [...this.activeFailures().values()].every(recoverableSyncFailure) && !c.lastError && !this.operationError) return "\u6B63\u5728\u6062\u590D\u540C\u6B65\uFF0C\u5931\u8D25\u9879\u76EE\u9010\u9879\u91CD\u8BD5";
+    if ((this.runnableRetrySummary()?.retrying || 0) + (this.runnableRetrySummary()?.blocked || 0)) return stallText(this.recoveryStatus());
+    if (c.lastError || this.activeFailures().size || this.operationError) return "\u5DF2\u8FDE\u63A5\uFF0C\u6709\u5931\u8D25\u9879\u76EE\uFF0C\u5185\u5BB9\u4FDD\u7559";
     if (!this.syncedOnce || this.initializing) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u51C6\u5907\u6587\u4EF6";
     if (this.reflection.queued || this.downloadPaths.size) return "\u5DF2\u8FDE\u63A5\uFF0C\u6B63\u5728\u63A5\u6536\u6587\u4EF6";
     if (this.pendingRows().length) return "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4";
@@ -11753,8 +11824,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   renderPanel(e, headline) {
     e.empty();
     const c = this.client, rows = this.pendingRows(), progress = this.progressModel();
+    e.createEl("p", { text: queueStateText(this.queueView()) });
     const audit = c ? diagnosticDetails(this).audit : void 0;
-    const sections = syncSections({ ready: !!c?.ready, connecting: !!c && !c.stopped && !c.ready, error: this.operationError || c?.lastError || this.conflictError, progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, audit, conflicts: this.conflicts.length, operations: this.settings.pathSafety?.items.length || 0, remoteDeletes: this.settings.remoteDeleteReview?.paths.length || 0, holds: this.settings.consistencyHolds?.length || 0 });
+    const sections = syncSections({ ready: !!c?.ready, connecting: !!c && !c.stopped && !c.ready, error: this.operationError || c?.lastError || this.conflictError, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, audit, conflicts: this.conflicts.length, operations: this.settings.pathSafety?.items.length || 0, remoteDeletes: this.settings.remoteDeleteReview?.paths.length || 0, holds: this.settings.consistencyHolds?.length || 0 });
     const overview = e.createDiv({ cls: "rl-sync-overview" });
     for (const section of sections) {
       const card = overview.createDiv({ cls: "rl-sync-section" });
@@ -11773,11 +11845,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
     e.createEl("p", { text: "\u4E00\u81F4\u6027\u4FDD\u62A4\u8DEF\u5F84\uFF1A" + (this.settings.consistencyHolds?.length || 0) + "\uFF1B\u9047\u5230\u7ADE\u4E89\u65F6\u4FDD\u7559\u672C\u673A\u6B63\u6587\uFF0C\u91CD\u542F\u540E\u7EE7\u7EED\u4FDD\u62A4\u3002\u8BF7\u901A\u8FC7\u9010\u6587\u4EF6\u6838\u9A8C\u9884\u89C8\uFF0C\u518D\u660E\u786E\u9009\u62E9\u4FDD\u7559\u526F\u672C\u5E76\u4FEE\u590D\u3002" });
     e.createEl("p", { text: "\u4E00\u81F4\u6027\u6838\u5BF9\uFF1A" + this.consistencyStatus + "\uFF1B\u81EA\u52A8\u6838\u5BF9\u4E0E\u5B89\u5168\u8865\u4F20\uFF1A" + (this.settings.autoConsistency ? "\u5DF2\u5F00\u542F" : "\u672A\u5F00\u542F") });
-    e.createEl("p", { text: "\u5F85\u4E0A\u4F20\u6587\u4EF6\u7248\u672C\uFF1A" + (c?.pending || this.settings.pending?.items || []).length + "\uFF1B\u540C\u4E00\u8DEF\u5F84\u53EF\u4EE5\u6709\u591A\u4E2A\u7248\u672C\uFF0C\u66F4\u65B0\u4E0E\u91CD\u8FDE\u4E0D\u4F1A\u81EA\u52A8\u6E05\u7A7A\u3002" });
+    e.createEl("p", { text: "\u4FDD\u7559\u5F85\u4F20\u6587\u4EF6\u7248\u672C\uFF08\u542B\u5F85\u786E\u8BA4\u4E0E\u4FDD\u62A4\u6682\u7F13\uFF09\uFF1A" + (c?.pending || this.settings.pending?.items || []).length + "\uFF1B\u540C\u4E00\u8DEF\u5F84\u53EF\u4EE5\u6709\u591A\u4E2A\u7248\u672C\uFF0C\u66F4\u65B0\u4E0E\u91CD\u8FDE\u4E0D\u4F1A\u81EA\u52A8\u6E05\u7A7A\u3002" });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A" + this.conflicts.length });
     if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
-    if ([this.operationError, ...this.fileFailures.values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u684C\u9762\u7AEF\u4FDD\u6301 Obsidian \u8FD0\u884C\u5373\u53EF\uFF0C\u624B\u673A\u7AEF\u9700\u4FDD\u6301\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
+    if ([this.operationError, ...this.activeFailures().values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u684C\u9762\u7AEF\u4FDD\u6301 Obsidian \u8FD0\u884C\u5373\u53EF\uFF0C\u624B\u673A\u7AEF\u9700\u4FDD\u6301\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
     if (this.capacityReport) e.createEl("p", { text: capacityText(this.capacityReport) });
     if (this.pendingRows().length || this.ledger()?.items.size) e.createEl("p", { text: stallText(this.recoveryStatus()) });
     if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
@@ -12081,8 +12153,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client;
     if (!c || this.stopping || c.stopped || c.transportBlocked || !c.ready || this.initializing || this.recoveryBusy || Date.now() < this.retryAfter) return;
     if (this.ledger() && !this.ledger().due("operation") && !this.syncedOnce) return;
-    const errors = [this.operationError, ...this.fileFailures.values(), c.lastError].filter(Boolean);
-    if (!errors.some(recoverableSyncFailure) && !c.pending.some((p) => this.ledger()?.due("upload:" + p.path)) && ![...this.dirtyFiles.keys()].some((p) => this.ledger()?.due("upload:" + p)) && !this.settings.receivePending?.paths.some((p) => this.ledger()?.due("download:" + p))) return;
+    const errors = [this.operationError, ...this.activeFailures().values(), c.lastError].filter(Boolean);
+    if (!errors.some(recoverableSyncFailure) && !c.pending.some((p) => this.pendingPublishAllowed(p.path) && this.ledger()?.due("upload:" + p.path)) && ![...this.dirtyFiles.keys()].some((p) => this.pendingPublishAllowed(p) && this.ledger()?.due("upload:" + p)) && !this.settings.receivePending?.paths.some((p) => !this.pathBlocked(p) && this.ledger()?.due("download:" + p))) return;
     this.recoveryBusy = true;
     this.retryAfter = Date.now() + 2e3;
     try {
@@ -12096,7 +12168,9 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (force) {
       const ledger = this.ledger();
       if (ledger) {
+        const protection = queueProtection(this.settings);
         for (const r2 of ledger.items.values()) {
+          if (deferredRetryKey(r2.key, protection)) continue;
           r2.nextAt = 0;
           r2.retryable = true;
         }
@@ -12124,7 +12198,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       await this.flushPathSafety();
       const confirmed = await c.confirmUploads();
       await this.reflect();
-      if (confirmed && !this.fileFailures.size && !this.pendingRows().length) {
+      if (confirmed && !this.activeFailures().size && !this.pendingRows().length) {
         if (recoverableSyncFailure(this.operationError)) this.operationError = "";
         if (recoverableSyncFailure(c.lastError)) c.lastError = "";
         await this.retrySuccess("operation");
@@ -12135,14 +12209,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   progressModel() {
     const c = this.client;
-    return fileProgress({ known: c ? Object.keys(entries(c.doc)) : [], pending: this.pendingRows().map((r2) => r2.path), failures: [...this.fileFailures.keys()], active: this.downloadPaths.size, ready: !!c?.serverId && this.settings.receivePending?.serverId === c.serverId });
+    return fileProgress({ known: c ? Object.keys(entries(c.doc)) : [], pending: this.pendingRows().map((r2) => r2.path), failures: [...this.activeFailures().keys()], active: this.downloadPaths.size, ready: !!c?.serverId && this.settings.receivePending?.serverId === c.serverId });
   }
   badgeModel() {
     const c = this.client, progress = this.progressModel(), uploads = /* @__PURE__ */ new Set([...c?.pendingPaths || this.settings.outbox || [], ...(c?.pending || this.settings.pending?.items || []).map((p) => p.path), ...this.dirtyFiles.keys()]);
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
     const recovery = this.recoveryStatus();
-    return badgeState({ stalled: recovery.stalled, stallReason: recovery.reason, progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.fileFailures.size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.fileFailures.values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.fileFailures.size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ stalled: recovery.stalled, stallReason: recovery.reason, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.activeFailures().size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.activeFailures().values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.activeFailures().size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -12250,7 +12324,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     try {
       await this.refreshCapacity();
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: this.isForeground(), ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.fileFailures.size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(CAPACITY_CAPABILITY) && this.capacityReport ? { capacity: this.capacityReport } : {}, ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: this.isForeground(), ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.activeFailures().size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(QUEUE_STATE_CAPABILITY) ? { queueState: queueTelemetry(this.queueView()) } : {}, ...c.serverCapabilities.includes(CAPACITY_CAPABILITY) && this.capacityReport ? { capacity: this.capacityReport } : {}, ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -12283,6 +12357,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.settings.deviceLabels = { ...this.settings.deviceLabels, [d.deviceId]: v.trim().slice(0, 64) };
           await this.persistConfig();
         }));
+        for (const d of result.devices) if (d.queueState) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 \u5F85\u786E\u8BA4 " + d.queueState.awaitingPaths + " \u8DEF\u5F84 \xB7 \u4FDD\u62A4\u6682\u7F13 " + d.queueState.protectedPaths + " \u8DEF\u5F84 \xB7 \u771F\u6B63\u5931\u8D25 " + d.queueState.failedPaths + " \u8DEF\u5F84 \xB7 \u53EF\u5904\u7406 " + d.queueState.activePaths + " \u8DEF\u5F84" });
         for (const d of result.devices) if (d.capacity) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + capacityText(d.capacity) });
         for (const d of result.devices) if (d.recovery) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + stallText(d.recovery) });
         for (const d of result.devices) if (d.performance) {
@@ -12358,7 +12433,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.safetyBusy = true;
     try {
       const deleted = new Set(queue.items.filter((i) => i.op.kind === "delete").flatMap((i) => i.op.entries.map((e) => e.from))), bulk = bulkDeletion(deleted.size, Object.keys(entries(c.doc)).length);
-      if (bulk) {
+      if (bulk && queue.items.some((i) => i.op.kind === "delete" && !i.review)) {
         for (const i of queue.items) if (i.op.kind === "delete") i.review = true;
         await this.persistConfig();
       }
@@ -12369,11 +12444,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           await this.persistConfig();
           return;
         }
-        if (index < 0) {
-          item.error = "\u6279\u91CF\u6216\u8303\u56F4\u53D8\u5316\u64CD\u4F5C\u7B49\u5F85\u660E\u786E\u786E\u8BA4";
-          await this.persistConfig();
-          return;
-        }
+        if (index < 0) return;
         try {
           for (const e of item.op.entries) if (this.app.vault.getAbstractFileByPath(e.from)) throw Error("\u539F\u8DEF\u5F84\u53C8\u6709\u672C\u673A\u6587\u4EF6\uFF0C\u672A\u4F20\u64AD\u5220\u9664/\u91CD\u547D\u540D\uFF0C\u8BF7\u68C0\u67E5");
           if (!item.prepared) {
@@ -12418,7 +12489,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           }
           await this.persistConfig();
           const confirmed = await c.confirmUploads();
-          if (confirmed && !queue.items.length && !this.fileFailures.size && !this.operationError) this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
+          if (confirmed && !queue.items.length && !this.activeFailures().size && !this.operationError) this.setConnectionStatus("\u6587\u4EF6\u5DF2\u5C31\u7EEA");
         } catch (e) {
           item.error = this.safeError(e);
           await this.persistConfig();
@@ -12976,7 +13047,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = new VaultClientV3({ url: this.settings.url, token: this.settings.token, fetchImpl: requestFetch(import_obsidian.requestUrl, void 0, () => this.performance.begin("network")), onTransfer: (kind, bytes, failed, files) => {
       this.transfers.record(kind, bytes, failed, files);
       if (!failed && bytes) this.lastQueueProgressAt = Date.now();
-    }, mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, canPublishPending: (path) => !this.pathBlocked(path) || !!this.settings.pathSafety?.items.some((i) => i.approved && i.op.entries.some((e) => e.from === path)), retryDue: (path) => this.ledger()?.due("upload:" + path) ?? true, onRetryFailure: async (path, e) => {
+    }, mode: this.settings.mode, serverId: this.settings.serverId, blobCache: this.cache, canPublishPending: (path) => this.pendingPublishAllowed(path), retryDue: (path) => this.ledger()?.due("upload:" + path) ?? true, onRetryFailure: async (path, e) => {
       this.fileFailures.set(path, this.safeError(e));
       await this.retryFailure("upload:" + path, e);
     }, onRetrySuccess: async (path) => {
@@ -13046,7 +13117,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         const confirmed = await c.confirmUploads();
         if (c.ready && !this.stopping) {
           this.setConnectionStatus(confirmed && !this.pendingRows().length ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
-          if (confirmed && !this.fileFailures.size && !this.pendingRows().length) {
+          if (confirmed && !this.activeFailures().size && !this.pendingRows().length) {
             if (recoverableSyncFailure(this.operationError)) this.operationError = "";
             new import_obsidian.Notice("\u6D4B\u8BD5\u6587\u4EF6\u5DF2\u5C31\u7EEA\uFF0C\u53EF\u4EE5\u5F00\u59CB\u7F16\u8F91\u540C\u6B65");
           }
@@ -13120,7 +13191,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           const f = this.app.vault.getAbstractFileByPath(p);
           if (m.deleted || c.doc.getMap("deleted").has(p)) {
             if (f instanceof import_obsidian.TFile) {
-              if (this.settings.recreateIntents?.[p] || this.fileFailures.size || this.downloadPaths.size) continue;
+              if (this.settings.recreateIntents?.[p] || this.activeFailures().size || this.downloadPaths.size) continue;
               const saved = await this.read(f);
               if (!this.remoteDeleteAllowed(p) && !await this.verifiedRemoteMoveCopy(p, saved)) continue;
               await this.backup(p, saved);

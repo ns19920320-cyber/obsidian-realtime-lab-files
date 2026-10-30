@@ -29,3 +29,5 @@ test('audit prerequisites and interrupted scans use retry causes without leaking
  assert.deepEqual(auditFailure(Error('/synthetic/private/path token=secret'),'save-baseline'),{reason:'unknown-error',code:'persistence'});
  assert.equal(errorCode('本地保存失败：synthetic failure'),'persistence');
 });
+
+test('queue classification diagnostics are bounded counts only and cannot claim pending reviews are complete',()=>{const doc=new Y.Doc(),base=report(doc),queueState={activePaths:0,awaitingPaths:18,protectedPaths:220,failedPaths:0,activeVersions:0,awaitingVersions:18,protectedVersions:220,failedVersions:0},input={...base,queued:238,files:238,queueState};const clean=validateDiagnostic(input);assert.deepEqual(clean.queueState,queueState);assert.throws(()=>validateDiagnostic({...input,queued:0}),/count mismatch/);assert.throws(()=>validateDiagnostic({...input,files:0}),/version count mismatch/);assert.throws(()=>validateDiagnostic({...input,queueState:{...queueState,path:'private.png'}}),/Invalid/);const store=new DeviceDiagnostics(),ws={readyState:1};store.report(ws,input);assert.equal(store.snapshot(documentDigest(doc),0)[0].completeAtReport,false);doc.destroy();});

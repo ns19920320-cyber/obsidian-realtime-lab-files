@@ -52,7 +52,10 @@ function deferredRetryKey(key, protection) {
 }
 function classifyQueues(rows = [], settings = {}, versions = []) {
   const protection = queueProtection(settings), map2 = new Map(rows.map((r2) => [r2.path, { ...r2 }]));
-  for (const i of settings.pathSafety?.items || []) for (const e of i.op.entries) for (const p of e.to ? [e.from, e.to] : [e.from]) if (!map2.has(p)) map2.set(p, { path: p, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD" : "\u5F85\u786E\u8BA4" });
+  for (const i of settings.pathSafety?.items || []) for (const e of i.op.entries) for (const p of e.to ? [e.from, e.to] : [e.from]) {
+    if (!map2.has(p)) map2.set(p, { path: p, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD" : "\u5F85\u786E\u8BA4" });
+    if (i.approved && i.error) map2.set(p, { ...map2.get(p), state: "\u5DF2\u6279\u51C6\u64CD\u4F5C\u5931\u8D25\uFF0C\u9700\u590D\u6838", error: i.error });
+  }
   for (const p of protection.review) if (!map2.has(p)) map2.set(p, { path: p, state: "\u4FDD\u7559\u539F\u5185\u5BB9" });
   const counts = { active: 0, review: 0, held: 0, failed: 0 }, versionCounts = { active: 0, review: 0, held: 0, failed: 0 };
   for (const row of map2.values()) {
@@ -11769,8 +11772,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     return this.queueView().rows;
   }
   activeFailures() {
-    const protection = queueProtection(this.settings);
-    return new Map([...this.fileFailures].filter(([path]) => !protectionKind(path, protection)));
+    const protection = queueProtection(this.settings), failures = new Map([...this.fileFailures].filter(([path]) => !protectionKind(path, protection)));
+    for (const i of this.settings.pathSafety?.items || []) if (i.approved && i.error) {
+      for (const path of operationPaths(i.op)) if (!protectionKind(path, protection)) failures.set(path, i.error);
+    }
+    return failures;
   }
   pendingPublishAllowed(path) {
     return !protectionKind(path, queueProtection(this.settings));

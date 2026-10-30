@@ -66,7 +66,7 @@ export default class RealtimeLab extends Plugin{
  cache!:ObsidianBlobCache;legacyConfig:any=null;fingerprints=new Map<string,{key:string;item:Item}>();configWrites=Promise.resolve();
  queueView(){const downloads=[...new Set([...this.downloadPaths,...(this.settings.receivePending?.paths||[]).filter(p=>!this.receiveAcks.has(p))])];return classifyQueues(queueRows({metadata:this.client?.pendingPaths||this.settings.outbox||[],files:this.client?.pending||this.settings.pending?.items||[],dirty:[...this.dirtyFiles.keys()],failures:[...this.fileFailures],downloads}),this.settings,this.client?.pending||this.settings.pending?.items||[]);}
  pendingRows(){return this.queueView().rows;}
- activeFailures(){const protection=queueProtection(this.settings);return new Map([...this.fileFailures].filter(([path])=>!protectionKind(path,protection)));}
+ activeFailures(){const protection=queueProtection(this.settings),failures=new Map([...this.fileFailures].filter(([path])=>!protectionKind(path,protection)));for(const i of this.settings.pathSafety?.items||[])if(i.approved&&i.error)for(const path of operationPaths(i.op))if(!protectionKind(path,protection))failures.set(path,i.error);return failures;}
  pendingPublishAllowed(path:string){return !protectionKind(path,queueProtection(this.settings));}
  runnableRetrySummary(){const protection=queueProtection(this.settings);return this.ledger()?.summary((key:string)=>!deferredRetryKey(key,protection));}
  safeError(error:unknown){return String(error||'').replaceAll(this.settings.token||'__no_token__','[令牌已隐藏]').slice(0,240);}

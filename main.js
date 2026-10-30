@@ -10684,6 +10684,15 @@ function validateSafetyQueue(queue, serverId) {
     if (typeof item.approved !== "boolean" || typeof item.backedUp !== "boolean") throw Error("Invalid protected queue item");
   }
 }
+function runnablePathOperation(items, bulk) {
+  const blocked = /* @__PURE__ */ new Set();
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index], paths = operationPaths(item.op), waiting = !item.approved && (item.review || (item.op.kind === "delete" ? bulk : item.op.entries.length >= 5));
+    if (!waiting && paths.every((p) => !blocked.has(p))) return index;
+    for (const p of paths) blocked.add(p);
+  }
+  return -1;
+}
 
 var DIAGNOSTICS_CAPABILITY = "device-diagnostics-v1";
 function documentDigest(doc2) {
@@ -12279,13 +12288,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         await this.persistConfig();
       }
       while (queue.items.length && this.client === c && c.ready) {
-        const item = queue.items[0];
+        const index = runnablePathOperation(queue.items, bulk), item = queue.items[index < 0 ? 0 : index];
         if (!c.serverCapabilities.includes(PATH_SAFETY_CAPABILITY)) {
           item.error = "\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301\u8DEF\u5F84\u4FDD\u62A4\uFF0C\u672A\u964D\u7EA7\u4E3A\u76F4\u63A5\u5220\u9664";
           await this.persistConfig();
           return;
         }
-        if (!item.approved && (item.review || (item.op.kind === "delete" ? bulk : item.op.entries.length >= 5))) {
+        if (index < 0) {
           item.error = "\u6279\u91CF\u6216\u8303\u56F4\u53D8\u5316\u64CD\u4F5C\u7B49\u5F85\u660E\u786E\u786E\u8BA4";
           await this.persistConfig();
           return;
@@ -12323,7 +12332,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
               } else await c.stageFile(e.to, this.cache.source(current), { base: published });
             }
           }
-          queue.items.shift();
+          queue.items.splice(index, 1);
           for (const e of item.op.entries) {
             this.dirtyFiles.delete(e.from);
             this.fileFailures.delete(e.from);

@@ -663,3 +663,10 @@ test('legacy remote deletion review is not automatically applied even when new c
  p.settings.remoteDeleteReview={signature:p.reviewDigest(),paths:moved.map(e=>e.from),approved:false};await p.persistConfig();p.reflection.request=request;await p.reflect();await p.queue;
  assert.equal(p.settings.remoteDeleteReview.approved,false);assert.equal(p.settings.remoteDeleteReview.moveInference,undefined);for(let i=0;i<6;i++){assert.equal(mem.data.get('legacy-remote/'+i+'.md'),'old review '+i);assert.equal(mem.data.get('legacy-copy/'+i+'.md'),'old review '+i);}
 });
+
+test('an unrelated approved move finishes without changing an earlier manual deletion plan',async t=>{
+ const {p,mem,server}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);for(let i=0;i<3;i++)await mem.v.create('manual-first/'+i+'.md','manual '+i);for(let i=0;i<6;i++)await mem.v.create('independent/'+i+'.md','move '+i);await wait(()=>[...server.doc.getMap('files').keys()].length===9);await p.queue;
+ await mem.v.trash({path:'manual-first'});await p.queue;await p.flushPathSafety();const manual=JSON.stringify(p.settings.pathSafety.items);assert.equal(p.settings.pathSafety.items.length,1);
+ await mem.v.rename({path:'independent'},'independent-new');await p.queue;await p.flushPathSafety();assert.equal(JSON.stringify(p.settings.pathSafety.items),manual);
+ for(let i=0;i<3;i++)assert(content(server.doc,'manual-first/'+i+'.md'));for(let i=0;i<6;i++){assert.equal(content(server.doc,'independent/'+i+'.md'),null);assert(content(server.doc,'independent-new/'+i+'.md'));}
+});

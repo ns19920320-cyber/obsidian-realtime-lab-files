@@ -11,3 +11,14 @@ export function applyPathOperation(doc,op){validatePathOperation(op);for(const e
 export function bulkDeletion(count,total){return count>=5||(count>=3&&count/Math.max(1,total)>=0.25);}
 export function operationPaths(op){return op.entries.flatMap(e=>e.to?[e.from,e.to]:[e.from]);}
 export function validateSafetyQueue(queue,serverId){if(!queue)return;if(queue.serverId!==serverId||!Array.isArray(queue.items)||queue.items.length>128||queue.items.reduce((n,x)=>n+x.op.entries.length,0)>3000||new TextEncoder().encode(JSON.stringify(queue)).length>2*1024*1024)throw Error('Protected queue identity or capacity mismatch');for(const item of queue.items){validatePathOperation(item.op);if(typeof item.approved!=='boolean'||typeof item.backedUp!=='boolean')throw Error('Invalid protected queue item');}}
+
+// Waiting decisions block dependent paths, not unrelated approved moves.
+export function runnablePathOperation(items,bulk){
+ const blocked=new Set();
+ for(let index=0;index<items.length;index++){
+  const item=items[index],paths=operationPaths(item.op),waiting=!item.approved&&(item.review||(item.op.kind==='delete'?bulk:item.op.entries.length>=5));
+  if(!waiting&&paths.every(p=>!blocked.has(p)))return index;
+  for(const p of paths)blocked.add(p);
+ }
+ return -1;
+}

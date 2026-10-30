@@ -9432,8 +9432,38 @@ function stallText(s) {
   return (s.stalled ? "\u8D85\u8FC760\u79D2\u672A\u89C1\u5B8C\u6210\u8FDB\u5C55\uFF1B" : "") + (names[s.reason] || s.reason) + "\uFF1B\u81EA\u52A8\u91CD\u8BD5 " + s.retrying + " \u9879\uFF0C\u9700\u590D\u6838 " + s.blocked + " \u9879" + (s.retrying ? "\uFF1B\u8DDD\u4E0B\u6B21\u91CD\u8BD5 " + s.nextRetrySeconds + " \u79D2" : "") + "\u3002\u4E0D\u4F1A\u6E05\u7A7A\u961F\u5217\u6216\u81EA\u52A8\u8986\u76D6\u51B2\u7A81\u3002";
 }
 
-function pathReviewGroups(items = []) {
-  return items.map((i) => ({ id: i.op.id, title: (i.op.kind === "rename" ? "\u91CD\u547D\u540D" : "\u5220\u9664") + " \xB7 " + i.op.entries.length + " \u9879", count: i.op.entries.length, affected: new Set(i.op.entries.flatMap((e) => e.to ? [e.from, e.to] : [e.from])).size, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: i.error || "", lines: i.op.entries.map((e) => e.to ? e.from + " \u2192 " + e.to : e.from), reviewed: { id: i.op.id, plan: JSON.stringify(i.op) } }));
+function pathReviewGroups(items = [], destinations = {}) {
+  const parent = (p) => p.slice(0, p.lastIndexOf("/")), name = (p) => p.slice(p.lastIndexOf("/") + 1);
+  const same = (a, b) => a?.kind === b?.kind && (a.kind === "text" ? a.data === b.data : a.hash === b.hash && a.size === b.size);
+  const sources = new Set(items.flatMap((i) => i.op.entries.map((e) => e.from))), groups = [], batches = /* @__PURE__ */ new Map();
+  for (const i of items) {
+    const reviewed = { id: i.op.id, plan: JSON.stringify(i.op) }, lines = [];
+    let inferred = i.op.kind === "delete";
+    for (const e of i.op.entries) {
+      const matches = i.op.kind === "delete" ? Object.entries(destinations).filter(([p, c]) => !sources.has(p) && name(p) === name(e.from) && same(e.base, c)) : [];
+      if (matches.length !== 1) inferred = false;
+      lines.push(e.to ? e.from + " \u2192 " + e.to : matches.length === 1 ? e.from + " \u2192 " + matches[0][0] + "\uFF08\u540C\u5185\u5BB9\u526F\u672C\uFF0C\u9700\u786E\u8BA4\u65E7\u8DEF\u5F84\u6E05\u7406\uFF09" : e.from);
+    }
+    const title = i.op.kind === "rename" ? "\u91CD\u547D\u540D" : inferred ? "\u7591\u4F3C\u79FB\u52A8\u540E\u65E7\u8DEF\u5F84\u6E05\u7406" : "\u5220\u9664";
+    const key = i.op.kind === "delete" ? JSON.stringify([title, !!i.approved, [...new Set(i.op.entries.map((e) => parent(e.from)))].sort()]) : null;
+    let g = key ? batches.get(key) : null;
+    if (!g) {
+      g = { id: i.op.id, title: "", count: 0, affected: 0, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: "", lines: [], reviewed, reviewedItems: [], paths: /* @__PURE__ */ new Set(), label: title };
+      groups.push(g);
+      if (key) batches.set(key, g);
+    }
+    g.count += i.op.entries.length;
+    g.reviewedItems.push(reviewed);
+    g.lines.push(...lines);
+    if (i.error && !g.error) g.error = i.error;
+    for (const e of i.op.entries) {
+      g.paths.add(e.from);
+      if (e.to) g.paths.add(e.to);
+    }
+    g.affected = g.paths.size;
+    g.title = g.label + " \xB7 " + g.count + " \u9879";
+  }
+  return groups.map(({ paths, label, ...g }) => g);
 }
 function syncSections(options = {}) {
   const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0 } = options;
@@ -10654,6 +10684,15 @@ function validateSafetyQueue(queue, serverId) {
     if (typeof item.approved !== "boolean" || typeof item.backedUp !== "boolean") throw Error("Invalid protected queue item");
   }
 }
+function runnablePathOperation(items, bulk) {
+  const blocked = /* @__PURE__ */ new Set();
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index], paths = operationPaths(item.op), waiting = !item.approved && (item.review || (item.op.kind === "delete" ? bulk : item.op.entries.length >= 5));
+    if (!waiting && paths.every((p) => !blocked.has(p))) return index;
+    for (const p of paths) blocked.add(p);
+  }
+  return -1;
+}
 
 var DIAGNOSTICS_CAPABILITY = "device-diagnostics-v1";
 function documentDigest(doc2) {
@@ -11513,7 +11552,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (removed || progress) this.lastQueueProgressAt = Date.now();
   }
   recoveryStatus() {
-    return stallStatus({ pending: this.pendingRows().length, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden && !desktopBackgroundEnabled(import_obsidian.Platform) });
+    const reviewPaths = new Set((this.settings.pathSafety?.items || []).filter((i) => !i.approved).flatMap((i) => operationPaths(i.op)).concat(this.settings.remoteDeleteReview?.approved ? [] : this.settings.remoteDeleteReview?.paths || []));
+    const pending = this.pendingRows().filter((r2) => !reviewPaths.has(r2.path)).length;
+    const result = stallStatus({ pending, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden && !desktopBackgroundEnabled(import_obsidian.Platform) });
+    return reviewPaths.size && !pending && this.client?.ready ? { ...result, reason: "manual-review", blocked: result.blocked + reviewPaths.size } : result;
   }
   performance = new PerformanceCounters();
   settings = { protocol: 3, capability: FILE_REFS_CAPABILITY, url: "ws://127.0.0.1:17241", token: "", state: "", enabled: false };
@@ -12246,13 +12288,13 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         await this.persistConfig();
       }
       while (queue.items.length && this.client === c && c.ready) {
-        const item = queue.items[0];
+        const index = runnablePathOperation(queue.items, bulk), item = queue.items[index < 0 ? 0 : index];
         if (!c.serverCapabilities.includes(PATH_SAFETY_CAPABILITY)) {
           item.error = "\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301\u8DEF\u5F84\u4FDD\u62A4\uFF0C\u672A\u964D\u7EA7\u4E3A\u76F4\u63A5\u5220\u9664";
           await this.persistConfig();
           return;
         }
-        if (!item.approved && (item.review || (item.op.kind === "delete" ? bulk : item.op.entries.length >= 5))) {
+        if (index < 0) {
           item.error = "\u6279\u91CF\u6216\u8303\u56F4\u53D8\u5316\u64CD\u4F5C\u7B49\u5F85\u660E\u786E\u786E\u8BA4";
           await this.persistConfig();
           return;
@@ -12290,7 +12332,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
               } else await c.stageFile(e.to, this.cache.source(current), { base: published });
             }
           }
-          queue.items.shift();
+          queue.items.splice(index, 1);
           for (const e of item.op.entries) {
             this.dirtyFiles.delete(e.from);
             this.fileFailures.delete(e.from);
@@ -12313,7 +12355,19 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.updateProgress();
     }
   }
-  async prepareRemoteDeletes() {
+  async verifiedRemoteMoveCopy(path, local) {
+    const c = this.client;
+    if (!c?.ready || this.settings.remoteDeleteReview?.moveInference !== true) return false;
+    const name = path.slice(path.lastIndexOf("/") + 1), matches = Object.entries(entries(c.doc)).filter(([p, item2]) => p !== path && p.slice(p.lastIndexOf("/") + 1) === name && equal(local, item2));
+    if (matches.length !== 1) return false;
+    const [target, item] = matches[0];
+    if (this.pathBlocked(target) || this.dirtyFiles.has(target) || this.writing.has(target) || c.pending.some((v) => v.path === target)) return false;
+    const f = this.app.vault.getAbstractFileByPath(target);
+    if (!(f instanceof import_obsidian.TFile)) return false;
+    const savedHash = byteDigest(new Uint8Array(await this.app.vault.readBinary(f)));
+    return this.client === c && c.ready && this.app.vault.getAbstractFileByPath(target) === f && !this.dirtyFiles.has(target) && !this.writing.has(target) && !this.pathBlocked(target) && savedHash === referenceDigest(item) && equal(content(c.doc, target), item);
+  }
+  async prepareRemoteDeletes(notify = true) {
     const c = this.client;
     if (!c?.ready) return;
     const paths = [...c.doc.getMap("files")].filter(([p, m]) => (m.deleted || c.doc.getMap("deleted").has(p)) && !this.pathBlocked(p) && this.app.vault.getAbstractFileByPath(p) instanceof import_obsidian.TFile).map(([p]) => p).sort();
@@ -12325,11 +12379,18 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       return;
     }
     const signature = this.reviewDigest(), prior = this.settings.remoteDeleteReview;
-    if (prior?.signature === signature) return;
+    if (prior?.signature === signature) {
+      if (notify && prior.notified === false) {
+        prior.notified = true;
+        await this.persistConfig();
+        new import_obsidian.Notice("\u68C0\u6D4B\u5230" + paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\uFF0C\u5DF2\u4FDD\u7559\u672C\u673A\u6587\u4EF6\uFF1B\u8BF7\u6253\u5F00\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4\u786E\u8BA4\u3002");
+      }
+      return;
+    }
     if (bulkDeletion(paths.length, this.app.vault.getFiles().filter((f) => supportedFile(f.path)).length) || prior) {
-      this.settings.remoteDeleteReview = { signature, paths, approved: false };
+      this.settings.remoteDeleteReview = { signature, paths, approved: false, notified: notify, moveInference: !prior || prior.moveInference === true };
       await this.persistConfig();
-      new import_obsidian.Notice("\u68C0\u6D4B\u5230" + paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\uFF0C\u5DF2\u4FDD\u7559\u672C\u673A\u6587\u4EF6\uFF1B\u8BF7\u6253\u5F00\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4\u786E\u8BA4\u3002");
+      if (notify) new import_obsidian.Notice("\u68C0\u6D4B\u5230" + paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\uFF0C\u5DF2\u4FDD\u7559\u672C\u673A\u6587\u4EF6\uFF1B\u8BF7\u6253\u5F00\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4\u786E\u8BA4\u3002");
     }
   }
   remoteDeleteAllowed(path) {
@@ -12409,7 +12470,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     confirm.open();
   }
   async openPathSafety() {
-    const groups = pathReviewGroups(this.settings.pathSafety?.items || []);
+    const groups = pathReviewGroups(this.settings.pathSafety?.items || [], this.client?.ready ? entries(this.client.doc) : {});
     const m = this.ownPathModal(new import_obsidian.Modal(this.app));
     m.titleEl.setText("\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4");
     m.modalEl.addClass("rl-history-modal");
@@ -12425,10 +12486,10 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       list.createEl("pre", { cls: "rl-review-paths", text: group.lines.join("\n") });
       new import_obsidian.Setting(card).addButton((b) => b.setButtonText("\u5BA1\u6838\u6B64\u7EC4\u4F20\u64AD").onClick(() => {
         m.close();
-        void this.confirmPathReview([group.reviewed], "approve").catch((e) => new import_obsidian.Notice(this.safeError(e)));
+        void this.confirmPathReview(group.reviewedItems || [group.reviewed], "approve").catch((e) => new import_obsidian.Notice(this.safeError(e)));
       })).addButton((b) => b.setButtonText("\u4FDD\u7559\u53CC\u65B9\uFF0C\u53D6\u6D88\u6B64\u7EC4\u4F20\u64AD").onClick(() => {
         m.close();
-        void this.confirmPathReview([group.reviewed], "keep").catch((e) => new import_obsidian.Notice(this.safeError(e)));
+        void this.confirmPathReview(group.reviewedItems || [group.reviewed], "keep").catch((e) => new import_obsidian.Notice(this.safeError(e)));
       }));
     }
     const review = this.settings.remoteDeleteReview;
@@ -12588,7 +12649,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         if (supportedFile(file.path)) this.dirtyFiles.set(file.path, file);
       }
       const plans = moved.filter(({ from: from2 }) => supportedFile(from2)).map(({ file, from: from2 }) => ({ from: from2, to: file.path, base: this.pathBase(from2) })).filter((e) => e.base);
-      if (plans.every((e) => supportedFile(e.to))) this.queuePathSafety("rename", plans);
+      if (plans.every((e) => supportedFile(e.to))) this.queuePathSafety("rename", plans, false, true);
       else {
         this.queuePathSafety("delete", plans.map(({ from: from2, base }) => ({ from: from2, base })), true);
         new import_obsidian.Notice("\u6587\u4EF6\u5DF2\u79FB\u51FA\u540C\u6B65\u8303\u56F4\uFF1B\u8FDC\u7AEF\u5220\u9664\u5DF2\u6682\u505C\uFF0C\u8BF7\u67E5\u770B\u8DEF\u5F84\u4FDD\u62A4\u3002");
@@ -12963,7 +13024,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (!c?.ready || this.stopping) return;
     const files = c.doc.getMap("files");
     await this.checkpointReceives();
-    await this.prepareRemoteDeletes();
+    await this.prepareRemoteDeletes(false);
     const pipeline = c.serverCapabilities?.includes(SMALL_BATCH_CAPABILITY) ? new SmallBlobPipeline(Object.values(entries(c.doc)).filter((r2) => r2.kind !== "text" && r2.size <= 32768), async (refs) => {
       const missing = [];
       for (const r2 of refs) if (!await this.cache.has(r2)) missing.push(r2);
@@ -12980,10 +13041,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           const f = this.app.vault.getAbstractFileByPath(p);
           if (m.deleted || c.doc.getMap("deleted").has(p)) {
             if (f instanceof import_obsidian.TFile) {
-              if (this.settings.recreateIntents?.[p] || this.fileFailures.size || this.downloadPaths.size || !this.remoteDeleteAllowed(p)) continue;
+              if (this.settings.recreateIntents?.[p] || this.fileFailures.size || this.downloadPaths.size) continue;
               const saved = await this.read(f);
+              if (!this.remoteDeleteAllowed(p) && !await this.verifiedRemoteMoveCopy(p, saved)) continue;
               await this.backup(p, saved);
-              if (content(c.doc, p) || this.dirtyFiles.has(p) || !equal(await this.read(f), saved) || !this.remoteDeleteAllowed(p)) continue;
+              if (content(c.doc, p) || this.dirtyFiles.has(p) || !equal(await this.read(f), saved) || !this.remoteDeleteAllowed(p) && !await this.verifiedRemoteMoveCopy(p, saved)) continue;
               this.writing.add(p);
               try {
                 await this.app.vault.trash(f, false);
@@ -13085,6 +13147,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.settings.remoteDeleteReview = void 0;
         await this.persistConfig();
       }
+      await this.prepareRemoteDeletes();
       await this.flushReceipts();
       this.refresh();
       this.updateProgress();

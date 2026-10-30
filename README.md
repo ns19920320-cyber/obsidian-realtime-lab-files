@@ -40,3 +40,7 @@ foreground even when background connection and queue reports are fresh.
 ## Deleted-name recreation (alpha.46)
 
 Newly created files retain the exact observed deletion generation in the durable pending manifest. A matching alpha.46 server is required to publish these recreations. Older servers leave the local file and cached pending version intact. Concurrent recreation or a newer deletion requires review and does not overwrite another device. Legacy files with no creation evidence are retained under consistency protection. Existing history and caches are preserved.
+
+## File moves (alpha.47)
+
+Moves explicitly reported by Obsidian use one protected batch, including large folder moves. Durable backups and exact source-version/target checks remain mandatory. Receiving devices remove the old local path only after a unique matching new copy is present and verified; ambiguous copies remain under review. Separate deletion/creation events are shown as possible moves and grouped by source folder for review. Existing unapproved plans are never automatically approved or cancelled. Waiting for a decision is displayed separately from a stalled transfer.

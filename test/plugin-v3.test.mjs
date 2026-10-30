@@ -198,8 +198,8 @@ test('lost protected operation acknowledgement retries without repeated backups 
  const {p,mem,other}=await env(t);await other.putFile('重试旧.png',bytesSource(new Uint8Array([3,4,5])));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has('重试旧.png'));await mem.v.rename(mem.files.get('重试旧.png'),'重试新.png');await p.queue;const request=p.client.request.bind(p.client);let lost=true;p.client.request=async(type,args)=>{const result=await request(type,args);if(type==='path-operation'&&lost){lost=false;throw new TypeError('Lost acknowledgement');}return result;};await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,1);const count=[...mem.data.keys()].filter(x=>x.startsWith('.realtime-lab-v3-recovery/')).length;await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,0);assert.equal([...mem.data.keys()].filter(x=>x.startsWith('.realtime-lab-v3-recovery/')).length,count);assert.equal((await request('history',{path:'重试新.png'})).length,1);assert.equal(content(other.doc,'重试旧.png'),null);
 });
 
-test('reviewed folder rename syncs its image and Obsidian-updated links together without changing bytes',async t=>{
- const {p,mem,other}=await env(t);const files={'原目录/引用.md':'![[原目录/图.png]]','原目录/一.md':'one','原目录/二.md':'two','原目录/三.md':'three'};for(const [path,text] of Object.entries(files))await other.putFile(path,bytesSource(new TextEncoder().encode(text)));await other.putImage('原目录/图.png',bytesSource(new Uint8Array([7,6,5])));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);const imageHash=content(other.doc,'原目录/图.png').hash;await mem.v.rename({path:'原目录'},'新目录');await mem.v.modify(mem.files.get('新目录/引用.md'),'![[新目录/图.png]]');await p.queue;await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,1);await p.approvePathSafety();await wait(()=>content(other.doc,'新目录/图.png'));assert.equal(content(other.doc,'新目录/图.png').hash,imageHash);assert.equal(mem.data.get('新目录/引用.md'),'![[新目录/图.png]]');assert(Object.keys(files).every(path=>content(other.doc,path)===null));assert.equal(p.settings.pathSafety.items.length,0);
+test('automatic native folder rename syncs its image and Obsidian-updated links together without changing bytes',async t=>{
+ const {p,mem,other}=await env(t);const files={'原目录/引用.md':'![[原目录/图.png]]','原目录/一.md':'one','原目录/二.md':'two','原目录/三.md':'three'};for(const [path,text] of Object.entries(files))await other.putFile(path,bytesSource(new TextEncoder().encode(text)));await other.putImage('原目录/图.png',bytesSource(new Uint8Array([7,6,5])));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);const imageHash=content(other.doc,'原目录/图.png').hash;await mem.v.rename({path:'原目录'},'新目录');await mem.v.modify(mem.files.get('新目录/引用.md'),'![[新目录/图.png]]');await p.queue;await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,0);await wait(()=>content(other.doc,'新目录/图.png'));assert.equal(content(other.doc,'新目录/图.png').hash,imageHash);assert.equal(mem.data.get('新目录/引用.md'),'![[新目录/图.png]]');assert(Object.keys(files).every(path=>content(other.doc,path)===null));assert.equal(p.settings.pathSafety.items.length,0);
 });
 test('remote delete approval expires if server changes before the local deletion is applied',async t=>{
  const {p,mem,other}=await env(t);for(let i=0;i<5;i++)await other.putFile('审阅/'+i+'.md',bytesSource(new TextEncoder().encode('saved '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===5);await other.batchFiles(async()=>{for(let i=0;i<5;i++)remove(other.doc,'审阅/'+i+'.md');});await wait(()=>p.settings.remoteDeleteReview);const review=p.settings.remoteDeleteReview;review.approved=true;await other.putFile('新变化.md',bytesSource(new TextEncoder().encode('different snapshot')));await wait(()=>p.settings.remoteDeleteReview!==review);assert.equal(p.settings.remoteDeleteReview.approved,false);assert([...mem.files.keys()].filter(x=>x.startsWith('审阅/')).length===5);
@@ -617,4 +617,42 @@ test('older server capability leaves recreated body and pending cache intact wit
  const {p,other,mem,server}=await env(t),path='旧服务兼容新建.md';await other.putFile(path,bytesSource(new TextEncoder().encode('old')));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.has(path));remove(other.doc,path);await other.request('barrier');await wait(()=>!mem.files.has(path));
  p.client.serverCapabilities=p.client.serverCapabilities.filter(c=>c!=='deletion-generation-v1');await mem.v.create(path,'new body waiting for upgrade');await p.queue;
  assert.equal(content(server.doc,path),null);assert.equal(mem.data.get(path),'new body waiting for upgrade');assert.equal(p.client.pending.length,1);assert(p.client.pending[0].recreateAfter);assert.equal(new TextDecoder().decode(await p.cache.materialize(p.client.pending[0])),'new body waiting for upgrade');assert.match([...p.fileFailures.values()].join(' '),/upgraded server/);
+});
+
+test('waiting path approvals alone never report a stalled transfer or hide their review status',async t=>{
+ const {p,mem}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);for(let i=0;i<5;i++)await mem.v.create('manual-review/'+i+'.md','synthetic '+i);await p.queue;await p.client.confirmUploads();
+ await wait(()=>[...p.client.doc.getMap('files').keys()].filter(k=>k.startsWith('manual-review/')).length===5);await mem.v.trash({path:'manual-review'});await p.queue;p.lastQueueProgressAt=Date.now()-120000;
+ assert.equal(p.settings.pathSafety.items.flatMap(i=>i.op.entries).length,5);assert.equal(p.recoveryStatus().stalled,false);assert.match(p.summaryStatus(),/删除或重命名等待/);
+ p.dirtyFiles.set('actual-pending.md',new bundle.TFile('actual-pending.md'));assert.equal(p.recoveryStatus().stalled,true,'a separate real transfer still triggers stall detection');
+});
+
+test('native folder move with more than five files completes one guarded operation without manual approval',async t=>{
+ const {p,mem,server}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);for(let i=0;i<6;i++)await mem.v.create('native-folder/'+i+'.md','synthetic '+i);await wait(()=>[...server.doc.getMap('files').keys()].filter(k=>k.startsWith('native-folder/')).length===6);await p.queue;
+ await mem.v.rename({path:'native-folder'},'moved-folder');await p.queue;await p.flushPathSafety();await wait(()=>p.settings.pathSafety.items.length===0);
+ for(let i=0;i<6;i++){assert.equal(content(server.doc,'native-folder/'+i+'.md'),null);assert(content(server.doc,'moved-folder/'+i+'.md'));assert.equal(mem.data.get('moved-folder/'+i+'.md'),'synthetic '+i);}assert([...mem.data.keys()].some(k=>k.startsWith('.realtime-lab-v3-recovery/')));
+});
+
+test('automatic native batch move refuses a concurrently occupied destination and retains the whole group',async t=>{
+ const {p,mem,server,other}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);for(let i=0;i<6;i++)await mem.v.create('guarded-folder/'+i+'.md','original '+i);await wait(()=>[...server.doc.getMap('files').keys()].filter(k=>k.startsWith('guarded-folder/')).length===6);await p.queue;
+ await mem.v.rename({path:'guarded-folder'},'guarded-target');await other.putFile('guarded-target/0.md',bytesSource(new TextEncoder().encode('concurrent other device')));await p.queue;await p.flushPathSafety();assert.equal(p.settings.pathSafety.items.length,1);assert.match(p.settings.pathSafety.items[0].error,/target exists/);
+ for(let i=0;i<6;i++){assert(content(server.doc,'guarded-folder/'+i+'.md'));assert.equal(mem.data.get('guarded-target/'+i+'.md'),'original '+i);}assert.equal(new TextDecoder().decode(server.blobs.read(content(server.doc,'guarded-target/0.md').hash,0)),'concurrent other device');
+});
+
+test('upgrade leaves a previously unapproved native move plan unchanged and awaiting review',async t=>{
+ const {p,mem,server}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);for(let i=0;i<6;i++)await mem.v.create('legacy-move/'+i+'.md','retained '+i);await wait(()=>[...server.doc.getMap('files').keys()].filter(k=>k.startsWith('legacy-move/')).length===6);await p.queue;
+ await mem.v.rename({path:'legacy-move'},'legacy-target');await p.queue;const item=p.settings.pathSafety.items[0];item.approved=false;item.review=true;await p.persistConfig();const original=JSON.stringify(item.op);await p.stop();await p.queue;
+ const next=new bundle.default();next.app=p.app;await next.onload();next.settings=structuredClone(p.saved);t.after(async()=>{await next.stop();await next.queue;});await next.start();await wait(()=>next.syncedOnce&&!next.initializing);await next.queue;
+ assert.equal(next.settings.pathSafety.items.length,1);assert.equal(JSON.stringify(next.settings.pathSafety.items[0].op),original);assert.equal(next.settings.pathSafety.items[0].approved,false);for(let i=0;i<6;i++)assert(content(server.doc,'legacy-move/'+i+'.md'));
+});
+
+test('receiving a folder move verifies new local copies before removing old paths without a bulk prompt remaining',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<6;i++)await other.putFile('remote-old/'+i+'.md',bytesSource(new TextEncoder().encode('body '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===6);
+ const entries=Array.from({length:6},(_,i)=>({from:'remote-old/'+i+'.md',to:'remote-new/'+i+'.md',base:content(other.doc,'remote-old/'+i+'.md')}));await other.request('path-operation',{op:{id:crypto.randomUUID(),kind:'rename',entries}});
+ await wait(()=>entries.every(e=>!mem.files.has(e.from)&&mem.files.has(e.to)));await p.queue;assert.equal(p.settings.remoteDeleteReview,undefined);for(let i=0;i<6;i++)assert.equal(mem.data.get('remote-new/'+i+'.md'),'body '+i);assert([...mem.data.keys()].filter(k=>k.startsWith('.realtime-lab-v3-recovery/')).length>=6);
+});
+
+test('ambiguous remote copies retain all old files and a grouped deletion review',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<6;i++)await other.putFile('ambiguous-old/'+i+'.md',bytesSource(new TextEncoder().encode('copy '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===6);
+ for(const folder of ['ambiguous-new','ambiguous-other'])for(let i=0;i<6;i++)await other.putFile(folder+'/'+i+'.md',bytesSource(new TextEncoder().encode('copy '+i)));await wait(()=>mem.files.size===18);await other.batchFiles(async()=>{for(let i=0;i<6;i++)remove(other.doc,'ambiguous-old/'+i+'.md');});await wait(()=>p.settings.remoteDeleteReview?.paths.length===6);await p.queue;
+ for(let i=0;i<6;i++)assert.equal(mem.data.get('ambiguous-old/'+i+'.md'),'copy '+i);assert.equal(p.settings.remoteDeleteReview.approved,false);
 });

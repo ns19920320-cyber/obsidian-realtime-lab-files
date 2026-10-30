@@ -44,3 +44,11 @@ Newly created files retain the exact observed deletion generation in the durable
 ## File moves (alpha.47)
 
 Moves explicitly reported by Obsidian use one protected batch, including large folder moves. Durable backups and exact source-version/target checks remain mandatory. Receiving devices remove the old local path only after a unique matching new copy is present and verified; ambiguous copies remain under review. Separate deletion/creation events are shown as possible moves and grouped by source folder for review. Existing unapproved plans are never automatically approved or cancelled. Waiting for a decision is displayed separately from a stalled transfer.
+
+## Capacity planning
+
+Alpha.48 servers default to 1 GiB of active logical content and 2 GiB of retained blob storage. Client private caches default to 2 GiB. Metadata is bounded at 8 MiB; streaming, per-file, path-count and object-count limits remain enforced. Budgets do not reserve memory or preallocate disk. No history or cached payload is automatically removed to meet a limit.
+
+The sync details and supported remote diagnostics show separate content, retained storage, metadata, path and object usage; client cache use is included once measured. At 80% a warning is shown, and a full budget stops the affected publication while retaining its immutable queued version. A server may override the defaults with a validated `capacity.json` beside its token (fields `liveBytes` and `diskBytes`); restart it after backing up. Boundaries are 1 MiB–4 GiB active and active-budget–8 GiB storage. Physical free disk must also be available.
+
+Recognized capacity retries resume after sufficient space or budget is available. Unknown, authentication and identity errors remain blocked; existing unapproved path plans are never approved, cancelled or bypassed by capacity recovery. Legacy clients may continue within their existing receive window; above it the server asks for an upgrade before sending an oversized snapshot. Upgrading a client alone does not change an older server's active-content budget.

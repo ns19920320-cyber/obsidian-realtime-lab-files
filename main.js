@@ -12347,7 +12347,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   async verifiedRemoteMoveCopy(path, local) {
     const c = this.client;
-    if (!c?.ready) return false;
+    if (!c?.ready || this.settings.remoteDeleteReview?.moveInference !== true) return false;
     const name = path.slice(path.lastIndexOf("/") + 1), matches = Object.entries(entries(c.doc)).filter(([p, item2]) => p !== path && p.slice(p.lastIndexOf("/") + 1) === name && equal(local, item2));
     if (matches.length !== 1) return false;
     const [target, item] = matches[0];
@@ -12378,7 +12378,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       return;
     }
     if (bulkDeletion(paths.length, this.app.vault.getFiles().filter((f) => supportedFile(f.path)).length) || prior) {
-      this.settings.remoteDeleteReview = { signature, paths, approved: false, notified: notify };
+      this.settings.remoteDeleteReview = { signature, paths, approved: false, notified: notify, moveInference: !prior || prior.moveInference === true };
       await this.persistConfig();
       if (notify) new import_obsidian.Notice("\u68C0\u6D4B\u5230" + paths.length + "\u4E2A\u8FDC\u7AEF\u5220\u9664\uFF0C\u5DF2\u4FDD\u7559\u672C\u673A\u6587\u4EF6\uFF1B\u8BF7\u6253\u5F00\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4\u786E\u8BA4\u3002");
     }

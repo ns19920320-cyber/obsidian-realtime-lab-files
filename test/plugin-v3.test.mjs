@@ -656,3 +656,10 @@ test('ambiguous remote copies retain all old files and a grouped deletion review
  for(const folder of ['ambiguous-new','ambiguous-other'])for(let i=0;i<6;i++)await other.putFile(folder+'/'+i+'.md',bytesSource(new TextEncoder().encode('copy '+i)));await wait(()=>mem.files.size===18);await other.batchFiles(async()=>{for(let i=0;i<6;i++)remove(other.doc,'ambiguous-old/'+i+'.md');});await wait(()=>p.settings.remoteDeleteReview?.paths.length===6);await p.queue;
  for(let i=0;i<6;i++)assert.equal(mem.data.get('ambiguous-old/'+i+'.md'),'copy '+i);assert.equal(p.settings.remoteDeleteReview.approved,false);
 });
+
+test('legacy remote deletion review is not automatically applied even when new copies match',async t=>{
+ const {p,mem,other}=await env(t);for(let i=0;i<6;i++)await other.putFile('legacy-remote/'+i+'.md',bytesSource(new TextEncoder().encode('old review '+i)));await p.start();await wait(()=>p.syncedOnce&&!p.initializing&&mem.files.size===6);await p.queue;
+ const request=p.reflection.request;p.reflection.request=()=>{};const moved=Array.from({length:6},(_,i)=>({from:'legacy-remote/'+i+'.md',to:'legacy-copy/'+i+'.md',base:content(other.doc,'legacy-remote/'+i+'.md')}));await other.request('path-operation',{op:{id:crypto.randomUUID(),kind:'rename',entries:moved}});await wait(()=>!content(p.client.doc,moved[0].from));
+ p.settings.remoteDeleteReview={signature:p.reviewDigest(),paths:moved.map(e=>e.from),approved:false};await p.persistConfig();p.reflection.request=request;await p.reflect();await p.queue;
+ assert.equal(p.settings.remoteDeleteReview.approved,false);assert.equal(p.settings.remoteDeleteReview.moveInference,undefined);for(let i=0;i<6;i++){assert.equal(mem.data.get('legacy-remote/'+i+'.md'),'old review '+i);assert.equal(mem.data.get('legacy-copy/'+i+'.md'),'old review '+i);}
+});

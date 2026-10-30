@@ -11545,7 +11545,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   recoveryStatus() {
     const reviewPaths = new Set((this.settings.pathSafety?.items || []).filter((i) => !i.approved).flatMap((i) => operationPaths(i.op)).concat(this.settings.remoteDeleteReview?.approved ? [] : this.settings.remoteDeleteReview?.paths || []));
     const pending = this.pendingRows().filter((r2) => !reviewPaths.has(r2.path)).length;
-    return stallStatus({ pending, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden && !desktopBackgroundEnabled(import_obsidian.Platform) });
+    const result = stallStatus({ pending, lastProgressAt: this.lastQueueProgressAt, active: [...this.activePhases.values()], retry: this.ledger()?.summary(), ready: !!this.client?.ready, hidden: document.hidden && !desktopBackgroundEnabled(import_obsidian.Platform) });
+    return reviewPaths.size && !pending && this.client?.ready ? { ...result, reason: "manual-review", blocked: result.blocked + reviewPaths.size } : result;
   }
   performance = new PerformanceCounters();
   settings = { protocol: 3, capability: FILE_REFS_CAPABILITY, url: "ws://127.0.0.1:17241", token: "", state: "", enabled: false };

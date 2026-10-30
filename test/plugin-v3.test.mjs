@@ -622,7 +622,7 @@ test('older server capability leaves recreated body and pending cache intact wit
 test('waiting path approvals alone never report a stalled transfer or hide their review status',async t=>{
  const {p,mem}=await env(t);await p.start();await wait(()=>p.syncedOnce&&!p.initializing);for(let i=0;i<5;i++)await mem.v.create('manual-review/'+i+'.md','synthetic '+i);await p.queue;await p.client.confirmUploads();
  await wait(()=>[...p.client.doc.getMap('files').keys()].filter(k=>k.startsWith('manual-review/')).length===5);await mem.v.trash({path:'manual-review'});await p.queue;p.lastQueueProgressAt=Date.now()-120000;
- assert.equal(p.settings.pathSafety.items.flatMap(i=>i.op.entries).length,5);assert.equal(p.recoveryStatus().stalled,false);assert.match(p.summaryStatus(),/删除或重命名等待/);
+ assert.equal(p.settings.pathSafety.items.flatMap(i=>i.op.entries).length,5);assert.equal(p.recoveryStatus().stalled,false);assert.equal(p.recoveryStatus().reason,'manual-review');assert.equal(p.recoveryStatus().blocked,5);assert.match(p.summaryStatus(),/删除或重命名等待/);
  p.dirtyFiles.set('actual-pending.md',new bundle.TFile('actual-pending.md'));assert.equal(p.recoveryStatus().stalled,true,'a separate real transfer still triggers stall detection');
 });
 

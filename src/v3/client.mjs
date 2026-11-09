@@ -23,10 +23,11 @@ export class VaultClientV3 extends VaultClient{
  }
  // iOS can retain an OPEN WebSocket after its network connection is gone.
  // Keep the Y.Doc, verified identity and pending blobs; replace only transport.
+ onHandshakePhase(phase){this.connectionPhase=phase;this.connectionProgressAt=Date.now();if(phase==='metadata')this.onStatus('正在接收同步元数据；慢网请稍候（最长等待3分钟）');else if(phase==='prepare')this.onStatus('元数据已接收，正在校验并准备补传');}
  connect(){
   const previous=this.ws;super.connect();
   if(!this.ws||this.ws===previous)return;
-  this.connectionStartedAt=Date.now();this.connectionProgressAt=this.connectionStartedAt;this.terminalCloseCode=undefined;
+  this.connectionPhase='connecting';this.connectionStartedAt=Date.now();this.connectionProgressAt=this.connectionStartedAt;this.terminalCloseCode=undefined;
   const ws=this.ws,closed=ws.onclose;ws.onclose=e=>{if(this.ws===ws&&[4400,4401,4403].includes(e.code))this.terminalCloseCode=e.code;closed?.(e);};
  }
  resume(){
@@ -57,7 +58,7 @@ export class VaultClientV3 extends VaultClient{
   // or CLOSING socket even when ready is already false. Successful cached
   // preparation renews inactivity: a large, productive queue is not a dead handshake.
   // Keep durable state intact.
-  if(!this.ready){if(!this.ws||Date.now()-Math.max(this.connectionStartedAt||0,this.connectionProgressAt||0)>=30000)this.resume();return false;}
+  if(!this.ready){const timeout=this.ws?.readyState===1&&this.connectionPhase==='metadata'?180000:30000;if(!this.ws||Date.now()-Math.max(this.connectionStartedAt||0,this.connectionProgressAt||0)>=timeout)this.resume();return false;}
   if(this.healthCheck)return this.healthCheck;
   const ws=this.ws;
   // Liveness must not wait behind a native snapshot write in confirmUploads.

@@ -9552,7 +9552,7 @@ function pathReviewGroups(items = [], destinations = {}) {
   return groups.map(({ paths, label, ...g }) => g);
 }
 function syncSections(options = {}) {
-  const { ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0, queueState = null } = options;
+  const { connectionPhase, ready = false, connecting = false, error = "", progress, pendingVersions = 0, audit, conflicts = 0, operations = 0, remoteDeletes = 0, holds = 0, queueState = null } = options;
   let transfer = progress?.available ? (ready ? "" : "\u79BB\u7EBF\u53C2\u8003 \xB7 ") + "\u5DF2\u5B8C\u6210 " + progress.completed + "/" + progress.total + " \xB7 \u5269\u4F59 " + progress.remaining + " \xB7 \u91CD\u8BD5 " + progress.retry + " \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions : "\u91CD\u8FDE\u540E\u6838\u5BF9\u8FDB\u5EA6 \xB7 \u5F85\u4F20\u7248\u672C " + pendingVersions;
   if (queueState) {
     const q = queueState.counts;
@@ -9562,7 +9562,7 @@ function syncSections(options = {}) {
   if (audit) {
     auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
   }
-  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
+  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? connectionPhase === "metadata" ? "\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E \xB7 \u6162\u7F51\u6700\u957F\u7B49\u5F853\u5206\u949F" : connectionPhase === "prepare" ? "\u5143\u6570\u636E\u5DF2\u63A5\u6536 \xB7 \u6B63\u5728\u6821\u9A8C\u5E76\u51C6\u5907\u8865\u4F20" : "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
 }
 
 var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
@@ -10792,7 +10792,7 @@ function documentDigest(doc2) {
   return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
 }
 
-function badgeState({ ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0, stalled = false, stallReason = "", queueState = null }) {
+function badgeState({ connectionPhase, ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0, stalled = false, stallReason = "", queueState = null }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
     tone = "error";
@@ -10867,6 +10867,11 @@ function badgeState({ ready = false, preparing = false, receiving = false, conne
         display = "Sync: " + (q.review ? "\u5F85\u786E\u8BA4" + q.review : "") + (q.review && q.held ? " \xB7 " : "") + (q.held ? "\u6682\u7F13" + q.held : "");
       }
     }
+  }
+  if (!ready && reconnecting && ["metadata", "prepare"].includes(connectionPhase)) {
+    label = connectionPhase === "metadata" ? "\u63A5\u6536\u5143\u6570\u636E" : "\u51C6\u5907\u8865\u4F20";
+    display = "Sync: \u21BB " + label;
+    counts += " \xB7 " + (connectionPhase === "metadata" ? "\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E\uFF0C\u6700\u957F\u7B49\u5F853\u5206\u949F" : "\u5143\u6570\u636E\u5DF2\u63A5\u6536\uFF0C\u6B63\u5728\u6821\u9A8C");
   }
   return { tone, icon, label, display, busy, counts, description: (progress?.available ? counts + "\uFF1B\u5F53\u524D\u63A5\u6536\u5E76\u53D1" + progress.active + "\uFF1B\u5F85\u91CD\u8BD5\u4EC5\u7EDF\u8BA1\u6587\u4EF6\u5931\u8D25\uFF0C\u4E0D\u5305\u542B\u8FDE\u63A5\u9519\u8BEF\u6216\u51B2\u7A81\uFF1B" : "\u8FDB\u5EA6\u5C1A\u672A\u6838\u5BF9\uFF1B") + label + "\uFF1B\u5F85\u5904\u7406\u51B2\u7A81" + conflicts + "\uFF1B\u5E93\u5185" + known + "\u4E2A\u8DEF\u5F84\uFF1B\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4" + (unknown ? "\u6570\u91CF\u5F85\u6838\u5BF9" : uploads) + "\uFF1B\u5F53\u524D\u63A5\u6536" + downloads + "\u3002\u70B9\u51FB\u67E5\u770B\u540C\u6B65\u8BE6\u60C5\u3002\u670D\u52A1\u5668\u786E\u8BA4\u4E0D\u7B49\u4E8E\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" };
 }
@@ -10962,7 +10967,10 @@ var VaultClient = class {
     this.onStatus("\u8FDE\u63A5\u4E2D");
     const ws = new this.WS(this.url);
     this.ws = ws;
-    ws.onopen = () => this.send({ type: "hello", room: this.room, capabilities: [...this.capabilities, ...this.optionalCapabilities], token: this.token, mode: this.mode });
+    ws.onopen = () => {
+      this.onHandshakePhase?.("metadata");
+      this.send({ type: "hello", room: this.room, capabilities: [...this.capabilities, ...this.optionalCapabilities], token: this.token, mode: this.mode });
+    };
     let inbox = Promise.resolve(), inboxBytes = 0;
     ws.onmessage = (e) => {
       if (this.transportBlocked || this.stopped) return;
@@ -11001,6 +11009,7 @@ var VaultClient = class {
               ws.close(4402, "Missing server identity");
               return;
             }
+            this.onHandshakePhase?.("prepare");
             this.serverId = m.serverId;
             this.mode = "join";
             try {
@@ -11032,6 +11041,7 @@ var VaultClient = class {
             }
             if (this.stopped || this.ws !== ws || ws.readyState !== 1) return;
             this.ready = true;
+            this.onHandshakePhase?.("ready");
             this.retry = 0;
             if (!this.send({ type: "update", update: encode(encodeStateAsUpdate(this.doc, decode(m.vector))) })) return;
             this.onReady();
@@ -11360,10 +11370,17 @@ var VaultClientV3 = class extends VaultClient {
   }
   // iOS can retain an OPEN WebSocket after its network connection is gone.
   // Keep the Y.Doc, verified identity and pending blobs; replace only transport.
+  onHandshakePhase(phase) {
+    this.connectionPhase = phase;
+    this.connectionProgressAt = Date.now();
+    if (phase === "metadata") this.onStatus("\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E\uFF1B\u6162\u7F51\u8BF7\u7A0D\u5019\uFF08\u6700\u957F\u7B49\u5F853\u5206\u949F\uFF09");
+    else if (phase === "prepare") this.onStatus("\u5143\u6570\u636E\u5DF2\u63A5\u6536\uFF0C\u6B63\u5728\u6821\u9A8C\u5E76\u51C6\u5907\u8865\u4F20");
+  }
   connect() {
     const previous = this.ws;
     super.connect();
     if (!this.ws || this.ws === previous) return;
+    this.connectionPhase = "connecting";
     this.connectionStartedAt = Date.now();
     this.connectionProgressAt = this.connectionStartedAt;
     this.terminalCloseCode = void 0;
@@ -11445,7 +11462,8 @@ var VaultClientV3 = class extends VaultClient {
   async checkConnection() {
     if (this.stopped || this.transportBlocked || this.terminalCloseCode) return false;
     if (!this.ready) {
-      if (!this.ws || Date.now() - Math.max(this.connectionStartedAt || 0, this.connectionProgressAt || 0) >= 3e4) this.resume();
+      const timeout = this.ws?.readyState === 1 && this.connectionPhase === "metadata" ? 18e4 : 3e4;
+      if (!this.ws || Date.now() - Math.max(this.connectionStartedAt || 0, this.connectionProgressAt || 0) >= timeout) this.resume();
       return false;
     }
     if (this.healthCheck) return this.healthCheck;
@@ -11802,6 +11820,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   }
   summaryStatus() {
     const c = this.client;
+    if (!c?.ready && c?.ws?.readyState === 1 && ["metadata", "prepare"].includes(c.connectionPhase)) return this.connectionStatus + "\uFF1B\u5F85\u4F20\u7248\u672C\u4FDD\u7559 " + c.pending.length;
     if (this.pendingRows().length && this.recoveryStatus().stalled) return "\u540C\u6B65\u6682\u672A\u63A8\u8FDB\uFF1A" + stallText(this.recoveryStatus());
     if (!c?.ready) return this.connectionStatus + "\uFF1B\u5F85\u4F20\u6587\u4EF6\u7248\u672C" + (c?.pending.length ?? this.settings.pending?.items?.length ?? 0) + "\uFF1B\u51B2\u7A81" + this.conflicts.length;
     if (this.queueView().counts.review || this.queueView().counts.held) return queueStateText(this.queueView());
@@ -11832,7 +11851,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client, rows = this.pendingRows(), progress = this.progressModel();
     e.createEl("p", { text: queueStateText(this.queueView()) });
     const audit = c ? diagnosticDetails(this).audit : void 0;
-    const sections = syncSections({ ready: !!c?.ready, connecting: !!c && !c.stopped && !c.ready, error: this.operationError || c?.lastError || this.conflictError, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, audit, conflicts: this.conflicts.length, operations: this.settings.pathSafety?.items.length || 0, remoteDeletes: this.settings.remoteDeleteReview?.paths.length || 0, holds: this.settings.consistencyHolds?.length || 0 });
+    const sections = syncSections({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, ready: !!c?.ready, connecting: !!c && !c.stopped && !c.ready, error: this.operationError || c?.lastError || this.conflictError, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, audit, conflicts: this.conflicts.length, operations: this.settings.pathSafety?.items.length || 0, remoteDeletes: this.settings.remoteDeleteReview?.paths.length || 0, holds: this.settings.consistencyHolds?.length || 0 });
     const overview = e.createDiv({ cls: "rl-sync-overview" });
     for (const section of sections) {
       const card = overview.createDiv({ cls: "rl-sync-section" });
@@ -12222,7 +12241,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
     const recovery = this.recoveryStatus();
-    return badgeState({ stalled: recovery.stalled, stallReason: recovery.reason, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.activeFailures().size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.activeFailures().values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.activeFailures().size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, stalled: recovery.stalled, stallReason: recovery.reason, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.activeFailures().size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.activeFailures().values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.activeFailures().size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));

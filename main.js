@@ -9436,9 +9436,9 @@ function errorCode(error) {
   if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
   if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
   if (/identity mismatch|身份/i.test(s)) return "identity";
-  if (/Large PDF requires alpha.51 server|per-type size limit|文件超过当前类型上限|quota|capacity|容量|Active logical content exceeds|metadata\/text state exceeds|path limit|Protected queue identity or capacity/i.test(s)) return "quota";
+  if (/per-type size limit|文件超过当前类型上限|quota|capacity|容量|Active logical content exceeds|metadata\/text state exceeds|path limit|Protected queue identity or capacity/i.test(s)) return "quota";
   if (/snapshot|persist|本地保存|快照/i.test(s)) return "persistence";
-  if (/invalid|无效|校验/i.test(s)) return "invalid-data";
+  if (/Large PDF requires alpha.51 server|invalid|无效|校验/i.test(s)) return "invalid-data";
   if (/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
   if (/File system operation timed out|\b(?:EBUSY|EAGAIN|EMFILE|ENFILE)\b/i.test(s)) return "filesystem-transient";
   if (/network|fetch|load failed|disconnected|not connected|timeout|timed out|Audit interrupted|网络|ECONN|ETIMEDOUT|Foreground reconnect/i.test(s)) return "network-transient";

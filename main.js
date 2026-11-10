@@ -34,13 +34,15 @@ __export(plugin_exports, {
 module.exports = __toCommonJS(plugin_exports);
 
 var QUEUE_STATE_CAPABILITY = "queue-state-v1";
-function queueProtection(settings = {}) {
+var needsPathReview = (error) => /^(?:Error: )?(?:Deletion generation changed; preserve local file and review|Source changed; protected operation requires review|路径计划已变化，请重新审核|path-review)$/.test(String(error?.message || error || ""));
+function queueProtection(settings = {}, failures = []) {
   const review = /* @__PURE__ */ new Set(), held = new Set(settings.consistencyHolds || []);
-  for (const item of settings.pathSafety?.items || []) if (!item.approved) for (const e of item.op.entries) {
+  for (const item of settings.pathSafety?.items || []) if (!item.approved || needsPathReview(item.error)) for (const e of item.op.entries) {
     review.add(e.from);
     if (e.to) review.add(e.to);
   }
   if (!settings.remoteDeleteReview?.approved) for (const p of settings.remoteDeleteReview?.paths || []) review.add(p);
+  for (const [p, error] of failures) if (needsPathReview(error)) review.add(p);
   return { review, held };
 }
 function protectionKind(path, protection) {
@@ -50,8 +52,8 @@ function deferredRetryKey(key, protection) {
   const m = /^(?:upload|download):(.+)$/.exec(key);
   return !!m && !!protectionKind(m[1], protection);
 }
-function classifyQueues(rows = [], settings = {}, versions = []) {
-  const protection = queueProtection(settings), map2 = new Map(rows.map((r2) => [r2.path, { ...r2 }]));
+function classifyQueues(rows = [], settings = {}, versions = [], protection = queueProtection(settings, rows.map((r2) => [r2.path, r2.error]))) {
+  const map2 = new Map(rows.map((r2) => [r2.path, { ...r2 }]));
   for (const i of settings.pathSafety?.items || []) for (const e of i.op.entries) for (const p of e.to ? [e.from, e.to] : [e.from]) {
     if (!map2.has(p)) map2.set(p, { path: p, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD" : "\u5F85\u786E\u8BA4" });
     if (i.approved && i.error) map2.set(p, { ...map2.get(p), state: "\u5DF2\u6279\u51C6\u64CD\u4F5C\u5931\u8D25\uFF0C\u9700\u590D\u6838", error: i.error });
@@ -62,8 +64,9 @@ function classifyQueues(rows = [], settings = {}, versions = []) {
     row.category = protectionKind(row.path, protection) || (row.error ? "failed" : "active");
     counts[row.category]++;
     if (row.category === "review" || row.category === "held") {
+      const reviewError = row.error;
       delete row.error;
-      row.state = row.category === "review" ? "\u5F85\u786E\u8BA4\uFF1A\u5220\u9664\u6216\u91CD\u547D\u540D\u64CD\u4F5C\uFF0C\u672A\u81EA\u52A8\u4F20\u64AD" : "\u4FDD\u62A4\u6682\u7F13\uFF1A\u4FDD\u7559\u6B63\u6587\u3001\u7F13\u5B58\u53CA\u5F85\u4F20\u7248\u672C";
+      row.state = row.category === "review" ? needsPathReview(reviewError) ? "\u5F85\u590D\u6838\uFF1A\u5220\u9664\u4EE3\u6B21\u6216\u6E90\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u4FDD\u7559\u672C\u673A\u6B63\u6587\u53CA\u5F85\u4F20\u7248\u672C\uFF0C\u8BF7\u6253\u5F00\u9010\u6587\u4EF6\u6838\u9A8C" : "\u5F85\u786E\u8BA4\uFF1A\u5220\u9664\u6216\u91CD\u547D\u540D\u64CD\u4F5C\uFF0C\u672A\u81EA\u52A8\u4F20\u64AD" : "\u4FDD\u62A4\u6682\u7F13\uFF1A\u4FDD\u7559\u6B63\u6587\u3001\u7F13\u5B58\u53CA\u5F85\u4F20\u7248\u672C";
     }
   }
   for (const v of versions) versionCounts[map2.get(v.path)?.category || protectionKind(v.path, protection) || "active"]++;
@@ -9223,7 +9226,8 @@ var MAX_INLINE_NOTE = 16 * 1024;
 var MAX_INLINE_TOTAL = 128 * 1024;
 var MAX_BINARY = 5 * 1024 * 1024;
 var MAX_FILE_TEXT = 16 * 1024 * 1024;
-var MAX_BLOB_BYTES = MAX_FILE_TEXT;
+var MAX_PDF = 64 * 1024 * 1024;
+var MAX_BLOB_BYTES = MAX_PDF;
 var MAX_LIVE_BYTES = 256 * 1024 * 1024;
 var MAX_STATE = 8 * 1024 * 1024;
 var FILE_REFS_CAPABILITY = "versioned-files-v1";
@@ -9235,6 +9239,8 @@ var MAX_METADATA_WIRE = 16 * 1024 * 1024;
 var MAX_METADATA_INBOX = 32 * 1024 * 1024;
 var LEGACY_METADATA_INBOX = 8 * 1024 * 1024;
 
+var LARGE_PDF_CAPABILITY = "large-pdf-64m-v1";
+var largePdf = (p, size2) => /\.pdf$/i.test(p) && size2 > MAX_BINARY;
 var GENERAL_FILES_CAPABILITY = "general-files-v1";
 var GENERAL = /\.(json|csv|jsonl|html?|py|txt|sha256|log|zip|bak|docx)$/i;
 var DATED_BACKUP = /\.md\.bak\.\d{8}-\d{6}$/i;
@@ -9243,7 +9249,7 @@ function supportedFile(p) {
   return !["realtime-lab-v3-files.json", "realtime-lab-v2.json"].includes(p) && (supported(p) || typeof p === "string" && p.length <= 512 && (/\.pdf$/i.test(p) || GENERAL.test(p) || DATED_BACKUP.test(p)) && supported(p.replace(/\.[^./]+$/, ".png")));
 }
 var fileKind = (p) => imagePath(p) ? "image" : "file";
-var maxFileSize = (p) => /\.md$/i.test(p) ? MAX_FILE_TEXT : imagePath(p) || /\.pdf$/i.test(p) ? MAX_BINARY : MAX_FILE_TEXT;
+var maxFileSize = (p) => /\.md$/i.test(p) ? MAX_FILE_TEXT : imagePath(p) ? MAX_BINARY : /\.pdf$/i.test(p) ? MAX_PDF : MAX_FILE_TEXT;
 var textPreviewPath = (p) => /\.(md|json|csv|jsonl|html?|py|txt|sha256|log|bak)$/i.test(p) || DATED_BACKUP.test(p);
 function decodeTextPreview(bytes) {
   try {
@@ -9423,13 +9429,14 @@ function errorCode(error) {
   const s = String(error?.message || error || "");
   if (!s) return null;
   if (REASON_CODES.includes(s)) return s;
+  if (/Deletion generation changed; preserve local file and review|Source changed; protected operation requires review|路径计划已变化，请重新审核/.test(s)) return "path-review";
   if (/Blob request failed \((?:409|429)\)/i.test(s)) return "transferring";
   if (/request failed \((?:408|5\d\d)\)/i.test(s)) return "network-transient";
   if (/^(?:Error: )?(?:Transfer busy|Binary operation busy)$/.test(s)) return "transferring";
   if (/^(?:Error: )?Cache staging busy$/.test(s)) return "cache-staging-busy";
   if (/401|403|Unauthorized|认证/i.test(s)) return "authentication";
   if (/identity mismatch|身份/i.test(s)) return "identity";
-  if (/quota|capacity|容量|Active logical content exceeds|metadata\/text state exceeds|path limit|Protected queue identity or capacity/i.test(s)) return "quota";
+  if (/Large PDF requires alpha.51 server|per-type size limit|文件超过当前类型上限|quota|capacity|容量|Active logical content exceeds|metadata\/text state exceeds|path limit|Protected queue identity or capacity/i.test(s)) return "quota";
   if (/snapshot|persist|本地保存|快照/i.test(s)) return "persistence";
   if (/invalid|无效|校验/i.test(s)) return "invalid-data";
   if (/Connect verified V3 metadata|Connect before resuming cached uploads|METADATA_NOT_READY/.test(s)) return "metadata-not-ready";
@@ -9454,7 +9461,7 @@ function diagnosticDetails(p) {
     const code = errorCode(e);
     if (code) reasons.add(code);
   }
-  const flags = { "initializing": p.initializing || !p.syncedOnce, "receiving": p.reflection.queued || p.downloadPaths.size, "uploading": p.fileUploads.queued, "local-operation": p.localOperations || p.writing.size, "transferring": c?.binaryBusy, "saving": p.receiveAcks.size || p.receiptFlush || c?.persistence.dirty || c?.persistence.inFlight, "recovering": p.recoveryBusy, "stopping": p.stopping, "conflict-check": p.conflictError, "conflict": p.conflicts.length, "path-review": p.settings.pathSafety?.items.length || p.settings.remoteDeleteReview?.paths.length, "consistency-hold": p.settings.consistencyHolds?.length, "consistency-difference": p.consistencyIssues() };
+  const flags = { "initializing": p.initializing || !p.syncedOnce, "receiving": p.reflection.queued || p.downloadPaths.size, "uploading": p.fileUploads.queued, "local-operation": p.localOperations || p.writing.size, "transferring": c?.binaryBusy, "saving": p.receiveAcks.size || p.receiptFlush || c?.persistence.dirty || c?.persistence.inFlight, "recovering": p.recoveryBusy, "stopping": p.stopping, "conflict-check": p.conflictError, "conflict": p.conflicts.length, "path-review": p.queueView?.().counts.review || p.settings.pathSafety?.items.length || p.settings.remoteDeleteReview?.paths.length, "consistency-hold": p.settings.consistencyHolds?.length, "consistency-difference": p.consistencyIssues() };
   for (const [k, on] of Object.entries(flags)) if (on) reasons.add(k);
   const r2 = p.consistencyReport, counts = Object.fromEntries(auditCounts.map((k) => [k, k === "refused" ? r2?.refused?.length || 0 : r2?.counts?.[k] ?? r2?.[k] ?? 0]));
   return validateDiagnosticDetails({ reasons: [...reasons], audit: { enabled: !!p.settings.autoConsistency, phase: p.consistencyBusy ? "running" : p.consistencyPhase || "never", reason: p.consistencyReason || "none", checkedAt: r2?.checkedAt ?? null, stable: !!r2?.stable, current: !p.consistencyBusy && p.consistencyPhase === "complete" && !!r2?.stable && r2.serverId === c?.serverId && p.consistencyDigest === p.currentDigest() && p.consistencyAuditEpoch === p.consistencyEpoch, limited: !!r2?.limited, counts } });
@@ -9462,7 +9469,7 @@ function diagnosticDetails(p) {
 function diagnosticDetailsText(d) {
   if (!d) return "\u8BE6\u7EC6\u8BCA\u65AD\uFF1A\u8BBE\u5907\u6216\u670D\u52A1\u5668\u5C1A\u4E0D\u652F\u6301";
   const a = d.audit;
-  return "\u5F02\u5E38/\u5FD9\u788C\u539F\u56E0\uFF1A" + (d.reasons.map((r2) => ({ "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "metadata-not-ready": "\u5143\u6570\u636E\u672A\u5C31\u7EEA", "authentication": "\u9274\u6743\u5931\u8D25", "identity": "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", "quota": "\u5BB9\u91CF\u9650\u5236", "persistence": "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "invalid-data": "\u6570\u636E\u6821\u9A8C\u5F02\u5E38", "unknown-error": "\u672A\u5206\u7C7B\u9519\u8BEF\uFF08\u9700\u672C\u673A\u8BE6\u60C5\uFF09", "initializing": "\u521D\u59CB\u5316\u4E2D", "receiving": "\u63A5\u6536\u4E2D", "uploading": "\u4E0A\u4F20\u4E2D", "local-operation": "\u672C\u5730\u5904\u7406", "transferring": "\u4F20\u8F93\u4E2D", "saving": "\u4FDD\u5B58\u4E2D", "recovering": "\u91CD\u8BD5\u6062\u590D\u4E2D", "stopping": "\u6B63\u5728\u65AD\u5F00", "conflict-check": "\u51B2\u7A81\u68C0\u67E5\u672A\u786E\u8BA4", "conflict": "\u6709\u51B2\u7A81", "path-review": "\u5220\u9664\u6216\u91CD\u547D\u540D\u5F85\u786E\u8BA4", "consistency-hold": "\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D", "consistency-difference": "\u4E00\u81F4\u6027\u6709\u5DEE\u5F02" })[r2] || r2).join("\u3001") || "\u65E0") + "\uFF1B\u81EA\u52A8\u6838\u5BF9\uFF1A" + (a.enabled ? "\u5F00\u542F" : "\u5173\u95ED") + "\uFF1B\u9636\u6BB5\uFF1A" + a.phase + "\uFF1B\u6838\u5BF9\u65F6\u95F4\uFF1A" + (a.checkedAt ? new Date(a.checkedAt).toISOString() : "\u5C1A\u672A\u6838\u5BF9") + "\uFF1B\u7ED3\u679C\u4ECD\u9002\u7528\uFF1A" + a.current + "\uFF1B\u7ED3\u679C\uFF1A" + JSON.stringify(a.counts) + "\uFF1B\u6682\u7F13\u539F\u56E0\uFF1A" + a.reason;
+  return "\u5F02\u5E38/\u5FD9\u788C\u539F\u56E0\uFF1A" + (d.reasons.map((r2) => ({ "cache-staging-busy": "\u7F13\u5B58\u6682\u5B58\u5FD9\u788C", "filesystem-transient": "\u6587\u4EF6\u7CFB\u7EDF\u6682\u65F6\u5F02\u5E38", "network-transient": "\u7F51\u7EDC\u6682\u65F6\u5F02\u5E38", "metadata-not-ready": "\u5143\u6570\u636E\u672A\u5C31\u7EEA", "authentication": "\u9274\u6743\u5931\u8D25", "identity": "\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD\u5F02\u5E38", "quota": "\u5BB9\u91CF\u9650\u5236", "persistence": "\u672C\u5730\u4FDD\u5B58\u5931\u8D25", "invalid-data": "\u6570\u636E\u6821\u9A8C\u5F02\u5E38", "unknown-error": "\u672A\u5206\u7C7B\u9519\u8BEF\uFF08\u9700\u672C\u673A\u8BE6\u60C5\uFF09", "initializing": "\u521D\u59CB\u5316\u4E2D", "receiving": "\u63A5\u6536\u4E2D", "uploading": "\u4E0A\u4F20\u4E2D", "local-operation": "\u672C\u5730\u5904\u7406", "transferring": "\u4F20\u8F93\u4E2D", "saving": "\u4FDD\u5B58\u4E2D", "recovering": "\u91CD\u8BD5\u6062\u590D\u4E2D", "stopping": "\u6B63\u5728\u65AD\u5F00", "conflict-check": "\u51B2\u7A81\u68C0\u67E5\u672A\u786E\u8BA4", "conflict": "\u6709\u51B2\u7A81", "path-review": "\u5220\u9664\u4EE3\u6B21\u6216\u8DEF\u5F84\u64CD\u4F5C\u5F85\u590D\u6838", "consistency-hold": "\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D", "consistency-difference": "\u4E00\u81F4\u6027\u6709\u5DEE\u5F02" })[r2] || r2).join("\u3001") || "\u65E0") + "\uFF1B\u81EA\u52A8\u6838\u5BF9\uFF1A" + (a.enabled ? "\u5F00\u542F" : "\u5173\u95ED") + "\uFF1B\u9636\u6BB5\uFF1A" + a.phase + "\uFF1B\u6838\u5BF9\u65F6\u95F4\uFF1A" + (a.checkedAt ? new Date(a.checkedAt).toISOString() : "\u5C1A\u672A\u6838\u5BF9") + "\uFF1B\u7ED3\u679C\u4ECD\u9002\u7528\uFF1A" + a.current + "\uFF1B\u7ED3\u679C\uFF1A" + JSON.stringify(a.counts) + "\uFF1B\u6682\u7F13\u539F\u56E0\uFF1A" + a.reason;
 }
 function auditFailure(error, stage) {
   const message = String(error?.message || error), code = stage === "save-baseline" ? "persistence" : errorCode(error);
@@ -9534,7 +9541,7 @@ function pathReviewGroups(items = [], destinations = {}) {
     const key = i.op.kind === "delete" ? JSON.stringify([title, !!i.approved, [...new Set(i.op.entries.map((e) => parent(e.from)))].sort()]) : null;
     let g = key ? batches.get(key) : null;
     if (!g) {
-      g = { id: i.op.id, title: "", count: 0, affected: 0, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: "", lines: [], reviewed, reviewedItems: [], paths: /* @__PURE__ */ new Set(), label: title };
+      g = { id: i.op.id, title: "", count: 0, affected: 0, state: needsPathReview(i.error) ? "\u6E90\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u9700\u91CD\u65B0\u590D\u6838\uFF08\u4E0D\u4F1A\u81EA\u52A8\u4F20\u64AD\uFF09" : i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD\u6216\u91CD\u8BD5" : "\u7B49\u5F85\u4F60\u786E\u8BA4", error: "", lines: [], reviewed, reviewedItems: [], paths: /* @__PURE__ */ new Set(), label: title };
       groups.push(g);
       if (key) batches.set(key, g);
     }
@@ -10777,7 +10784,7 @@ function validateSafetyQueue(queue, serverId) {
 function runnablePathOperation(items, bulk) {
   const blocked = /* @__PURE__ */ new Set();
   for (let index = 0; index < items.length; index++) {
-    const item = items[index], paths = operationPaths(item.op), waiting = !item.approved && (item.review || (item.op.kind === "delete" ? bulk : item.op.entries.length >= 5));
+    const item = items[index], paths = operationPaths(item.op), waiting = needsPathReview(item.error) || !item.approved && (item.review || (item.op.kind === "delete" ? bulk : item.op.entries.length >= 5));
     if (!waiting && paths.every((p) => !blocked.has(p))) return index;
     for (const p of paths) blocked.add(p);
   }
@@ -11078,7 +11085,7 @@ var VaultClient = class {
       this.requests.clear();
       if (this.stopped || this.transportBlocked) return;
       if (e.code === 4401 || e.code === 4400 || e.code === 4403) {
-        this.onStatus(e.code === 4401 ? "\u8BA4\u8BC1\u5931\u8D25" : e.code === 4403 ? "\u521B\u5EFA\u5931\u8D25\uFF1A\u670D\u52A1\u5668\u5DF2\u6709\u5185\u5BB9\uFF0C\u8BF7\u9009\u62E9\u52A0\u5165" : "\u66F4\u65B0\u88AB\u62D2\u7EDD\uFF0C\u8BF7\u68C0\u67E5\u5BB9\u91CF\u6216\u8DEF\u5F84");
+        this.onStatus(e.code === 4401 ? "\u8BA4\u8BC1\u5931\u8D25" : e.code === 4403 ? "\u521B\u5EFA\u5931\u8D25\uFF1A\u670D\u52A1\u5668\u5DF2\u6709\u5185\u5BB9\uFF0C\u8BF7\u9009\u62E9\u52A0\u5165" : String(e.reason) === "Upgrade PDF support" ? "\u5927 PDF \u540C\u6B65\u9700\u8981\u5347\u7EA7\u5230 alpha.51 \u6216\u4EE5\u4E0A\uFF1B\u672C\u5730\u5185\u5BB9\u4E0E\u961F\u5217\u4FDD\u7559" : "\u66F4\u65B0\u88AB\u62D2\u7EDD\uFF0C\u8BF7\u68C0\u67E5\u5BB9\u91CF\u6216\u8DEF\u5F84");
         return;
       }
       this.onStatus("\u79BB\u7EBF\uFF0C\u7B49\u5F85\u91CD\u8FDE");
@@ -11185,7 +11192,7 @@ var BlobTransfer = class {
     this.busy = true;
     try {
       await this.identity(signal);
-      if (!Number.isSafeInteger(source.size) || source.size < 0 || source.size > MAX_BLOB_BYTES) throw Error("Blob exceeds 16 MiB or invalid size");
+      if (!Number.isSafeInteger(source.size) || source.size < 0 || source.size > MAX_BLOB_BYTES) throw Error("Blob exceeds 64 MiB or invalid size");
       const hash = await hashSource(source, signal);
       let s = await boundedJson(await this.call(hash, { status: "1", size: source.size }, { signal }));
       checkStatus(s, source.size);
@@ -11299,7 +11306,7 @@ var BlobTransfer = class {
 
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
-    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], optionalCapabilities: [METADATA_CAPACITY_CAPABILITY], beforeUpload: async (context) => {
+    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], optionalCapabilities: [METADATA_CAPACITY_CAPABILITY, LARGE_PDF_CAPABILITY], beforeUpload: async (context) => {
       if (context.isCurrent()) this.connectionProgressAt = Date.now();
       await options.beforeUpload?.(context);
       if (!context.isCurrent()) return;
@@ -11507,6 +11514,7 @@ var VaultClientV3 = class extends VaultClient {
     if (p.recreateAfter !== void 0 && !validDeletionGeneration(p.recreateAfter)) throw Error("Invalid deletion generation");
   }
   async putFile(path, source, options = {}) {
+    if (largePdf(path, source.size) && !this.serverCapabilities?.includes(LARGE_PDF_CAPABILITY)) throw Error("Large PDF requires alpha.51 server; cached source retained");
     if (options.recreateAfter !== void 0 && (!validDeletionGeneration(options.recreateAfter) || !this.serverCapabilities?.includes(DELETION_GENERATION_CAPABILITY))) throw Error("Deletion generation requires upgraded server; cached source retained");
     if (options.ifAbsent && (!this.serverCapabilities?.includes(SAFE_PUBLISH_CAPABILITY) || !this.serverCapabilities?.includes(CONFLICT_CAPABILITY))) throw Error("Server does not support safe absent-only publication");
     if (!supportedFile(path) || source.size > maxFileSize(path)) throw Error("Unsupported file or per-type size limit");
@@ -11782,25 +11790,36 @@ var RealtimeLab = class extends import_obsidian.Plugin {
   legacyConfig = null;
   fingerprints = /* @__PURE__ */ new Map();
   configWrites = Promise.resolve();
+  reviewFailures() {
+    const failures = new Map(this.fileFailures);
+    const c = this.client;
+    if (c?.metadataVerified) {
+      for (const p of c.pending) if (p.recreateAfter && p.recreateAfter !== deletionGeneration(c.doc, p.path)) failures.set(p.path, "Deletion generation changed; preserve local file and review");
+    }
+    return failures;
+  }
+  queueProtection() {
+    return queueProtection(this.settings, [...this.reviewFailures()]);
+  }
   queueView() {
     const downloads = [.../* @__PURE__ */ new Set([...this.downloadPaths, ...(this.settings.receivePending?.paths || []).filter((p) => !this.receiveAcks.has(p))])];
-    return classifyQueues(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.fileFailures], downloads }), this.settings, this.client?.pending || this.settings.pending?.items || []);
+    return classifyQueues(queueRows({ metadata: this.client?.pendingPaths || this.settings.outbox || [], files: this.client?.pending || this.settings.pending?.items || [], dirty: [...this.dirtyFiles.keys()], failures: [...this.reviewFailures()], downloads }), this.settings, this.client?.pending || this.settings.pending?.items || [], this.queueProtection());
   }
   pendingRows() {
     return this.queueView().rows;
   }
   activeFailures() {
-    const protection = queueProtection(this.settings), failures = new Map([...this.fileFailures].filter(([path]) => !protectionKind(path, protection)));
+    const protection = this.queueProtection(), failures = new Map([...this.reviewFailures()].filter(([path]) => !protectionKind(path, protection)));
     for (const i of this.settings.pathSafety?.items || []) if (i.approved && i.error) {
       for (const path of operationPaths(i.op)) if (!protectionKind(path, protection)) failures.set(path, i.error);
     }
     return failures;
   }
   pendingPublishAllowed(path) {
-    return !protectionKind(path, queueProtection(this.settings));
+    return !protectionKind(path, this.queueProtection());
   }
   runnableRetrySummary() {
-    const protection = queueProtection(this.settings);
+    const protection = this.queueProtection();
     return this.ledger()?.summary((key) => !deferredRetryKey(key, protection));
   }
   safeError(error) {
@@ -11851,7 +11870,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client, rows = this.pendingRows(), progress = this.progressModel();
     e.createEl("p", { text: queueStateText(this.queueView()) });
     const audit = c ? diagnosticDetails(this).audit : void 0;
-    const sections = syncSections({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, ready: !!c?.ready, connecting: !!c && !c.stopped && !c.ready, error: this.operationError || c?.lastError || this.conflictError, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, audit, conflicts: this.conflicts.length, operations: this.settings.pathSafety?.items.length || 0, remoteDeletes: this.settings.remoteDeleteReview?.paths.length || 0, holds: this.settings.consistencyHolds?.length || 0 });
+    const sections = syncSections({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, ready: !!c?.ready, connecting: !!c && !c.stopped && !c.ready, error: (needsPathReview(this.operationError) ? "" : this.operationError) || (needsPathReview(c?.lastError) ? "" : c?.lastError) || this.conflictError, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, audit, conflicts: this.conflicts.length, operations: this.settings.pathSafety?.items.length || 0, remoteDeletes: this.settings.remoteDeleteReview?.paths.length || 0, holds: this.settings.consistencyHolds?.length || 0 });
     const overview = e.createDiv({ cls: "rl-sync-overview" });
     for (const section of sections) {
       const card = overview.createDiv({ cls: "rl-sync-section" });
@@ -11877,8 +11896,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if ([this.operationError, ...this.activeFailures().values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u684C\u9762\u7AEF\u4FDD\u6301 Obsidian \u8FD0\u884C\u5373\u53EF\uFF0C\u624B\u673A\u7AEF\u9700\u4FDD\u6301\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
     if (this.capacityReport) e.createEl("p", { text: capacityText(this.capacityReport) });
     if (this.pendingRows().length || this.ledger()?.items.size) e.createEl("p", { text: stallText(this.recoveryStatus()) });
-    if (this.operationError) e.createEl("p", { text: "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A" + this.safeError(this.operationError) });
-    if (c?.lastError) e.createEl("p", { text: "\u6700\u8FD1\u9519\u8BEF\uFF1A" + this.safeError(c.lastError) });
+    if (this.operationError) e.createEl("p", { text: (needsPathReview(this.operationError) ? "\u672C\u5730\u590D\u6838\u63D0\u793A\uFF1A" : "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A") + this.safeError(this.operationError) });
+    if (c?.lastError) e.createEl("p", { text: (needsPathReview(c.lastError) ? "\u8DEF\u5F84\u590D\u6838\u63D0\u793A\uFF1A" : "\u6700\u8FD1\u9519\u8BEF\uFF1A") + this.safeError(c.lastError) });
     for (const row of rows.slice(0, 50)) e.createEl("p", { text: (row.path === "*" ? "\u672C\u5730\u79BB\u7EBF\u5FEB\u7167\u5F85\u6838\u5BF9" : row.path) + " \xB7 " + row.state + (row.error ? " \xB7 " + this.safeError(row.error) : "") });
   }
   resumeForeground(force = true) {
@@ -12193,7 +12212,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (force) {
       const ledger = this.ledger();
       if (ledger) {
-        const protection = queueProtection(this.settings);
+        const protection = this.queueProtection();
         for (const r2 of ledger.items.values()) {
           if (deferredRetryKey(r2.key, protection)) continue;
           r2.nextAt = 0;
@@ -12241,7 +12260,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
     const recovery = this.recoveryStatus();
-    return badgeState({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, stalled: recovery.stalled, stallReason: recovery.reason, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.activeFailures().size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.activeFailures().values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || c?.lastError || this.activeFailures().size || this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, stalled: recovery.stalled, stallReason: recovery.reason, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.activeFailures().size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.activeFailures().values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || !needsPathReview(c?.lastError) && c?.lastError || this.activeFailures().size || !needsPathReview(this.operationError) && this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -12646,6 +12665,15 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     m.titleEl.setText("\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4");
     m.modalEl.addClass("rl-history-modal");
     m.contentEl.createEl("p", { text: "\u672C\u673A\u64CD\u4F5C\u5DF2\u53D1\u751F\uFF0C\u4EE5\u4E0B\u8BA1\u5212\u5C1A\u9700\u4F20\u64AD\u3002\u9010\u7EC4\u5BA1\u6838\uFF1B\u53EA\u5904\u7406\u4F60\u9009\u4E2D\u7684\u7EC4\u3002\u5173\u95ED\u7A97\u53E3\u4E0D\u4F1A\u6279\u51C6\u64CD\u4F5C\u3002" });
+    const generationReviews = [...this.reviewFailures()].filter(([p, error]) => needsPathReview(error));
+    if (generationReviews.length) {
+      m.contentEl.createEl("p", { text: "\u53E6\u6709 " + generationReviews.length + " \u6761\u5220\u9664\u4EE3\u6B21\u6216\u6E90\u7248\u672C\u53D8\u5316\uFF0C\u9700\u590D\u6838\uFF1B\u4E0D\u4F1A\u81EA\u52A8\u91CD\u5EFA\u3001\u5220\u9664\u6216\u8986\u76D6\u3002" });
+      for (const [path] of generationReviews) m.contentEl.createEl("pre", { text: path });
+      new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u9010\u6587\u4EF6\u6838\u9A8C\u4E0E\u4FEE\u590D").onClick(() => {
+        m.close();
+        void this.openConsistency();
+      }));
+    }
     m.contentEl.createEl("p", { text: "\u672C\u673A " + groups.length + " \u7EC4 \xB7 " + groups.reduce((n, g) => n + g.count, 0) + " \u9879\u64CD\u4F5C\u3002\u6539\u540D\u540E\u7684\u5176\u4ED6\u7B14\u8BB0\u94FE\u63A5\u6CBF\u7528 Obsidian \u5DF2\u4FDD\u5B58\u7684\u7ED3\u679C\u3002" });
     for (const group of groups) {
       const card = m.contentEl.createDiv({ cls: "rl-review-card" });
@@ -13845,7 +13873,7 @@ var Settings = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(e).setName("\u6587\u4EF6\u4E00\u81F4\u6027").addButton((b) => b.setButtonText("\u9010\u6587\u4EF6\u6838\u9A8C\u4E0E\u4FEE\u590D").onClick(() => void this.p.openConsistency()));
     new import_obsidian.Setting(e).addButton((b) => b.setButtonText("\u5237\u65B0\u72B6\u6001").onClick(() => this.p.renderProgress())).addButton((b) => b.setButtonText("\u91CD\u8BD5\u5F85\u4F20\u4E0E\u63A5\u6536").onClick(() => void this.p.retryQueue()));
     new import_obsidian.Setting(e).setName("\u8BEF\u7F6E\u65E7\u534F\u8BAE\u8BBE\u7F6E").addButton((b) => b.setButtonText("\u5907\u4EFD\u5E76\u6E05\u7A7A\u65E7\u72B6\u6001").onClick(() => void this.p.backupRejectedState()));
-    e.createEl("p", { text: "\u652F\u6301\u81EA\u5B9A\u4E49\u4ED3\u5E93\u540D\uFF1B\u6BCF\u4E2A\u5E93\u9700\u5355\u72EC\u521D\u59CB\u5316\u5E76\u8FDE\u63A5\u72EC\u7ACB\u540C\u6B65\u7A7A\u95F4\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA Word DOCX/JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247/PDF\u22645 MiB\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u65B0\u7248\u670D\u52A1\u9ED8\u8BA4\u6D3B\u52A8\u5185\u5BB9\u22641 GiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u9ED8\u8BA4\u5404\u22642 GiB\uFF08\u542B\u5386\u53F2\u53CA\u6062\u590D\u5185\u5BB9\uFF0C\u4E0D\u81EA\u52A8\u5220\u9664\uFF09\u3001CRDT\u72B6\u6001\u22648 MiB\uFF08\u9700\u65B0\u7248\u670D\u52A1\uFF1B\u8D85\u51FA\u65E7\u7248\u63A5\u6536\u80FD\u529B\u65F6\u63D0\u793A\u5347\u7EA7\uFF0C\u4FDD\u7559\u672C\u5730\u961F\u5217\uFF09\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
+    e.createEl("p", { text: "\u652F\u6301\u81EA\u5B9A\u4E49\u4ED3\u5E93\u540D\uFF1B\u6BCF\u4E2A\u5E93\u9700\u5355\u72EC\u521D\u59CB\u5316\u5E76\u8FDE\u63A5\u72EC\u7ACB\u540C\u6B65\u7A7A\u95F4\u3002\u652F\u6301 Markdown\u3001\u56FE\u7247\u3001PDF\u53CA Word DOCX/JSON/CSV/JSONL/HTML/Python/TXT/\u6821\u9A8C/\u65E5\u5FD7/ZIP/\u5907\u4EFD\u6587\u4EF6\uFF08\u4EC5\u4F20\u8F93\uFF0C\u4E0D\u6267\u884C\uFF09\uFF1A\u5B9E\u65F6\u534F\u4F5C\u6D4B\u8BD5.md \u5728\u226416 KiB\u65F6\u9010\u5B57\u534F\u4F5C\uFF1B\u5176\u4F59 Markdown \u6309\u6574\u6587\u4EF6\u7248\u672C\u540C\u6B65\uFF08\u226416 MiB\uFF09\uFF0C\u51B2\u7A81\u53CC\u65B9\u4FDD\u7559\u5386\u53F2\uFF1B\u56FE\u7247\u22645 MiB\uFF0CPDF\u226464 MiB\uFF08\u9700\u4E24\u7AEF\u4E0E\u670D\u52A1\u7AEF alpha.51+\uFF09\uFF0C\u5176\u4ED6\u8D44\u6599\u226416 MiB\uFF1B\u65B0\u7248\u670D\u52A1\u9ED8\u8BA4\u6D3B\u52A8\u5185\u5BB9\u22641 GiB\u3001\u6700\u591A6000\u6D3B\u52A8\u8DEF\u5F84/8192\u8DDF\u8E2A\u8DEF\u5F84\uFF08\u542B\u5893\u7891\uFF09\uFF0C\u670D\u52A1\u7AEF\u4E0E\u672C\u5730\u7F13\u5B58\u9ED8\u8BA4\u5404\u22642 GiB\uFF08\u542B\u5386\u53F2\u53CA\u6062\u590D\u5185\u5BB9\uFF0C\u4E0D\u81EA\u52A8\u5220\u9664\uFF09\u3001CRDT\u72B6\u6001\u22648 MiB\uFF08\u9700\u65B0\u7248\u670D\u52A1\uFF1B\u8D85\u51FA\u65E7\u7248\u63A5\u6536\u80FD\u529B\u65F6\u63D0\u793A\u5347\u7EA7\uFF0C\u4FDD\u7559\u672C\u5730\u961F\u5217\uFF09\u3002\u914D\u7F6E\u3001\u9690\u85CF\u6587\u4EF6\u548C\u6062\u590D\u526F\u672C\u4E0D\u53C2\u4E0E\u540C\u6B65\u3002V3 \u670D\u52A1\u5668\u4E0E\u65E7\u7248\u4E0D\u517C\u5BB9\uFF0C\u8BF7\u52FF\u590D\u7528\u65E7\u8FDE\u63A5\u3002" });
     new import_obsidian.Setting(e).setName("\u521B\u5EFA\u6216\u52A0\u5165\u5411\u5BFC").addButton((b) => b.setButtonText("\u914D\u7F6E\u8FDE\u63A5").onClick(() => void this.p.setupConnection()));
     new import_obsidian.Setting(e).setName("\u53EA\u8BFB\u6587\u4EF6\u53CA\u9644\u4EF6\u6E05\u5355").addButton((b) => b.setButtonText("\u9884\u89C8\uFF0C\u4E0D\u8FC1\u79FB").onClick(() => void this.p.previewInventory()));
     new import_obsidian.Setting(e).setName("\u521D\u59CB\u5316\u540C\u6B65\u5E93").addButton((b) => b.setButtonText("\u521D\u59CB\u5316").onClick(() => void this.p.initialize()));

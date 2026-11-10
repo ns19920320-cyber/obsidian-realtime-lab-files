@@ -1,3 +1,4 @@
+import {needsPathReview} from './queue-state.mjs';
 // Presentation only: never change queues, content or approval flags here.
 export function pathReviewGroups(items=[],destinations={}){
  const parent=p=>p.slice(0,p.lastIndexOf('/')),name=p=>p.slice(p.lastIndexOf('/')+1);
@@ -15,7 +16,7 @@ export function pathReviewGroups(items=[],destinations={}){
   // remain independently checked when the user confirms the displayed group.
   const key=i.op.kind==='delete'?JSON.stringify([title,!!i.approved,[...new Set(i.op.entries.map(e=>parent(e.from)))].sort()]):null;
   let g=key?batches.get(key):null;
-  if(!g){g={id:i.op.id,title:'',count:0,affected:0,state:i.approved?'已批准，等待传播或重试':'等待你确认',error:'',lines:[],reviewed,reviewedItems:[],paths:new Set(),label:title};groups.push(g);if(key)batches.set(key,g);}
+  if(!g){g={id:i.op.id,title:'',count:0,affected:0,state:needsPathReview(i.error)?'源版本已变化，需重新复核（不会自动传播）':i.approved?'已批准，等待传播或重试':'等待你确认',error:'',lines:[],reviewed,reviewedItems:[],paths:new Set(),label:title};groups.push(g);if(key)batches.set(key,g);}
   g.count+=i.op.entries.length;g.reviewedItems.push(reviewed);g.lines.push(...lines);if(i.error&&!g.error)g.error=i.error;for(const e of i.op.entries){g.paths.add(e.from);if(e.to)g.paths.add(e.to);}g.affected=g.paths.size;g.title=g.label+' · '+g.count+' 项';
  }
  return groups.map(({paths,label,...g})=>g);

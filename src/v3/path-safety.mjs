@@ -1,3 +1,4 @@
+import {needsPathReview} from './queue-state.mjs';
 import {supported,content,put,remove} from './model.mjs';
 import {sameContent} from './conflicts.mjs';
 export const PATH_SAFETY_CAPABILITY='protected-paths-v1';
@@ -16,7 +17,7 @@ export function validateSafetyQueue(queue,serverId){if(!queue)return;if(queue.se
 export function runnablePathOperation(items,bulk){
  const blocked=new Set();
  for(let index=0;index<items.length;index++){
-  const item=items[index],paths=operationPaths(item.op),waiting=!item.approved&&(item.review||(item.op.kind==='delete'?bulk:item.op.entries.length>=5));
+  const item=items[index],paths=operationPaths(item.op),waiting=needsPathReview(item.error)||!item.approved&&(item.review||(item.op.kind==='delete'?bulk:item.op.entries.length>=5));
   if(!waiting&&paths.every(p=>!blocked.has(p)))return index;
   for(const p of paths)blocked.add(p);
  }

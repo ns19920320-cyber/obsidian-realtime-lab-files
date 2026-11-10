@@ -14,3 +14,5 @@ test('waiting decisions keep dependent moves blocked while an independent move m
  const independent={op:{kind:'rename',entries:[{from:'separate.md',to:'moved.md',base}]},approved:true};
  const items=[manual,dependent,independent],before=structuredClone(items);assert.equal(runnablePathOperation(items.slice(0,2),true),-1);assert.equal(runnablePathOperation(items,true),2);assert.deepEqual(items,before);
 });
+
+test('approved stale source plan is never automatically retried or allowed to release dependent plans',async()=>{const {runnablePathOperation}=await import('../src/v3/path-safety.mjs'),items=[{approved:true,error:'Source changed; protected operation requires review',op:{kind:'rename',entries:[{from:'a.md',to:'b.md'}]}},{approved:true,op:{kind:'rename',entries:[{from:'b.md',to:'c.md'}]}},{approved:true,op:{kind:'rename',entries:[{from:'x.md',to:'y.md'}]}}],before=JSON.stringify(items);assert.equal(runnablePathOperation(items,false),2);assert.equal(runnablePathOperation(items.slice(0,2),false),-1);assert.equal(JSON.stringify(items),before);});

@@ -62,3 +62,9 @@ Stale per-path failures remain stored but are excluded from live failure totals,
 ## Slow-network handshake (alpha.50)
 
 Once WebSocket opens, receiving the metadata welcome may take longer than 30 seconds. The client allows up to 180 seconds for this phase, with a bounded retry for a silent peer. Connecting/CLOSING sockets and stalled cached preparation retain the 30-second inactivity guard. Metadata reception and pre-upload preparation are shown separately; no byte percentage is claimed because browser WebSocket does not expose partial-frame bytes. Durable queues and review plans are not rewritten by this timeout change.
+
+## PDF and deletion review (alpha.51)
+
+PDF files may be up to 64 MiB; images remain 5 MiB and other opaque files remain 16 MiB. PDFs above 5 MiB require the `large-pdf-64m-v1` capability on the server and every receiving client. Upgrade the server and all clients before publishing large PDFs. Older clients are refused metadata containing large-PDF versions, including retained history, rather than receiving an invalid state. Existing total storage and content budgets are unchanged.
+
+Deletion-generation and stale-source safety failures are derived as manual-review work without rewriting approval flags, immutable versions, caches or retry history. They are not automatically retried or rebased; use the read-only file verification entry and explicitly review any subsequent operation.

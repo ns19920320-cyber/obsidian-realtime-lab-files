@@ -18,7 +18,7 @@ export function badgeState({connectionPhase,ready=false,preparing=false,receivin
  if(!ready&&reconnecting&&conflicts)display='Sync: 重连中 · 冲突'+conflicts;
  if(stalled&&ready&&!conflicts&&!protectedCount){tone='error';icon='alert-circle';label='同步暂未推进';display='Sync: ⚠ '+({network:'等待网络',cache:'等待缓存',vault:'等待写盘',config:'等待保存'}[stallReason]||'暂未推进');}
  if(queueState){const q=queueState.counts;counts+=' · 待确认 '+q.review+' · 保护暂缓 '+q.held+' · 真正失败 '+q.failed;if(ready&&!conflicts){if(q.failed||error){tone='error';label='有失败需处理';display='Sync: ⚠ '+(q.failed?'失败'+q.failed:'连接/本地异常');}else if(q.review||q.held){tone='waiting';busy=false;label='等待确认或保护暂缓';display='Sync: '+(q.review?'待确认'+q.review:'')+(q.review&&q.held?' · ':'')+(q.held?'暂缓'+q.held:'');}}}
- if(!ready&&reconnecting&&['metadata','prepare'].includes(connectionPhase)){label=connectionPhase==='metadata'?'接收元数据':'准备补传';display='Sync: ↻ '+label;counts+=' · '+(connectionPhase==='metadata'?'正在接收同步元数据，最长等待3分钟':'元数据已接收，正在校验');}
+ if(!ready&&reconnecting&&['metadata','identity','apply','prepare'].includes(connectionPhase)){label=({metadata:'接收元数据',identity:'保存身份',apply:'合并元数据',prepare:'准备补传'})[connectionPhase];display='Sync: ↻ '+label;counts+=' · '+(connectionPhase==='metadata'?'正在接收同步元数据，最长等待3分钟':'元数据已接收，正在校验');}
  return {tone,icon,label,display,busy,counts,description:(progress?.available?counts+'；当前接收并发'+progress.active+'；待重试仅统计文件失败，不包含连接错误或冲突；':'进度尚未核对；')+label+'；待处理冲突'+conflicts+'；库内'+known+'个路径；待上传或确认'+(unknown?'数量待核对':uploads)+'；当前接收'+downloads+'。点击查看同步详情。服务器确认不等于其他设备已收到。'};
 }
 export const badgeCSS=`

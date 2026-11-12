@@ -33,6 +33,57 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
+var CONNECTION_TIMINGS_CAPABILITY = "connection-timings-v1";
+var phases = ["connecting", "metadata", "identity", "apply", "prepare", "ready", "closed"];
+var bound = (n) => Math.min(6048e5, Math.max(0, Math.round(n)));
+var ConnectionTimings = class {
+  constructor({ now = () => performance.now() } = {}) {
+    this.now = now;
+    this.attempt = 0;
+  }
+  begin() {
+    this.attempt = Math.min(1e5, this.attempt + 1);
+    this.started = this.phaseAt = this.now();
+    this.phase = "connecting";
+    this.mode = "unknown";
+    this.times = { connecting: 0, metadata: 0, identity: 0, apply: 0, prepare: 0 };
+    this.readyAt = null;
+    this.ended = null;
+    this.confirmMs = null;
+    this.localMs = null;
+    this.vectorBytes = this.welcomeBytes = this.updateBytes = 0;
+  }
+  enter(phase) {
+    if (!phases.includes(phase) || !this.phase) return;
+    const now = this.now();
+    if (Object.hasOwn(this.times, this.phase)) this.times[this.phase] = bound(this.times[this.phase] + now - this.phaseAt);
+    this.phase = phase;
+    this.phaseAt = now;
+    if (phase === "ready") {
+      this.readyAt = now;
+      this.ended = now;
+    }
+    if (phase === "closed" && this.ended === null) this.ended = now;
+  }
+  confirmed() {
+    if (this.readyAt !== null && this.confirmMs === null) this.confirmMs = bound(this.now() - this.readyAt);
+  }
+  localReady() {
+    if (this.readyAt !== null && this.localMs === null) this.localMs = bound(this.now() - this.readyAt);
+  }
+  snapshot() {
+    if (!this.phase) return null;
+    const t = { ...this.times };
+    if (Object.hasOwn(t, this.phase)) t[this.phase] = bound(t[this.phase] + this.now() - this.phaseAt);
+    return { attempt: this.attempt, phase: this.phase, mode: this.mode, totalMs: bound((this.ended ?? this.now()) - this.started), connectMs: t.connecting, metadataMs: t.metadata, identityMs: t.identity, applyMs: t.apply, prepareMs: t.prepare, confirmMs: this.confirmMs, localMs: this.localMs, vectorBytes: this.vectorBytes, welcomeBytes: this.welcomeBytes, updateBytes: this.updateBytes };
+  }
+};
+function connectionTimingText(v) {
+  if (!v) return "\u8FDE\u63A5\u5206\u9636\u6BB5\u8BA1\u65F6\uFF1A\u5C1A\u672A\u5F00\u59CB";
+  const modes = { unknown: "\u5C1A\u672A\u534F\u5546", full: "\u5168\u91CF\u63E1\u624B", delta: "\u589E\u91CF\u63E1\u624B" }, stage = { connecting: "\u5EFA\u7ACB\u8FDE\u63A5", metadata: "\u63A5\u6536\u5143\u6570\u636E", identity: "\u4FDD\u5B58\u8EAB\u4EFD", apply: "\u5408\u5E76\u5143\u6570\u636E", prepare: "\u51C6\u5907\u8865\u4F20", ready: "\u5DF2\u8FDE\u63A5", closed: "\u5DF2\u65AD\u5F00" };
+  return modes[v.mode] + " \xB7 " + stage[v.phase] + "\uFF1B\u5EFA\u8FDE " + v.connectMs + "ms \xB7 \u63A5\u6536 " + v.metadataMs + "ms \xB7 \u8EAB\u4EFD\u4FDD\u5B58 " + v.identityMs + "ms \xB7 \u5408\u5E76 " + v.applyMs + "ms \xB7 \u51C6\u5907 " + v.prepareMs + "ms \xB7 \u5C31\u7EEA\u5171 " + v.totalMs + "ms\uFF1B\u9996\u786E\u8BA4 " + (v.confirmMs === null ? "\u5F85\u786E\u8BA4" : v.confirmMs + "ms") + " \xB7 \u672C\u673A\u51C6\u5907 " + (v.localMs === null ? "\u5F85\u5B8C\u6210" : v.localMs + "ms") + "\uFF1B\u5411\u91CF " + v.vectorBytes + " B \xB7 \u63E1\u624B\u6D88\u606F " + v.welcomeBytes + " B \xB7 \u5143\u6570\u636E " + v.updateBytes + " B\u3002\u63A5\u6536\u8017\u65F6\u5305\u542B\u670D\u52A1\u7AEF\u5904\u7406\u4E0E\u7F51\u7EDC\u7B49\u5F85\uFF1B\u9996\u786E\u8BA4\u3001\u672C\u673A\u51C6\u5907\u4ECE\u534F\u8BAE\u5C31\u7EEA\u5F00\u59CB\u5355\u72EC\u8BA1\u65F6\u3002";
+}
+
 var QUEUE_STATE_CAPABILITY = "queue-state-v1";
 var needsPathReview = (error) => /^(?:Error: )?(?:Deletion generation changed; preserve local file and review|Source changed; protected operation requires review|路径计划已变化，请重新审核|path-review)$/.test(String(error?.message || error || ""));
 function queueProtection(settings = {}, failures = []) {
@@ -9445,14 +9496,14 @@ function errorCode(error) {
   return "unknown-error";
 }
 var auditCounts = ["equal", "missing", "different", "local-only", "queued", "excluded", "read-error", "downloaded", "uploaded", "refused"];
-var phases = ["never", "running", "waiting", "complete", "deferred"];
+var phases2 = ["never", "running", "waiting", "complete", "deferred"];
 var auditReasons = ["none", "queue-active", "changed", "conflict-unverified", "baseline-invalid", "unknown-error"];
 function validateDiagnosticDetails(v) {
   const exact = (o, keys2) => o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length === keys2.length && Object.keys(o).every((k) => keys2.includes(k));
   const count = (n) => Number.isSafeInteger(n) && n >= 0 && n <= 1e5;
   if (!exact(v, ["reasons", "audit"]) || !Array.isArray(v.reasons) || v.reasons.length > REASON_CODES.length || new Set(v.reasons).size !== v.reasons.length || v.reasons.some((r2) => !REASON_CODES.includes(r2))) throw Error("Invalid diagnostic details");
   const a = v.audit;
-  if (!exact(a, ["enabled", "phase", "reason", "checkedAt", "stable", "current", "limited", "counts"]) || typeof a.enabled !== "boolean" || !phases.includes(a.phase) || !auditReasons.includes(a.reason) || ![a.stable, a.current, a.limited].every((x) => typeof x === "boolean") || !(a.checkedAt === null || Number.isSafeInteger(a.checkedAt) && a.checkedAt >= 0 && a.checkedAt <= 864e13) || !exact(a.counts, auditCounts) || !auditCounts.every((k) => count(a.counts[k]))) throw Error("Invalid audit diagnostics");
+  if (!exact(a, ["enabled", "phase", "reason", "checkedAt", "stable", "current", "limited", "counts"]) || typeof a.enabled !== "boolean" || !phases2.includes(a.phase) || !auditReasons.includes(a.reason) || ![a.stable, a.current, a.limited].every((x) => typeof x === "boolean") || !(a.checkedAt === null || Number.isSafeInteger(a.checkedAt) && a.checkedAt >= 0 && a.checkedAt <= 864e13) || !exact(a.counts, auditCounts) || !auditCounts.every((k) => count(a.counts[k]))) throw Error("Invalid audit diagnostics");
   return { reasons: [...v.reasons], audit: { ...a, counts: { ...a.counts } } };
 }
 function diagnosticDetails(p) {
@@ -9569,7 +9620,7 @@ function syncSections(options = {}) {
   if (audit) {
     auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
   }
-  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? connectionPhase === "metadata" ? "\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E \xB7 \u6162\u7F51\u6700\u957F\u7B49\u5F853\u5206\u949F" : connectionPhase === "prepare" ? "\u5143\u6570\u636E\u5DF2\u63A5\u6536 \xB7 \u6B63\u5728\u6821\u9A8C\u5E76\u51C6\u5907\u8865\u4F20" : "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
+  return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? connectionPhase === "metadata" ? "\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E \xB7 \u6162\u7F51\u6700\u957F\u7B49\u5F853\u5206\u949F" : connectionPhase === "identity" ? "\u5143\u6570\u636E\u5DF2\u63A5\u6536 \xB7 \u6B63\u5728\u4FDD\u5B58\u8EAB\u4EFD" : connectionPhase === "apply" ? "\u6B63\u5728\u5408\u5E76\u540C\u6B65\u5143\u6570\u636E" : connectionPhase === "prepare" ? "\u5143\u6570\u636E\u5DF2\u63A5\u6536 \xB7 \u6B63\u5728\u6821\u9A8C\u5E76\u51C6\u5907\u8865\u4F20" : "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
 }
 
 var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
@@ -10875,8 +10926,8 @@ function badgeState({ connectionPhase, ready = false, preparing = false, receivi
       }
     }
   }
-  if (!ready && reconnecting && ["metadata", "prepare"].includes(connectionPhase)) {
-    label = connectionPhase === "metadata" ? "\u63A5\u6536\u5143\u6570\u636E" : "\u51C6\u5907\u8865\u4F20";
+  if (!ready && reconnecting && ["metadata", "identity", "apply", "prepare"].includes(connectionPhase)) {
+    label = { metadata: "\u63A5\u6536\u5143\u6570\u636E", identity: "\u4FDD\u5B58\u8EAB\u4EFD", apply: "\u5408\u5E76\u5143\u6570\u636E", prepare: "\u51C6\u5907\u8865\u4F20" }[connectionPhase];
     display = "Sync: \u21BB " + label;
     counts += " \xB7 " + (connectionPhase === "metadata" ? "\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E\uFF0C\u6700\u957F\u7B49\u5F853\u5206\u949F" : "\u5143\u6570\u636E\u5DF2\u63A5\u6536\uFF0C\u6B63\u5728\u6821\u9A8C");
   }
@@ -10900,6 +10951,14 @@ body.is-mobile .rl-sync-row .rl-sync-badge{font-size:11px;min-height:28px;line-h
 .rl-sync-overview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0 20px}.rl-sync-section,.rl-review-card{border:1px solid var(--background-modifier-border);border-radius:10px;padding:12px 14px;background:var(--background-secondary)}.rl-sync-section strong{display:block;font-size:var(--font-ui-small);color:var(--text-muted);margin-bottom:6px}.rl-sync-section div{line-height:1.6;overflow-wrap:anywhere}.rl-sync-section[data-tone=error],.rl-review-error{color:var(--text-error)}.rl-sync-section[data-tone=warning]{color:var(--text-warning)}.rl-review-card{margin:12px 0}.rl-review-card h3{margin:0 0 8px}.rl-review-paths{white-space:pre-wrap;overflow-wrap:anywhere;max-height:32vh;overflow:auto;font-size:var(--font-smaller);line-height:1.6}.rl-review-card summary{cursor:pointer;color:var(--text-muted);padding:6px 0}body.is-mobile .rl-sync-overview{grid-template-columns:1fr}
 .rl-sync-details-note{color:var(--text-muted);font-size:var(--font-ui-small);line-height:1.6}
 `;
+
+var DELTA_HANDSHAKE_CAPABILITY = "delta-handshake-v1";
+var MAX_VECTOR_BYTES = 128 * 1024;
+function clientVector(doc2, serverId) {
+  if (!serverId) return {};
+  const bytes = encodeStateVector(doc2);
+  return bytes.length <= MAX_VECTOR_BYTES ? { serverId, vector: encode(bytes) } : {};
+}
 
 var NO_PERSIST = (_state) => {
 };
@@ -10976,7 +11035,7 @@ var VaultClient = class {
     this.ws = ws;
     ws.onopen = () => {
       this.onHandshakePhase?.("metadata");
-      this.send({ type: "hello", room: this.room, capabilities: [...this.capabilities, ...this.optionalCapabilities], token: this.token, mode: this.mode });
+      this.send({ type: "hello", room: this.room, capabilities: [...this.capabilities, ...this.optionalCapabilities], token: this.token, mode: this.mode, ...this.helloExtras?.() || {} });
     };
     let inbox = Promise.resolve(), inboxBytes = 0;
     ws.onmessage = (e) => {
@@ -11016,7 +11075,9 @@ var VaultClient = class {
               ws.close(4402, "Missing server identity");
               return;
             }
-            this.onHandshakePhase?.("prepare");
+            this.verifyHandshake?.(m);
+            this.onHandshakeWelcome?.(m, raw);
+            this.onHandshakePhase?.("identity");
             this.serverId = m.serverId;
             this.mode = "join";
             try {
@@ -11029,9 +11090,14 @@ var VaultClient = class {
               return;
             }
             if (this.stopped || this.ws !== ws || ws.readyState !== 1) return;
-            applyUpdate(this.doc, decode(m.update), "remote");
+            this.onHandshakePhase?.("apply");
+            const update = decode(m.update);
+            this.onHandshakePayload?.(update.length);
+            applyUpdate(this.doc, update, "remote");
+            this.onHandshakeApplied?.();
             this.serverCapabilities = m.capabilities || [];
             this.metadataVerified = true;
+            this.onHandshakePhase?.("prepare");
             try {
               await this.beforeUpload({ isCurrent: () => !this.stopped && this.ws === ws && ws.readyState === 1 });
             } catch (error) {
@@ -11242,12 +11308,12 @@ var BlobTransfer = class {
     const pending = /* @__PURE__ */ new Map();
     try {
       checkRef(ref);
-      const bound = this.responseIdentity() && this.verifyIdentity;
-      if (bound) {
+      const bound2 = this.responseIdentity() && this.verifyIdentity;
+      if (bound2) {
         this.expectedResponseIdentity = await this.verifyIdentity(signal);
         if (typeof this.expectedResponseIdentity !== "string" || !this.expectedResponseIdentity) throw Error("Verified metadata identity required");
       } else await this.identity(signal);
-      const range = !!bound && this.rangeReads() && ref.size > CHUNK_BYTES, frameBytes = range ? RANGE_BYTES : CHUNK_BYTES, window2 = range ? 2 : bound ? 4 : 2;
+      const range = !!bound2 && this.rangeReads() && ref.size > CHUNK_BYTES, frameBytes = range ? RANGE_BYTES : CHUNK_BYTES, window2 = range ? 2 : bound2 ? 4 : 2;
       if (!ref.size) {
         const s = checkStatus(await boundedJson(await this.call(ref.hash, { status: "1", size: 0 }, { signal })), 0);
         if (!s.complete) throw Error("Remote blob incomplete");
@@ -11306,7 +11372,7 @@ var BlobTransfer = class {
 
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
-    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], optionalCapabilities: [METADATA_CAPACITY_CAPABILITY, LARGE_PDF_CAPABILITY], beforeUpload: async (context) => {
+    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], optionalCapabilities: [METADATA_CAPACITY_CAPABILITY, LARGE_PDF_CAPABILITY, DELTA_HANDSHAKE_CAPABILITY], beforeUpload: async (context) => {
       if (context.isCurrent()) this.connectionProgressAt = Date.now();
       await options.beforeUpload?.(context);
       if (!context.isCurrent()) return;
@@ -11344,6 +11410,8 @@ var VaultClientV3 = class extends VaultClient {
     for (const p of this.pending) this.checkPending(p);
     this.binaryBusy = false;
     this.binaryAbort = new AbortController();
+    this.hasHandshakeBaseline = !!options.state;
+    this.connectionTimings = new ConnectionTimings();
     this.onSyncState = options.onSyncState || (() => {
     });
     this.onOutbox = options.onOutbox;
@@ -11377,13 +11445,40 @@ var VaultClientV3 = class extends VaultClient {
   }
   // iOS can retain an OPEN WebSocket after its network connection is gone.
   // Keep the Y.Doc, verified identity and pending blobs; replace only transport.
+  helloExtras() {
+    const extra = this.hasHandshakeBaseline && this.optionalCapabilities.includes(DELTA_HANDSHAKE_CAPABILITY) ? clientVector(this.doc, this.serverId) : {};
+    this.helloVectorOffered = !!extra.vector;
+    this.connectionTimings.vectorBytes = extra.vector ? Math.floor(extra.vector.length * 3 / 4) - (extra.vector.endsWith("==") ? 2 : extra.vector.endsWith("=") ? 1 : 0) : 0;
+    return extra;
+  }
+  verifyHandshake(m) {
+    if (m.handshake !== void 0 && !["full", "delta"].includes(m.handshake) || m.handshake === "delta" && (!this.helloVectorOffered || !this.serverId || !m.capabilities?.includes(DELTA_HANDSHAKE_CAPABILITY))) {
+      this.stopped = true;
+      throw Error("Unverified delta handshake; local state retained");
+    }
+  }
+  onHandshakeWelcome(m, raw) {
+    this.connectionTimings.mode = m.handshake === "delta" ? "delta" : "full";
+    this.connectionTimings.welcomeBytes = new TextEncoder().encode(raw).length;
+  }
+  onHandshakeApplied() {
+    this.hasHandshakeBaseline = true;
+  }
+  onHandshakePayload(bytes) {
+    this.connectionTimings.updateBytes = bytes;
+  }
   onHandshakePhase(phase) {
+    this.connectionTimings.enter(phase);
     this.connectionPhase = phase;
     this.connectionProgressAt = Date.now();
-    if (phase === "metadata") this.onStatus("\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E\uFF1B\u6162\u7F51\u8BF7\u7A0D\u5019\uFF08\u6700\u957F\u7B49\u5F853\u5206\u949F\uFF09");
+    if (phase === "identity") this.onStatus("\u6B63\u5728\u4FDD\u5B58\u540C\u6B65\u7A7A\u95F4\u8EAB\u4EFD");
+    else if (phase === "apply") this.onStatus("\u6B63\u5728\u5408\u5E76\u540C\u6B65\u5143\u6570\u636E");
+    else if (phase === "metadata") this.onStatus("\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E\uFF1B\u6162\u7F51\u8BF7\u7A0D\u5019\uFF08\u6700\u957F\u7B49\u5F853\u5206\u949F\uFF09");
     else if (phase === "prepare") this.onStatus("\u5143\u6570\u636E\u5DF2\u63A5\u6536\uFF0C\u6B63\u5728\u6821\u9A8C\u5E76\u51C6\u5907\u8865\u4F20");
   }
   connect() {
+    if (this.stopped || [0, 1, 2].includes(this.ws?.readyState)) return;
+    this.connectionTimings.begin();
     const previous = this.ws;
     super.connect();
     if (!this.ws || this.ws === previous) return;
@@ -11393,6 +11488,7 @@ var VaultClientV3 = class extends VaultClient {
     this.terminalCloseCode = void 0;
     const ws = this.ws, closed = ws.onclose;
     ws.onclose = (e) => {
+      if (this.ws === ws) this.connectionTimings.enter("closed");
       if (this.ws === ws && [4400, 4401, 4403].includes(e.code)) this.terminalCloseCode = e.code;
       closed?.(e);
     };
@@ -11450,6 +11546,7 @@ var VaultClientV3 = class extends VaultClient {
         for (const [p, n] of cleared) if (!this.localOutbox.has(p)) this.localOutbox.set(p, n);
         throw e;
       }
+      this.connectionTimings.confirmed();
       this.lastConfirmedAt = Date.now();
       this.lastError = "";
       this.onSyncState();
@@ -11894,6 +11991,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.conflictError) e.createEl("p", { text: "\u51B2\u7A81\u68C0\u67E5\uFF1A" + this.conflictError });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u8DEF\u5F84\uFF1A" + rows.length + "\uFF08\u663E\u793A\u524D50\u9879\uFF09" });
     if ([this.operationError, ...this.activeFailures().values()].some(recoverableSyncFailure)) e.createEl("p", { text: "\u7F51\u7EDC\u6216\u4E34\u65F6\u6587\u4EF6\u7CFB\u7EDF\u6545\u969C\u6062\u590D\u540E\u81EA\u52A8\u8865\u4F20\uFF1B\u684C\u9762\u7AEF\u4FDD\u6301 Obsidian \u8FD0\u884C\u5373\u53EF\uFF0C\u624B\u673A\u7AEF\u9700\u4FDD\u6301\u524D\u53F0\u3002\u91CD\u8BD5\u91C7\u7528\u9000\u907F\u95F4\u9694\uFF0C\u6700\u957F\u7EA660\u79D2\u3002" });
+    if (c?.connectionTimings) e.createEl("p", { text: connectionTimingText(c.connectionTimings.snapshot()) });
     if (this.capacityReport) e.createEl("p", { text: capacityText(this.capacityReport) });
     if (this.pendingRows().length || this.ledger()?.items.size) e.createEl("p", { text: stallText(this.recoveryStatus()) });
     if (this.operationError) e.createEl("p", { text: (needsPathReview(this.operationError) ? "\u672C\u5730\u590D\u6838\u63D0\u793A\uFF1A" : "\u672C\u5730\u5904\u7406\u9519\u8BEF\uFF1A") + this.safeError(this.operationError) });
@@ -11904,6 +12002,11 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     const c = this.client;
     if (!this.isForeground() || !c || !c.connectionStartedAt || this.stopping || c.stopped || c.transportBlocked || c.terminalCloseCode) return;
     const now = Date.now();
+    if (force && !c.ready && c.ws?.readyState === 1 && ["metadata", "identity", "apply", "prepare"].includes(c.connectionPhase) && now - Math.max(c.connectionStartedAt, c.connectionProgressAt || 0) < (c.connectionPhase === "metadata" ? 18e4 : 3e4)) {
+      void c.checkConnection();
+      this.updateProgress();
+      return;
+    }
     if (force && now - this.lastWakeAt < 1500) return;
     this.lastForegroundTick = now;
     this.retryAfter = 0;
@@ -12368,7 +12471,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     try {
       await this.refreshCapacity();
       const rows = this.pendingRows(), platform = import_obsidian.Platform?.isIosApp ? "ios" : import_obsidian.Platform?.isAndroidApp ? "android" : import_obsidian.Platform?.isMacOS ? "macos" : import_obsidian.Platform?.isWin ? "windows" : import_obsidian.Platform?.isLinux ? "linux" : "unknown";
-      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: this.isForeground(), ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.activeFailures().size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(QUEUE_STATE_CAPABILITY) ? { queueState: queueTelemetry(this.queueView()) } : {}, ...c.serverCapabilities.includes(CAPACITY_CAPABILITY) && this.capacityReport ? { capacity: this.capacityReport } : {}, ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
+      await c.request("device-report", { report: { deviceId: this.settings.deviceId, platform, version: this.manifest?.version || "0.5.0-alpha.23", foreground: this.isForeground(), ready: c.ready, busy: !!(this.initializing || !this.syncedOnce || this.safetyBusy || this.reflection.queued || this.fileUploads.queued || this.localOperations || this.writing.size || this.recoveryBusy || this.stopping || this.receiveAcks.size || this.receiptFlush || c.binaryBusy || c.persistence.dirty || c.persistence.inFlight || this.operationError || c.lastError || this.conflictError), queued: rows.length, metadata: c.pendingPaths.length, files: c.pending.length, dirty: this.dirtyFiles.size, receiving: this.downloadPaths.size, failed: this.activeFailures().size, conflicts: this.conflicts.length, confirmedAgeMs: c.lastConfirmedAt ? Math.min(6048e5, Math.max(0, Date.now() - c.lastConfirmedAt)) : null, digest: this.currentDigest(), ...c.serverCapabilities.includes(CONNECTION_TIMINGS_CAPABILITY) ? { connection: c.connectionTimings.snapshot() } : {}, ...c.serverCapabilities.includes(QUEUE_STATE_CAPABILITY) ? { queueState: queueTelemetry(this.queueView()) } : {}, ...c.serverCapabilities.includes(CAPACITY_CAPABILITY) && this.capacityReport ? { capacity: this.capacityReport } : {}, ...c.serverCapabilities.includes(DIAGNOSTIC_DETAILS_CAPABILITY) ? { details: diagnosticDetails(this) } : {}, ...c.serverCapabilities.includes(RECOVERY_DIAGNOSTICS_CAPABILITY) ? { recovery: this.recoveryStatus() } : {}, ...c.serverCapabilities.includes(PERFORMANCE_CAPABILITY) ? { performance: this.performance.snapshot() } : {}, ...c.serverCapabilities.includes(TRANSFER_COUNTERS_CAPABILITY) ? { transfers: this.transfers.snapshot() } : {} } });
       this.diagnosticError = "";
     } catch {
       this.diagnosticError = "\u8FDC\u7A0B\u8BCA\u65AD\u6682\u672A\u4E0A\u62A5\uFF1B\u4E0D\u5F71\u54CD\u539F\u540C\u6B65\u961F\u5217";
@@ -12401,6 +12504,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           this.settings.deviceLabels = { ...this.settings.deviceLabels, [d.deviceId]: v.trim().slice(0, 64) };
           await this.persistConfig();
         }));
+        for (const d of result.devices) if (d.connection) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + connectionTimingText(d.connection) });
         for (const d of result.devices) if (d.queueState) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 \u5F85\u786E\u8BA4 " + d.queueState.awaitingPaths + " \u8DEF\u5F84 \xB7 \u4FDD\u62A4\u6682\u7F13 " + d.queueState.protectedPaths + " \u8DEF\u5F84 \xB7 \u771F\u6B63\u5931\u8D25 " + d.queueState.failedPaths + " \u8DEF\u5F84 \xB7 \u53EF\u5904\u7406 " + d.queueState.activePaths + " \u8DEF\u5F84" });
         for (const d of result.devices) if (d.capacity) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + capacityText(d.capacity) });
         for (const d of result.devices) if (d.recovery) panel.createEl("p", { text: this.deviceLabel(d) + " \xB7 " + stallText(d.recovery) });
@@ -12816,6 +12920,14 @@ var RealtimeLab = class extends import_obsidian.Plugin {
           });
         }
       }
+      if (this.client && (!this.syncedOnce || this.initializing) && event !== "delete" && f instanceof import_obsidian.TFile && supportedFile(f.path) && !this.writing.has(f.path)) {
+        if (this.dirtyFiles.size < 6e3 || this.dirtyFiles.has(f.path)) {
+          this.dirtyFiles.set(f.path, f);
+          this.updateProgress();
+          if (this.client.ready) this.fileUploads.request();
+        } else new import_obsidian.Notice("\u672C\u5730\u5F85\u540C\u6B65\u8DEF\u5F84\u8D85\u8FC76000\uFF0C\u539F\u6587\u4EF6\u4FDD\u7559");
+        return;
+      }
       if (!this.client || !this.syncedOnce || this.initializing) return;
       if (event === "delete") {
         if (this.writing.has(f.path)) return;
@@ -13169,6 +13281,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
         this.refresh();
         const confirmed = await c.confirmUploads();
         if (c.ready && !this.stopping) {
+          c.connectionTimings.localReady();
           this.setConnectionStatus(confirmed && !this.pendingRows().length ? "\u6587\u4EF6\u5DF2\u5C31\u7EEA" : "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u786E\u8BA4");
           if (confirmed && !this.activeFailures().size && !this.pendingRows().length) {
             if (recoverableSyncFailure(this.operationError)) this.operationError = "";
@@ -13267,8 +13380,8 @@ var RealtimeLab = class extends import_obsidian.Plugin {
               this.bindings.delete(cm);
             }
           }
-          const bound = [...this.bindings.values()].some((b) => b.path === p);
-          if (bound && item.kind === "text") continue;
+          const bound2 = [...this.bindings.values()].some((b) => b.path === p);
+          if (bound2 && item.kind === "text") continue;
           if (f instanceof import_obsidian.TFile) {
             const old = await this.read(f);
             if (equal(old, item)) {

@@ -68,3 +68,11 @@ Once WebSocket opens, receiving the metadata welcome may take longer than 30 sec
 PDF files may be up to 64 MiB; images remain 5 MiB and other opaque files remain 16 MiB. PDFs above 5 MiB require the `large-pdf-64m-v1` capability on the server and every receiving client. Upgrade the server and all clients before publishing large PDFs. Older clients are refused metadata containing large-PDF versions, including retained history, rather than receiving an invalid state. Existing total storage and content budgets are unchanged.
 
 Deletion-generation and stale-source safety failures are derived as manual-review work without rewriting approval flags, immutable versions, caches or retry history. They are not automatically retried or rebased; use the read-only file verification entry and explicitly review any subsequent operation.
+
+## Incremental reconnect and stage timings (alpha.52)
+
+`delta-handshake-v1` uses a canonical state vector (at most 128 KiB) only with a previously verified matching server identity. The server authenticates before parsing it, returns a Yjs update containing missing structs and deletion sets, and retains the existing client-to-server upload, persistence, conflict and immutable-queue guards. First join, a vector too large to offer, or an older peer falls back to full metadata. The client refuses an unsolicited delta before saving identity or applying state. No on-disk schema migration or snapshot pruning is performed.
+
+Connection timing diagnostics are memory-only and capability-gated (`connection-timings-v1`). They contain per-attempt stage durations, full/delta mode and bounded byte counts, with no vectors, paths, URLs, errors or content. Metadata time combines server processing and network reception; it does not separately claim DNS, TLS or authentication latency. First confirmation and local preparation are measured after protocol readiness, so they must not be added to the ready total. Offline devices cannot upload new diagnostics until they reconnect.
+
+Upgrade both server and client for incremental reconnect. Updating only the client remains compatible with an old server but continues to receive full metadata. Existing 180-second metadata and 30-second connect/preparation watchdog guards remain; focusing the app does not restart an unexpired open handshake.

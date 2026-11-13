@@ -33,153 +33,6 @@ __export(plugin_exports, {
 });
 module.exports = __toCommonJS(plugin_exports);
 
-var CONNECTION_TIMINGS_CAPABILITY = "connection-timings-v1";
-var phases = ["connecting", "metadata", "identity", "apply", "prepare", "ready", "closed"];
-var bound = (n) => Math.min(6048e5, Math.max(0, Math.round(n)));
-var ConnectionTimings = class {
-  constructor({ now = () => performance.now() } = {}) {
-    this.now = now;
-    this.attempt = 0;
-  }
-  begin() {
-    this.attempt = Math.min(1e5, this.attempt + 1);
-    this.started = this.phaseAt = this.now();
-    this.phase = "connecting";
-    this.mode = "unknown";
-    this.times = { connecting: 0, metadata: 0, identity: 0, apply: 0, prepare: 0 };
-    this.readyAt = null;
-    this.ended = null;
-    this.confirmMs = null;
-    this.localMs = null;
-    this.vectorBytes = this.welcomeBytes = this.updateBytes = 0;
-  }
-  enter(phase) {
-    if (!phases.includes(phase) || !this.phase) return;
-    const now = this.now();
-    if (Object.hasOwn(this.times, this.phase)) this.times[this.phase] = bound(this.times[this.phase] + now - this.phaseAt);
-    this.phase = phase;
-    this.phaseAt = now;
-    if (phase === "ready") {
-      this.readyAt = now;
-      this.ended = now;
-    }
-    if (phase === "closed" && this.ended === null) this.ended = now;
-  }
-  confirmed() {
-    if (this.readyAt !== null && this.confirmMs === null) this.confirmMs = bound(this.now() - this.readyAt);
-  }
-  localReady() {
-    if (this.readyAt !== null && this.localMs === null) this.localMs = bound(this.now() - this.readyAt);
-  }
-  snapshot() {
-    if (!this.phase) return null;
-    const t = { ...this.times };
-    if (Object.hasOwn(t, this.phase)) t[this.phase] = bound(t[this.phase] + this.now() - this.phaseAt);
-    return { attempt: this.attempt, phase: this.phase, mode: this.mode, totalMs: bound((this.ended ?? this.now()) - this.started), connectMs: t.connecting, metadataMs: t.metadata, identityMs: t.identity, applyMs: t.apply, prepareMs: t.prepare, confirmMs: this.confirmMs, localMs: this.localMs, vectorBytes: this.vectorBytes, welcomeBytes: this.welcomeBytes, updateBytes: this.updateBytes };
-  }
-};
-function connectionTimingText(v) {
-  if (!v) return "\u8FDE\u63A5\u5206\u9636\u6BB5\u8BA1\u65F6\uFF1A\u5C1A\u672A\u5F00\u59CB";
-  const modes = { unknown: "\u5C1A\u672A\u534F\u5546", full: "\u5168\u91CF\u63E1\u624B", delta: "\u589E\u91CF\u63E1\u624B" }, stage = { connecting: "\u5EFA\u7ACB\u8FDE\u63A5", metadata: "\u63A5\u6536\u5143\u6570\u636E", identity: "\u4FDD\u5B58\u8EAB\u4EFD", apply: "\u5408\u5E76\u5143\u6570\u636E", prepare: "\u51C6\u5907\u8865\u4F20", ready: "\u5DF2\u8FDE\u63A5", closed: "\u5DF2\u65AD\u5F00" };
-  return modes[v.mode] + " \xB7 " + stage[v.phase] + "\uFF1B\u5EFA\u8FDE " + v.connectMs + "ms \xB7 \u63A5\u6536 " + v.metadataMs + "ms \xB7 \u8EAB\u4EFD\u4FDD\u5B58 " + v.identityMs + "ms \xB7 \u5408\u5E76 " + v.applyMs + "ms \xB7 \u51C6\u5907 " + v.prepareMs + "ms \xB7 \u5C31\u7EEA\u5171 " + v.totalMs + "ms\uFF1B\u9996\u786E\u8BA4 " + (v.confirmMs === null ? "\u5F85\u786E\u8BA4" : v.confirmMs + "ms") + " \xB7 \u672C\u673A\u51C6\u5907 " + (v.localMs === null ? "\u5F85\u5B8C\u6210" : v.localMs + "ms") + "\uFF1B\u5411\u91CF " + v.vectorBytes + " B \xB7 \u63E1\u624B\u6D88\u606F " + v.welcomeBytes + " B \xB7 \u5143\u6570\u636E " + v.updateBytes + " B\u3002\u63A5\u6536\u8017\u65F6\u5305\u542B\u670D\u52A1\u7AEF\u5904\u7406\u4E0E\u7F51\u7EDC\u7B49\u5F85\uFF1B\u9996\u786E\u8BA4\u3001\u672C\u673A\u51C6\u5907\u4ECE\u534F\u8BAE\u5C31\u7EEA\u5F00\u59CB\u5355\u72EC\u8BA1\u65F6\u3002";
-}
-
-var QUEUE_STATE_CAPABILITY = "queue-state-v1";
-var needsPathReview = (error) => /^(?:Error: )?(?:Deletion generation changed; preserve local file and review|Source changed; protected operation requires review|路径计划已变化，请重新审核|path-review)$/.test(String(error?.message || error || ""));
-function queueProtection(settings = {}, failures = []) {
-  const review = /* @__PURE__ */ new Set(), held = new Set(settings.consistencyHolds || []);
-  for (const item of settings.pathSafety?.items || []) if (!item.approved || needsPathReview(item.error)) for (const e of item.op.entries) {
-    review.add(e.from);
-    if (e.to) review.add(e.to);
-  }
-  if (!settings.remoteDeleteReview?.approved) for (const p of settings.remoteDeleteReview?.paths || []) review.add(p);
-  for (const [p, error] of failures) if (needsPathReview(error)) review.add(p);
-  return { review, held };
-}
-function protectionKind(path, protection) {
-  return protection.review.has(path) ? "review" : protection.held.has(path) ? "held" : null;
-}
-function deferredRetryKey(key, protection) {
-  const m = /^(?:upload|download):(.+)$/.exec(key);
-  return !!m && !!protectionKind(m[1], protection);
-}
-function classifyQueues(rows = [], settings = {}, versions = [], protection = queueProtection(settings, rows.map((r2) => [r2.path, r2.error]))) {
-  const map2 = new Map(rows.map((r2) => [r2.path, { ...r2 }]));
-  for (const i of settings.pathSafety?.items || []) for (const e of i.op.entries) for (const p of e.to ? [e.from, e.to] : [e.from]) {
-    if (!map2.has(p)) map2.set(p, { path: p, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD" : "\u5F85\u786E\u8BA4" });
-    if (i.approved && i.error) map2.set(p, { ...map2.get(p), state: "\u5DF2\u6279\u51C6\u64CD\u4F5C\u5931\u8D25\uFF0C\u9700\u590D\u6838", error: i.error });
-  }
-  for (const p of protection.review) if (!map2.has(p)) map2.set(p, { path: p, state: "\u4FDD\u7559\u539F\u5185\u5BB9" });
-  const counts = { active: 0, review: 0, held: 0, failed: 0 }, versionCounts = { active: 0, review: 0, held: 0, failed: 0 };
-  for (const row of map2.values()) {
-    row.category = protectionKind(row.path, protection) || (row.error ? "failed" : "active");
-    counts[row.category]++;
-    if (row.category === "review" || row.category === "held") {
-      const reviewError = row.error;
-      delete row.error;
-      row.state = row.category === "review" ? needsPathReview(reviewError) ? "\u5F85\u590D\u6838\uFF1A\u5220\u9664\u4EE3\u6B21\u6216\u6E90\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u4FDD\u7559\u672C\u673A\u6B63\u6587\u53CA\u5F85\u4F20\u7248\u672C\uFF0C\u8BF7\u6253\u5F00\u9010\u6587\u4EF6\u6838\u9A8C" : "\u5F85\u786E\u8BA4\uFF1A\u5220\u9664\u6216\u91CD\u547D\u540D\u64CD\u4F5C\uFF0C\u672A\u81EA\u52A8\u4F20\u64AD" : "\u4FDD\u62A4\u6682\u7F13\uFF1A\u4FDD\u7559\u6B63\u6587\u3001\u7F13\u5B58\u53CA\u5F85\u4F20\u7248\u672C";
-    }
-  }
-  for (const v of versions) versionCounts[map2.get(v.path)?.category || protectionKind(v.path, protection) || "active"]++;
-  return { rows: [...map2.values()], counts, versionCounts, protection };
-}
-function queueStateText(view) {
-  return "\u5F85\u786E\u8BA4 " + view.counts.review + " \u8DEF\u5F84\uFF08" + view.versionCounts.review + "\u7248\u672C\uFF09 \xB7 \u4FDD\u62A4\u6682\u7F13 " + view.counts.held + " \u8DEF\u5F84\uFF08" + view.versionCounts.held + "\u7248\u672C\uFF09 \xB7 \u771F\u6B63\u5931\u8D25 " + view.counts.failed + " \u8DEF\u5F84 \xB7 \u53EF\u5904\u7406 " + view.counts.active + " \u8DEF\u5F84";
-}
-function queueTelemetry(view) {
-  return { activePaths: view.counts.active, awaitingPaths: view.counts.review, protectedPaths: view.counts.held, failedPaths: view.counts.failed, activeVersions: view.versionCounts.active, awaitingVersions: view.versionCounts.review, protectedVersions: view.versionCounts.held, failedVersions: view.versionCounts.failed };
-}
-
-var CAPACITY_CAPABILITY = "capacity-status-v1";
-var DEFAULT_CAPACITY = { liveBytes: 1024 * 1024 * 1024, diskBytes: 2 * 1024 * 1024 * 1024 };
-function capacityMetric(used, limit) {
-  if (!Number.isSafeInteger(used) || used < 0 || !Number.isSafeInteger(limit) || limit < 1) throw Error("Invalid capacity metric");
-  return { used, limit, level: used >= limit ? "full" : used >= limit * 0.8 ? "warning" : "normal" };
-}
-function validateCapacity(v) {
-  if (!v || !["active,disk,metadata,objects,paths", "active,cache,disk,metadata,objects,paths"].includes(Object.keys(v).sort().join(","))) throw Error("Invalid capacity report");
-  const out = {};
-  for (const key of ["active", "disk", "metadata", "objects", "paths", ...v.cache ? ["cache"] : []]) {
-    const m = v[key];
-    if (!m || Object.keys(m).sort().join(",") !== "level,limit,used") throw Error("Invalid capacity metric");
-    const clean = capacityMetric(m.used, m.limit);
-    if (clean.level !== m.level) throw Error("Capacity warning mismatch");
-    out[key] = clean;
-  }
-  return out;
-}
-function capacityText(v) {
-  if (!v) return "\u5BB9\u91CF\uFF1A\u670D\u52A1\u5668\u5C1A\u672A\u63D0\u4F9B\u5BB9\u91CF\u8BCA\u65AD";
-  const names = { active: "\u5E93\u5185\u5185\u5BB9", disk: "\u542B\u5386\u53F2\u5B58\u50A8", metadata: "\u540C\u6B65\u5143\u6570\u636E", objects: "\u5B58\u50A8\u5BF9\u8C61", paths: "\u6D3B\u52A8\u6587\u4EF6", cache: "\u672C\u673A\u7F13\u5B58\uFF08\u542B\u4FDD\u7559\u7248\u672C\uFF09" };
-  return Object.entries(validateCapacity(v)).map(([k, m]) => names[k] + " " + (["objects", "paths"].includes(k) ? m.used + "/" + m.limit : (m.used / 1048576).toFixed(1) + "/" + (m.limit / 1048576).toFixed(0) + " MiB") + (m.level === "full" ? "\uFF08\u5DF2\u6EE1\uFF09" : m.level === "warning" ? "\uFF08\u63A5\u8FD1\u4E0A\u9650\uFF09" : "")).join("\uFF1B");
-}
-function capacityUploadFits(v, item, current) {
-  return !!v && v.active.used + Math.max(0, item.size - (current?.size || 0)) <= v.active.limit && v.disk.used + item.size <= v.disk.limit && v.objects.used < v.objects.limit && (current || v.paths.used < v.paths.limit) && v.metadata.used + 4096 < v.metadata.limit;
-}
-function rearmCapacityRetries(ledger, pending, report, { current = () => null, blocked = () => false, now = Date.now() } = {}) {
-  let changed = 0;
-  for (const item of pending) {
-    const row = ledger.items.get("upload:" + item.path);
-    if (!row || row.code !== "quota" || row.retryable || blocked(item.path) || !capacityUploadFits(report, item, current(item.path))) continue;
-    row.retryable = true;
-    row.nextAt = now;
-    changed++;
-  }
-  return changed;
-}
-
-var DELETION_GENERATION_CAPABILITY = "deletion-generation-v1";
-function deletionGeneration(doc2, path) {
-  const map2 = doc2.getMap("deleted");
-  if (!map2.has(path)) return null;
-  const item = map2._map.get(path), id2 = item?.id;
-  if (!id2 || !Number.isSafeInteger(id2.client) || !Number.isSafeInteger(id2.clock)) throw Error("Deletion generation unavailable; preserve local file");
-  return `${id2.client}:${id2.clock}`;
-}
-function validDeletionGeneration(value) {
-  return typeof value === "string" && /^\d{1,16}:\d{1,16}$/.test(value);
-}
-
 var create = () => /* @__PURE__ */ new Map();
 var copy = (m) => {
   const r2 = create();
@@ -9160,97 +9013,6 @@ if (glo[importIdentifier] === true) {
 }
 glo[importIdentifier] = true;
 
-var SnapshotScheduler = class {
-  constructor({ capture, persist, delayMs = 0, lastState = "", onError = () => {
-  } }) {
-    Object.assign(this, { capture, persist, delayMs, lastState, onError });
-    this.dirty = false;
-    this.closed = false;
-    this.inFlight = false;
-    this.pending = void 0;
-    this.timer = null;
-    this.error = null;
-    this.job = Promise.resolve();
-  }
-  changed() {
-    if (!this.persist || this.closed) return;
-    this.dirty = true;
-    if (!this.inFlight && this.delayMs === 0) this.flush();
-    else this.arm();
-  }
-  arm() {
-    if (!this.persist || this.closed || this.inFlight || this.timer !== null) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.flush();
-    }, this.delayMs);
-  }
-  flush(force = false) {
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    if (!this.persist) return this.lastState;
-    if (!this.dirty && !force) return this.lastState;
-    const state = this.capture();
-    this.lastState = state;
-    this.dirty = false;
-    if (this.inFlight) this.pending = state;
-    else this.write(state);
-    return state;
-  }
-  write(state) {
-    let value;
-    try {
-      value = this.persist(state);
-    } catch (e) {
-      this.failed(e);
-      return;
-    }
-    if (value && typeof value.then === "function") {
-      this.inFlight = true;
-      this.job = Promise.resolve(value).then(() => this.finish(true), (e) => {
-        this.failed(e);
-        this.finish(false);
-      });
-    } else this.finish(true);
-  }
-  failed(e) {
-    this.error = e;
-    this.dirty = true;
-    this.onError(e);
-  }
-  finish(ok) {
-    this.inFlight = false;
-    if (ok) this.error = null;
-    if (this.pending !== void 0) {
-      const state = this.pending;
-      this.pending = void 0;
-      this.write(state);
-    } else if (ok && this.dirty && !this.closed) this.arm();
-  }
-  async wait() {
-    while (this.inFlight) await this.job;
-    return !this.error;
-  }
-  close() {
-    this.closed = true;
-    this.flush();
-    return this.wait();
-  }
-};
-
-var encode = (bytes) => {
-  const chunks = [];
-  for (let offset = 0; offset < bytes.length; offset += 8192) chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 8192)));
-  return btoa(chunks.join(""));
-};
-var decode = (value) => {
-  const binary = atob(value), bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-};
-
 var MAX_IMAGE = 5 * 1024 * 1024;
 var MAX_TEXT = 1024 * 1024;
 var MAX_TOTAL = 50 * 1024 * 1024;
@@ -9308,6 +9070,149 @@ function decodeTextPreview(bytes) {
   } catch {
     return null;
   }
+}
+
+var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
+var r = (v, n) => v >>> n | v << 32 - n;
+var Sha256 = class {
+  constructor() {
+    this.h = new Uint32Array([1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]);
+    this.block = new Uint8Array(64);
+    this.w = new Uint32Array(64);
+    this.used = 0;
+    this.length = 0;
+    this.done = false;
+  }
+  compress() {
+    const w = this.w, b = this.block;
+    for (let i = 0; i < 16; i++) w[i] = b[i * 4] << 24 | b[i * 4 + 1] << 16 | b[i * 4 + 2] << 8 | b[i * 4 + 3];
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15], y = w[i - 2];
+      w[i] = w[i - 16] + (r(x, 7) ^ r(x, 18) ^ x >>> 3) + w[i - 7] + (r(y, 17) ^ r(y, 19) ^ y >>> 10) >>> 0;
+    }
+    let [a, c, d, e, f, g, h, j] = this.h;
+    for (let i = 0; i < 64; i++) {
+      const t = j + (r(f, 6) ^ r(f, 11) ^ r(f, 25)) + (f & g ^ ~f & h) + K[i] + w[i] >>> 0, u = (r(a, 2) ^ r(a, 13) ^ r(a, 22)) + (a & c ^ a & d ^ c & d) >>> 0;
+      j = h;
+      h = g;
+      g = f;
+      f = e + t >>> 0;
+      e = d;
+      d = c;
+      c = a;
+      a = t + u >>> 0;
+    }
+    const v = [a, c, d, e, f, g, h, j];
+    for (let i = 0; i < 8; i++) this.h[i] = this.h[i] + v[i] >>> 0;
+  }
+  update(bytes) {
+    if (this.done) throw Error("Hash already finished");
+    this.length += bytes.byteLength;
+    for (let p = 0; p < bytes.length; ) {
+      const n = Math.min(64 - this.used, bytes.length - p);
+      this.block.set(bytes.subarray(p, p + n), this.used);
+      this.used += n;
+      p += n;
+      if (this.used === 64) {
+        this.compress();
+        this.used = 0;
+      }
+    }
+    return this;
+  }
+  hex() {
+    if (this.done) throw Error("Hash already finished");
+    const n = this.length;
+    this.update(new Uint8Array([128]));
+    while (this.used !== 56) this.update(new Uint8Array([0]));
+    const bits = n * 8, tail = new Uint8Array(8), v = new DataView(tail.buffer);
+    v.setUint32(0, Math.floor(bits / 4294967296));
+    v.setUint32(4, bits >>> 0);
+    this.update(tail);
+    this.done = true;
+    return Array.from(this.h, (v2) => v2.toString(16).padStart(8, "0")).join("");
+  }
+};
+var CHUNK_BYTES = 32 * 1024;
+async function hashSource(source, signal) {
+  const h = new Sha256();
+  for (let p = 0; p < source.size; p += CHUNK_BYTES) {
+    signal?.throwIfAborted();
+    const n = Math.min(CHUNK_BYTES, source.size - p), bytes = await source.read(p, n);
+    if (!(bytes instanceof Uint8Array) || bytes.length !== n) throw Error("Source changed or short read");
+    h.update(bytes);
+  }
+  return h.hex();
+}
+
+var byteDigest = (bytes) => new Sha256().update(bytes).hex();
+var referenceDigest = (item) => item?.kind === "text" ? byteDigest(new TextEncoder().encode(item.data)) : item?.hash;
+function connectionIdentity({ vaultName, basePath, url, serverId, deviceId, deviceName }) {
+  let endpoint = "\u672A\u914D\u7F6E";
+  try {
+    const u = new URL(url);
+    if (["ws:", "wss:"].includes(u.protocol)) {
+      u.username = "";
+      u.password = "";
+      u.search = "";
+      u.hash = "";
+      endpoint = u.toString();
+    }
+  } catch {
+  }
+  return { vaultName, localPath: basePath || "\u7CFB\u7EDF\u672A\u63D0\u4F9B\u5B8C\u6574\u8DEF\u5F84\uFF0C\u8BF7\u5728 Obsidian \u4ED3\u5E93\u7BA1\u7406\u4E2D\u6838\u5BF9", endpoint, serverId: serverId || "\u5C1A\u672A\u6838\u5B9E", deviceId: deviceId || "\u5C1A\u672A\u5206\u914D", deviceName: deviceName || "\u672A\u547D\u540D\u8BBE\u5907" };
+}
+async function auditFiles({ files, remote, read, queued = (
+  /** @type {string[]} */
+  []
+), maxPaths = 8192, shouldContinue = () => true }) {
+  const local = new Map(files.map((f) => [f.path, f])), paths = [.../* @__PURE__ */ new Set([...local.keys(), ...Object.keys(remote)])].sort();
+  if (paths.length > maxPaths) throw Error("Audit path capacity exceeded");
+  const pending = new Set(queued), rows = [];
+  for (const path of paths) {
+    if (!shouldContinue()) throw Error("Audit interrupted; files preserved");
+    if (rows.length % 8 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    const f = local.get(path), r2 = remote[path];
+    let row = { path, status: "equal", localHash: null, remoteHash: r2 ? referenceDigest(r2) : null };
+    if (!supportedFile(path) || f && f.size > maxFileSize(path)) {
+      row.status = "excluded";
+      rows.push(row);
+      continue;
+    }
+    try {
+      if (f) {
+        const bytes = new Uint8Array(await read(path));
+        if (bytes.length > maxFileSize(path)) throw Error("File grew beyond limit");
+        row.localHash = byteDigest(bytes);
+        row.status = r2 ? row.localHash === row.remoteHash ? "equal" : "different" : "local-only";
+      } else row.status = "missing";
+    } catch {
+      row.status = "read-error";
+    }
+    if (pending.has("*") || pending.has(path)) row.status = "queued";
+    rows.push(row);
+  }
+  const counts = { equal: 0, missing: 0, different: 0, "local-only": 0, queued: 0, excluded: 0, "read-error": 0 };
+  for (const r2 of rows) counts[r2.status]++;
+  return { counts, rows, automaticWrites: 0 };
+}
+function assertRepairSnapshot(row, { localHash, remoteHash, queued = false, stable = true }) {
+  if (!stable || !["missing", "different"].includes(row.status) || queued || localHash !== row.localHash || remoteHash !== row.remoteHash) throw Error("\u6587\u4EF6\u6216\u540C\u6B65\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6838\u9A8C\uFF1B\u672A\u66FF\u6362\u6587\u4EF6");
+}
+var SAFE_PUBLISH_CAPABILITY = "publish-absent-only-v1";
+function safeConsistencyPlan(report, { deleted = (
+  /** @type {string[]} */
+  []
+), conflicts = (
+  /** @type {string[]} */
+  []
+), seen = (
+  /** @type {string[]} */
+  []
+) } = {}) {
+  if (!report.stable) return [];
+  const blocked = /* @__PURE__ */ new Set([...deleted, ...conflicts]), prior = new Set(seen);
+  return report.rows.filter((r2) => !blocked.has(r2.path) && ["missing", "local-only"].includes(r2.status) && (r2.status !== "missing" || seen.length < 8192 && !prior.has(byteDigest(new TextEncoder().encode(r2.path))))).map((r2) => ({ path: r2.path, action: r2.status === "missing" ? "download-missing" : "upload-absent", row: r2 }));
 }
 
 var markdown = (p) => /\.md$/i.test(p);
@@ -9406,6 +9311,315 @@ function validate(doc2, hasBlob, { liveBytes = MAX_LIVE_BYTES } = {}) {
   if (encodeStateAsUpdate(doc2).length > MAX_STATE) throw Error("V3 metadata capacity exceeds 8 MiB; local content and pending versions retained");
   return total;
 }
+
+var DELETION_GENERATION_CAPABILITY = "deletion-generation-v1";
+function deletionGeneration(doc2, path) {
+  const map2 = doc2.getMap("deleted");
+  if (!map2.has(path)) return null;
+  const item = map2._map.get(path), id2 = item?.id;
+  if (!id2 || !Number.isSafeInteger(id2.client) || !Number.isSafeInteger(id2.clock)) throw Error("Deletion generation unavailable; preserve local file");
+  return `${id2.client}:${id2.clock}`;
+}
+function validDeletionGeneration(value) {
+  return typeof value === "string" && /^\d{1,16}:\d{1,16}$/.test(value);
+}
+
+var PROTECTED_REVIEW_CAPABILITY = "protected-review-nas-v1";
+var reviewId = (x) => typeof x === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(x);
+function reviewManifest(v) {
+  if (!v || Object.keys(v).sort().join(",") !== "deviceId,files,jobId,protocol,serverId" || v.protocol !== 1 || ![v.serverId, v.deviceId, v.jobId].every(reviewId) || !Array.isArray(v.files) || !v.files.length || v.files.length > 6e3) throw Error("Invalid protected review manifest");
+  let total = 0;
+  const paths = /* @__PURE__ */ new Set(), files = v.files.map((f) => {
+    if (!f || Object.keys(f).sort().join(",") !== "hash,path,size" || !supportedFile(f.path) || !Number.isSafeInteger(f.size) || f.size < 0 || f.size > maxFileSize(f.path) || !/^[a-f0-9]{64}$/.test(f.hash) || paths.has(f.path.toLowerCase())) throw Error("Invalid protected review file");
+    paths.add(f.path.toLowerCase());
+    total += f.size;
+    return { path: f.path, hash: f.hash, size: f.size };
+  }).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  if (new TextEncoder().encode(JSON.stringify(files)).length > 2 * 1024 * 1024) throw Error("Protected review manifest exceeds 2 MiB");
+  if (total > 1024 * 1024 * 1024) throw Error("Protected review snapshot exceeds 1 GiB");
+  return { protocol: 1, serverId: v.serverId, deviceId: v.deviceId, jobId: v.jobId, files };
+}
+var reviewDigest = (m) => byteDigest(new TextEncoder().encode(JSON.stringify(reviewManifest(m))));
+async function collectProtectedReview({ paths, identity, read, blocked = (_path) => false, shouldContinue = () => true }) {
+  const files = [];
+  for (const path of [...new Set(paths)].sort()) {
+    if (!shouldContinue()) throw Error("Protected review interrupted; originals retained");
+    if (blocked(path)) throw Error("Protected path has pending edits; originals retained");
+    const bytes = new Uint8Array(await read(path));
+    if (blocked(path)) throw Error("Protected path changed; originals retained");
+    files.push({ path, hash: byteDigest(bytes), size: bytes.length });
+  }
+  return reviewManifest({ ...identity, protocol: 1, files });
+}
+async function exportProtectedReview({ manifest, request, upload, read, shouldContinue = () => true }) {
+  manifest = reviewManifest(manifest);
+  const prepared = await request("protected-review-prepare", { manifest });
+  if (prepared.digest !== reviewDigest(manifest) || !Array.isArray(prepared.missing)) throw Error("Protected review snapshot mismatch");
+  const hashes = new Map(manifest.files.map((f) => [f.hash, f]));
+  for (const hash of prepared.missing) {
+    if (!shouldContinue()) throw Error("Protected review interrupted; originals retained");
+    const file = hashes.get(hash);
+    if (!file) throw Error("Unexpected protected review payload");
+    const bytes = new Uint8Array(await read(file.path));
+    if (byteDigest(bytes) !== hash || bytes.length !== file.size) throw Error("Protected file changed; originals retained");
+    const ref = await upload({ size: bytes.length, read: async (o, n) => bytes.subarray(o, o + n) });
+    if (ref.hash !== hash || ref.size !== bytes.length) throw Error("Protected review upload mismatch");
+  }
+  return request("protected-review-seal", { jobId: manifest.jobId, deviceId: manifest.deviceId });
+}
+async function cleanProtectedReview({ manifest, plan, read, blocked, check, trash, release }) {
+  manifest = reviewManifest(manifest);
+  if (plan.digest !== reviewDigest(manifest) || !plan.nasVerified || !Array.isArray(plan.duplicates)) throw Error("Verified NAS backup required");
+  const files = new Map(manifest.files.map((f) => [f.path, f])), seen = /* @__PURE__ */ new Set();
+  for (const r2 of plan.duplicates) {
+    const f = files.get(r2.path);
+    if (!f || f.hash !== r2.hash || f.size !== r2.size || seen.has(r2.path) || typeof r2.generation !== "string" || typeof r2.historyId !== "string") throw Error("Invalid cleanup snapshot");
+    seen.add(r2.path);
+  }
+  const removed = [], retained = [];
+  for (const row of plan.duplicates) {
+    try {
+      if (blocked(row.path)) throw Error("Path has pending changes");
+      let bytes = new Uint8Array(await read(row.path));
+      if (byteDigest(bytes) !== row.hash || bytes.length !== row.size) throw Error("Local content changed");
+      if (await check(row) !== true) throw Error("Remote review not confirmed");
+      bytes = new Uint8Array(await read(row.path));
+      if (blocked(row.path) || byteDigest(bytes) !== row.hash || bytes.length !== row.size) throw Error("Local content changed");
+      await trash(row.path, row.hash);
+      await release(row.path);
+      removed.push(row.path);
+    } catch {
+      retained.push(row.path);
+    }
+  }
+  return { removed, retained, unique: manifest.files.filter((f) => !seen.has(f.path)).map((f) => f.path) };
+}
+
+var CONNECTION_TIMINGS_CAPABILITY = "connection-timings-v1";
+var phases = ["connecting", "metadata", "identity", "apply", "prepare", "ready", "closed"];
+var bound = (n) => Math.min(6048e5, Math.max(0, Math.round(n)));
+var ConnectionTimings = class {
+  constructor({ now = () => performance.now() } = {}) {
+    this.now = now;
+    this.attempt = 0;
+  }
+  begin() {
+    this.attempt = Math.min(1e5, this.attempt + 1);
+    this.started = this.phaseAt = this.now();
+    this.phase = "connecting";
+    this.mode = "unknown";
+    this.times = { connecting: 0, metadata: 0, identity: 0, apply: 0, prepare: 0 };
+    this.readyAt = null;
+    this.ended = null;
+    this.confirmMs = null;
+    this.localMs = null;
+    this.vectorBytes = this.welcomeBytes = this.updateBytes = 0;
+  }
+  enter(phase) {
+    if (!phases.includes(phase) || !this.phase) return;
+    const now = this.now();
+    if (Object.hasOwn(this.times, this.phase)) this.times[this.phase] = bound(this.times[this.phase] + now - this.phaseAt);
+    this.phase = phase;
+    this.phaseAt = now;
+    if (phase === "ready") {
+      this.readyAt = now;
+      this.ended = now;
+    }
+    if (phase === "closed" && this.ended === null) this.ended = now;
+  }
+  confirmed() {
+    if (this.readyAt !== null && this.confirmMs === null) this.confirmMs = bound(this.now() - this.readyAt);
+  }
+  localReady() {
+    if (this.readyAt !== null && this.localMs === null) this.localMs = bound(this.now() - this.readyAt);
+  }
+  snapshot() {
+    if (!this.phase) return null;
+    const t = { ...this.times };
+    if (Object.hasOwn(t, this.phase)) t[this.phase] = bound(t[this.phase] + this.now() - this.phaseAt);
+    return { attempt: this.attempt, phase: this.phase, mode: this.mode, totalMs: bound((this.ended ?? this.now()) - this.started), connectMs: t.connecting, metadataMs: t.metadata, identityMs: t.identity, applyMs: t.apply, prepareMs: t.prepare, confirmMs: this.confirmMs, localMs: this.localMs, vectorBytes: this.vectorBytes, welcomeBytes: this.welcomeBytes, updateBytes: this.updateBytes };
+  }
+};
+function connectionTimingText(v) {
+  if (!v) return "\u8FDE\u63A5\u5206\u9636\u6BB5\u8BA1\u65F6\uFF1A\u5C1A\u672A\u5F00\u59CB";
+  const modes = { unknown: "\u5C1A\u672A\u534F\u5546", full: "\u5168\u91CF\u63E1\u624B", delta: "\u589E\u91CF\u63E1\u624B" }, stage = { connecting: "\u5EFA\u7ACB\u8FDE\u63A5", metadata: "\u63A5\u6536\u5143\u6570\u636E", identity: "\u4FDD\u5B58\u8EAB\u4EFD", apply: "\u5408\u5E76\u5143\u6570\u636E", prepare: "\u51C6\u5907\u8865\u4F20", ready: "\u5DF2\u8FDE\u63A5", closed: "\u5DF2\u65AD\u5F00" };
+  return modes[v.mode] + " \xB7 " + stage[v.phase] + "\uFF1B\u5EFA\u8FDE " + v.connectMs + "ms \xB7 \u63A5\u6536 " + v.metadataMs + "ms \xB7 \u8EAB\u4EFD\u4FDD\u5B58 " + v.identityMs + "ms \xB7 \u5408\u5E76 " + v.applyMs + "ms \xB7 \u51C6\u5907 " + v.prepareMs + "ms \xB7 \u5C31\u7EEA\u5171 " + v.totalMs + "ms\uFF1B\u9996\u786E\u8BA4 " + (v.confirmMs === null ? "\u5F85\u786E\u8BA4" : v.confirmMs + "ms") + " \xB7 \u672C\u673A\u51C6\u5907 " + (v.localMs === null ? "\u5F85\u5B8C\u6210" : v.localMs + "ms") + "\uFF1B\u5411\u91CF " + v.vectorBytes + " B \xB7 \u63E1\u624B\u6D88\u606F " + v.welcomeBytes + " B \xB7 \u5143\u6570\u636E " + v.updateBytes + " B\u3002\u63A5\u6536\u8017\u65F6\u5305\u542B\u670D\u52A1\u7AEF\u5904\u7406\u4E0E\u7F51\u7EDC\u7B49\u5F85\uFF1B\u9996\u786E\u8BA4\u3001\u672C\u673A\u51C6\u5907\u4ECE\u534F\u8BAE\u5C31\u7EEA\u5F00\u59CB\u5355\u72EC\u8BA1\u65F6\u3002";
+}
+
+var QUEUE_STATE_CAPABILITY = "queue-state-v1";
+var needsPathReview = (error) => /^(?:Error: )?(?:Deletion generation changed; preserve local file and review|Source changed; protected operation requires review|路径计划已变化，请重新审核|path-review)$/.test(String(error?.message || error || ""));
+function queueProtection(settings = {}, failures = []) {
+  const review = /* @__PURE__ */ new Set(), held = new Set(settings.consistencyHolds || []);
+  for (const item of settings.pathSafety?.items || []) if (!item.approved || needsPathReview(item.error)) for (const e of item.op.entries) {
+    review.add(e.from);
+    if (e.to) review.add(e.to);
+  }
+  if (!settings.remoteDeleteReview?.approved) for (const p of settings.remoteDeleteReview?.paths || []) review.add(p);
+  for (const [p, error] of failures) if (needsPathReview(error)) review.add(p);
+  return { review, held };
+}
+function protectionKind(path, protection) {
+  return protection.review.has(path) ? "review" : protection.held.has(path) ? "held" : null;
+}
+function deferredRetryKey(key, protection) {
+  const m = /^(?:upload|download):(.+)$/.exec(key);
+  return !!m && !!protectionKind(m[1], protection);
+}
+function classifyQueues(rows = [], settings = {}, versions = [], protection = queueProtection(settings, rows.map((r2) => [r2.path, r2.error]))) {
+  const map2 = new Map(rows.map((r2) => [r2.path, { ...r2 }]));
+  for (const i of settings.pathSafety?.items || []) for (const e of i.op.entries) for (const p of e.to ? [e.from, e.to] : [e.from]) {
+    if (!map2.has(p)) map2.set(p, { path: p, state: i.approved ? "\u5DF2\u6279\u51C6\uFF0C\u7B49\u5F85\u4F20\u64AD" : "\u5F85\u786E\u8BA4" });
+    if (i.approved && i.error) map2.set(p, { ...map2.get(p), state: "\u5DF2\u6279\u51C6\u64CD\u4F5C\u5931\u8D25\uFF0C\u9700\u590D\u6838", error: i.error });
+  }
+  for (const p of protection.review) if (!map2.has(p)) map2.set(p, { path: p, state: "\u4FDD\u7559\u539F\u5185\u5BB9" });
+  const counts = { active: 0, review: 0, held: 0, failed: 0 }, versionCounts = { active: 0, review: 0, held: 0, failed: 0 };
+  for (const row of map2.values()) {
+    row.category = protectionKind(row.path, protection) || (row.error ? "failed" : "active");
+    counts[row.category]++;
+    if (row.category === "review" || row.category === "held") {
+      const reviewError = row.error;
+      delete row.error;
+      row.state = row.category === "review" ? needsPathReview(reviewError) ? "\u5F85\u590D\u6838\uFF1A\u5220\u9664\u4EE3\u6B21\u6216\u6E90\u7248\u672C\u5DF2\u53D8\u5316\uFF0C\u4FDD\u7559\u672C\u673A\u6B63\u6587\u53CA\u5F85\u4F20\u7248\u672C\uFF0C\u8BF7\u6253\u5F00\u9010\u6587\u4EF6\u6838\u9A8C" : "\u5F85\u786E\u8BA4\uFF1A\u5220\u9664\u6216\u91CD\u547D\u540D\u64CD\u4F5C\uFF0C\u672A\u81EA\u52A8\u4F20\u64AD" : "\u4FDD\u62A4\u6682\u7F13\uFF1A\u4FDD\u7559\u6B63\u6587\u3001\u7F13\u5B58\u53CA\u5F85\u4F20\u7248\u672C";
+    }
+  }
+  for (const v of versions) versionCounts[map2.get(v.path)?.category || protectionKind(v.path, protection) || "active"]++;
+  return { rows: [...map2.values()], counts, versionCounts, protection };
+}
+function queueStateText(view) {
+  return "\u5F85\u786E\u8BA4 " + view.counts.review + " \u8DEF\u5F84\uFF08" + view.versionCounts.review + "\u7248\u672C\uFF09 \xB7 \u4FDD\u62A4\u6682\u7F13 " + view.counts.held + " \u8DEF\u5F84\uFF08" + view.versionCounts.held + "\u7248\u672C\uFF09 \xB7 \u771F\u6B63\u5931\u8D25 " + view.counts.failed + " \u8DEF\u5F84 \xB7 \u53EF\u5904\u7406 " + view.counts.active + " \u8DEF\u5F84";
+}
+function queueTelemetry(view) {
+  return { activePaths: view.counts.active, awaitingPaths: view.counts.review, protectedPaths: view.counts.held, failedPaths: view.counts.failed, activeVersions: view.versionCounts.active, awaitingVersions: view.versionCounts.review, protectedVersions: view.versionCounts.held, failedVersions: view.versionCounts.failed };
+}
+
+var CAPACITY_CAPABILITY = "capacity-status-v1";
+var DEFAULT_CAPACITY = { liveBytes: 1024 * 1024 * 1024, diskBytes: 2 * 1024 * 1024 * 1024 };
+function capacityMetric(used, limit) {
+  if (!Number.isSafeInteger(used) || used < 0 || !Number.isSafeInteger(limit) || limit < 1) throw Error("Invalid capacity metric");
+  return { used, limit, level: used >= limit ? "full" : used >= limit * 0.8 ? "warning" : "normal" };
+}
+function validateCapacity(v) {
+  if (!v || !["active,disk,metadata,objects,paths", "active,cache,disk,metadata,objects,paths"].includes(Object.keys(v).sort().join(","))) throw Error("Invalid capacity report");
+  const out = {};
+  for (const key of ["active", "disk", "metadata", "objects", "paths", ...v.cache ? ["cache"] : []]) {
+    const m = v[key];
+    if (!m || Object.keys(m).sort().join(",") !== "level,limit,used") throw Error("Invalid capacity metric");
+    const clean = capacityMetric(m.used, m.limit);
+    if (clean.level !== m.level) throw Error("Capacity warning mismatch");
+    out[key] = clean;
+  }
+  return out;
+}
+function capacityText(v) {
+  if (!v) return "\u5BB9\u91CF\uFF1A\u670D\u52A1\u5668\u5C1A\u672A\u63D0\u4F9B\u5BB9\u91CF\u8BCA\u65AD";
+  const names = { active: "\u5E93\u5185\u5185\u5BB9", disk: "\u542B\u5386\u53F2\u5B58\u50A8", metadata: "\u540C\u6B65\u5143\u6570\u636E", objects: "\u5B58\u50A8\u5BF9\u8C61", paths: "\u6D3B\u52A8\u6587\u4EF6", cache: "\u672C\u673A\u7F13\u5B58\uFF08\u542B\u4FDD\u7559\u7248\u672C\uFF09" };
+  return Object.entries(validateCapacity(v)).map(([k, m]) => names[k] + " " + (["objects", "paths"].includes(k) ? m.used + "/" + m.limit : (m.used / 1048576).toFixed(1) + "/" + (m.limit / 1048576).toFixed(0) + " MiB") + (m.level === "full" ? "\uFF08\u5DF2\u6EE1\uFF09" : m.level === "warning" ? "\uFF08\u63A5\u8FD1\u4E0A\u9650\uFF09" : "")).join("\uFF1B");
+}
+function capacityUploadFits(v, item, current) {
+  return !!v && v.active.used + Math.max(0, item.size - (current?.size || 0)) <= v.active.limit && v.disk.used + item.size <= v.disk.limit && v.objects.used < v.objects.limit && (current || v.paths.used < v.paths.limit) && v.metadata.used + 4096 < v.metadata.limit;
+}
+function rearmCapacityRetries(ledger, pending, report, { current = () => null, blocked = () => false, now = Date.now() } = {}) {
+  let changed = 0;
+  for (const item of pending) {
+    const row = ledger.items.get("upload:" + item.path);
+    if (!row || row.code !== "quota" || row.retryable || blocked(item.path) || !capacityUploadFits(report, item, current(item.path))) continue;
+    row.retryable = true;
+    row.nextAt = now;
+    changed++;
+  }
+  return changed;
+}
+
+var SnapshotScheduler = class {
+  constructor({ capture, persist, delayMs = 0, lastState = "", onError = () => {
+  } }) {
+    Object.assign(this, { capture, persist, delayMs, lastState, onError });
+    this.dirty = false;
+    this.closed = false;
+    this.inFlight = false;
+    this.pending = void 0;
+    this.timer = null;
+    this.error = null;
+    this.job = Promise.resolve();
+  }
+  changed() {
+    if (!this.persist || this.closed) return;
+    this.dirty = true;
+    if (!this.inFlight && this.delayMs === 0) this.flush();
+    else this.arm();
+  }
+  arm() {
+    if (!this.persist || this.closed || this.inFlight || this.timer !== null) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flush();
+    }, this.delayMs);
+  }
+  flush(force = false) {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (!this.persist) return this.lastState;
+    if (!this.dirty && !force) return this.lastState;
+    const state = this.capture();
+    this.lastState = state;
+    this.dirty = false;
+    if (this.inFlight) this.pending = state;
+    else this.write(state);
+    return state;
+  }
+  write(state) {
+    let value;
+    try {
+      value = this.persist(state);
+    } catch (e) {
+      this.failed(e);
+      return;
+    }
+    if (value && typeof value.then === "function") {
+      this.inFlight = true;
+      this.job = Promise.resolve(value).then(() => this.finish(true), (e) => {
+        this.failed(e);
+        this.finish(false);
+      });
+    } else this.finish(true);
+  }
+  failed(e) {
+    this.error = e;
+    this.dirty = true;
+    this.onError(e);
+  }
+  finish(ok) {
+    this.inFlight = false;
+    if (ok) this.error = null;
+    if (this.pending !== void 0) {
+      const state = this.pending;
+      this.pending = void 0;
+      this.write(state);
+    } else if (ok && this.dirty && !this.closed) this.arm();
+  }
+  async wait() {
+    while (this.inFlight) await this.job;
+    return !this.error;
+  }
+  close() {
+    this.closed = true;
+    this.flush();
+    return this.wait();
+  }
+};
+
+var encode = (bytes) => {
+  const chunks = [];
+  for (let offset = 0; offset < bytes.length; offset += 8192) chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 8192)));
+  return btoa(chunks.join(""));
+};
+var decode = (value) => {
+  const binary = atob(value), bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+};
 
 function newlyReceivedPaths(previous, next, isMissing) {
   const before = new Doc(), after = new Doc();
@@ -9618,152 +9832,9 @@ function syncSections(options = {}) {
   }
   let auditText = "\u5C1A\u672A\u6838\u5BF9";
   if (audit) {
-    auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672A\u8865\u9F50 " + (audit.counts.missing + audit.counts["local-only"]) + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
+    auditText = (audit.enabled ? "\u81EA\u52A8\u6838\u5BF9\u5DF2\u5F00\u542F" : "\u81EA\u52A8\u6838\u5BF9\u672A\u5F00\u542F") + " \xB7 " + (audit.phase === "running" ? "\u6B63\u5728\u6838\u5BF9" : !audit.checkedAt ? "\u5C1A\u65E0\u672C\u8F6E\u7ED3\u679C" : !ready ? "\u4E0A\u6B21\u6838\u5BF9\u7ED3\u679C \xB7 \u79BB\u7EBF\uFF0C\u5F85\u91CD\u8FDE\u590D\u6838" : !audit.current ? "\u4E0A\u6B21\u7ED3\u679C\u5DF2\u8FC7\u671F\uFF0C\u5F85\u91CD\u65B0\u6838\u5BF9" : "\u6700\u8FD1\u6838\u5BF9\uFF1A\u4E00\u81F4 " + audit.counts.equal + " \xB7 \u5DEE\u5F02 " + audit.counts.different + " \xB7 \u672C\u673A\u7F3A\u5931 " + audit.counts.missing + " \xB7 \u672C\u673A\u5F85\u6838\u5BF9 " + audit.counts["local-only"] + " \xB7 \u8865\u6536 " + audit.counts.downloaded + " \xB7 \u8865\u4F20 " + audit.counts.uploaded + " \xB7 \u6682\u7F13 " + audit.counts.refused);
   }
   return [{ title: "\u8FDE\u63A5", text: ready ? "\u5DF2\u8FDE\u63A5" + (error ? " \xB7 \u6709\u5F02\u5E38\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u539F\u56E0" : "") : connecting ? connectionPhase === "metadata" ? "\u6B63\u5728\u63A5\u6536\u540C\u6B65\u5143\u6570\u636E \xB7 \u6162\u7F51\u6700\u957F\u7B49\u5F853\u5206\u949F" : connectionPhase === "identity" ? "\u5143\u6570\u636E\u5DF2\u63A5\u6536 \xB7 \u6B63\u5728\u4FDD\u5B58\u8EAB\u4EFD" : connectionPhase === "apply" ? "\u6B63\u5728\u5408\u5E76\u540C\u6B65\u5143\u6570\u636E" : connectionPhase === "prepare" ? "\u5143\u6570\u636E\u5DF2\u63A5\u6536 \xB7 \u6B63\u5728\u6821\u9A8C\u5E76\u51C6\u5907\u8865\u4F20" : "\u6B63\u5728\u8FDE\u63A5\u6216\u91CD\u8FDE" : "\u5DF2\u65AD\u5F00 \xB7 \u8FDB\u5EA6\u9700\u91CD\u65B0\u786E\u8BA4", tone: error ? "error" : ready ? "ok" : "muted" }, { title: "\u6587\u4EF6\u4F20\u8F93", text: transfer, tone: progress?.retry ? "error" : "muted" }, { title: "\u5185\u5BB9\u6838\u5BF9", text: auditText, tone: audit?.current && (audit.counts.different || audit.counts.missing || audit.counts["local-only"] || audit.counts["read-error"]) ? "warning" : "muted" }, { title: "\u5F85\u786E\u8BA4\u4E8B\u9879", text: "\u51B2\u7A81 " + conflicts + " \xB7 \u672C\u673A\u8DEF\u5F84\u64CD\u4F5C " + operations + " \u7EC4 \xB7 \u8FDC\u7AEF\u5220\u9664 " + remoteDeletes + " \u9879 \xB7 \u4E00\u81F4\u6027\u4FDD\u62A4 " + holds + " \u6761", tone: conflicts || operations || remoteDeletes || holds ? "warning" : "muted" }];
-}
-
-var K = new Uint32Array([1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]);
-var r = (v, n) => v >>> n | v << 32 - n;
-var Sha256 = class {
-  constructor() {
-    this.h = new Uint32Array([1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]);
-    this.block = new Uint8Array(64);
-    this.w = new Uint32Array(64);
-    this.used = 0;
-    this.length = 0;
-    this.done = false;
-  }
-  compress() {
-    const w = this.w, b = this.block;
-    for (let i = 0; i < 16; i++) w[i] = b[i * 4] << 24 | b[i * 4 + 1] << 16 | b[i * 4 + 2] << 8 | b[i * 4 + 3];
-    for (let i = 16; i < 64; i++) {
-      const x = w[i - 15], y = w[i - 2];
-      w[i] = w[i - 16] + (r(x, 7) ^ r(x, 18) ^ x >>> 3) + w[i - 7] + (r(y, 17) ^ r(y, 19) ^ y >>> 10) >>> 0;
-    }
-    let [a, c, d, e, f, g, h, j] = this.h;
-    for (let i = 0; i < 64; i++) {
-      const t = j + (r(f, 6) ^ r(f, 11) ^ r(f, 25)) + (f & g ^ ~f & h) + K[i] + w[i] >>> 0, u = (r(a, 2) ^ r(a, 13) ^ r(a, 22)) + (a & c ^ a & d ^ c & d) >>> 0;
-      j = h;
-      h = g;
-      g = f;
-      f = e + t >>> 0;
-      e = d;
-      d = c;
-      c = a;
-      a = t + u >>> 0;
-    }
-    const v = [a, c, d, e, f, g, h, j];
-    for (let i = 0; i < 8; i++) this.h[i] = this.h[i] + v[i] >>> 0;
-  }
-  update(bytes) {
-    if (this.done) throw Error("Hash already finished");
-    this.length += bytes.byteLength;
-    for (let p = 0; p < bytes.length; ) {
-      const n = Math.min(64 - this.used, bytes.length - p);
-      this.block.set(bytes.subarray(p, p + n), this.used);
-      this.used += n;
-      p += n;
-      if (this.used === 64) {
-        this.compress();
-        this.used = 0;
-      }
-    }
-    return this;
-  }
-  hex() {
-    if (this.done) throw Error("Hash already finished");
-    const n = this.length;
-    this.update(new Uint8Array([128]));
-    while (this.used !== 56) this.update(new Uint8Array([0]));
-    const bits = n * 8, tail = new Uint8Array(8), v = new DataView(tail.buffer);
-    v.setUint32(0, Math.floor(bits / 4294967296));
-    v.setUint32(4, bits >>> 0);
-    this.update(tail);
-    this.done = true;
-    return Array.from(this.h, (v2) => v2.toString(16).padStart(8, "0")).join("");
-  }
-};
-var CHUNK_BYTES = 32 * 1024;
-async function hashSource(source, signal) {
-  const h = new Sha256();
-  for (let p = 0; p < source.size; p += CHUNK_BYTES) {
-    signal?.throwIfAborted();
-    const n = Math.min(CHUNK_BYTES, source.size - p), bytes = await source.read(p, n);
-    if (!(bytes instanceof Uint8Array) || bytes.length !== n) throw Error("Source changed or short read");
-    h.update(bytes);
-  }
-  return h.hex();
-}
-
-var byteDigest = (bytes) => new Sha256().update(bytes).hex();
-var referenceDigest = (item) => item?.kind === "text" ? byteDigest(new TextEncoder().encode(item.data)) : item?.hash;
-function connectionIdentity({ vaultName, basePath, url, serverId, deviceId, deviceName }) {
-  let endpoint = "\u672A\u914D\u7F6E";
-  try {
-    const u = new URL(url);
-    if (["ws:", "wss:"].includes(u.protocol)) {
-      u.username = "";
-      u.password = "";
-      u.search = "";
-      u.hash = "";
-      endpoint = u.toString();
-    }
-  } catch {
-  }
-  return { vaultName, localPath: basePath || "\u7CFB\u7EDF\u672A\u63D0\u4F9B\u5B8C\u6574\u8DEF\u5F84\uFF0C\u8BF7\u5728 Obsidian \u4ED3\u5E93\u7BA1\u7406\u4E2D\u6838\u5BF9", endpoint, serverId: serverId || "\u5C1A\u672A\u6838\u5B9E", deviceId: deviceId || "\u5C1A\u672A\u5206\u914D", deviceName: deviceName || "\u672A\u547D\u540D\u8BBE\u5907" };
-}
-async function auditFiles({ files, remote, read, queued = (
-  /** @type {string[]} */
-  []
-), maxPaths = 8192, shouldContinue = () => true }) {
-  const local = new Map(files.map((f) => [f.path, f])), paths = [.../* @__PURE__ */ new Set([...local.keys(), ...Object.keys(remote)])].sort();
-  if (paths.length > maxPaths) throw Error("Audit path capacity exceeded");
-  const pending = new Set(queued), rows = [];
-  for (const path of paths) {
-    if (!shouldContinue()) throw Error("Audit interrupted; files preserved");
-    if (rows.length % 8 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
-    const f = local.get(path), r2 = remote[path];
-    let row = { path, status: "equal", localHash: null, remoteHash: r2 ? referenceDigest(r2) : null };
-    if (!supportedFile(path) || f && f.size > maxFileSize(path)) {
-      row.status = "excluded";
-      rows.push(row);
-      continue;
-    }
-    try {
-      if (f) {
-        const bytes = new Uint8Array(await read(path));
-        if (bytes.length > maxFileSize(path)) throw Error("File grew beyond limit");
-        row.localHash = byteDigest(bytes);
-        row.status = r2 ? row.localHash === row.remoteHash ? "equal" : "different" : "local-only";
-      } else row.status = "missing";
-    } catch {
-      row.status = "read-error";
-    }
-    if (pending.has("*") || pending.has(path)) row.status = "queued";
-    rows.push(row);
-  }
-  const counts = { equal: 0, missing: 0, different: 0, "local-only": 0, queued: 0, excluded: 0, "read-error": 0 };
-  for (const r2 of rows) counts[r2.status]++;
-  return { counts, rows, automaticWrites: 0 };
-}
-function assertRepairSnapshot(row, { localHash, remoteHash, queued = false, stable = true }) {
-  if (!stable || !["missing", "different"].includes(row.status) || queued || localHash !== row.localHash || remoteHash !== row.remoteHash) throw Error("\u6587\u4EF6\u6216\u540C\u6B65\u72B6\u6001\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u6838\u9A8C\uFF1B\u672A\u66FF\u6362\u6587\u4EF6");
-}
-var SAFE_PUBLISH_CAPABILITY = "publish-absent-only-v1";
-function safeConsistencyPlan(report, { deleted = (
-  /** @type {string[]} */
-  []
-), conflicts = (
-  /** @type {string[]} */
-  []
-), seen = (
-  /** @type {string[]} */
-  []
-) } = {}) {
-  if (!report.stable) return [];
-  const blocked = /* @__PURE__ */ new Set([...deleted, ...conflicts]), prior = new Set(seen);
-  return report.rows.filter((r2) => !blocked.has(r2.path) && ["missing", "local-only"].includes(r2.status) && (r2.status !== "missing" || seen.length < 8192 && !prior.has(byteDigest(new TextEncoder().encode(r2.path))))).map((r2) => ({ path: r2.path, action: r2.status === "missing" ? "download-missing" : "upload-absent", row: r2 }));
 }
 
 var TRANSFER_COUNTERS_CAPABILITY = "device-transfer-counters-v1";
@@ -10850,7 +10921,7 @@ function documentDigest(doc2) {
   return new Sha256().update(new TextEncoder().encode(JSON.stringify(state))).hex();
 }
 
-function badgeState({ connectionPhase, ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0, stalled = false, stallReason = "", queueState = null }) {
+function badgeState({ connectionPhase, ready = false, preparing = false, receiving = false, connecting = false, error = false, confirmed = false, uploads = 0, downloads = 0, unknown = false, known = 0, conflicts = 0, protectedCount = 0, localReviewCount = 0, progress, retrying = false, reconnecting = false, pendingVersions = 0, stalled = false, stallReason = "", queueState = null }) {
   let tone = "offline", icon = "cloud-off", label = "\u79BB\u7EBF", busy = false;
   if (ready && conflicts) {
     tone = "error";
@@ -10925,6 +10996,12 @@ function badgeState({ connectionPhase, ready = false, preparing = false, receivi
         display = "Sync: " + (q.review ? "\u5F85\u786E\u8BA4" + q.review : "") + (q.review && q.held ? " \xB7 " : "") + (q.held ? "\u6682\u7F13" + q.held : "");
       }
     }
+  }
+  if (ready && confirmed && progress?.available && progress.remaining === 0 && localReviewCount && !protectedCount && !conflicts && !error && !(queueState?.counts.failed || queueState?.counts.review || queueState?.counts.held) && !busy) {
+    tone = "waiting";
+    icon = "check";
+    label = "\u5DF2\u540C\u6B65 \xB7 " + localReviewCount + "\u6761\u672C\u673A\u5185\u5BB9\u5F85\u6838\u5BF9";
+    display = "Sync: \u5DF2\u540C\u6B65 \xB7 \u5F85\u6838\u5BF9" + localReviewCount;
   }
   if (!ready && reconnecting && ["metadata", "identity", "apply", "prepare"].includes(connectionPhase)) {
     label = { metadata: "\u63A5\u6536\u5143\u6570\u636E", identity: "\u4FDD\u5B58\u8EAB\u4EFD", apply: "\u5408\u5E76\u5143\u6570\u636E", prepare: "\u51C6\u5907\u8865\u4F20" }[connectionPhase];
@@ -11372,7 +11449,7 @@ var BlobTransfer = class {
 
 var VaultClientV3 = class extends VaultClient {
   constructor(options) {
-    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], optionalCapabilities: [METADATA_CAPACITY_CAPABILITY, LARGE_PDF_CAPABILITY, DELTA_HANDSHAKE_CAPABILITY], beforeUpload: async (context) => {
+    super({ ...options, retryPreparation: transientTransferFailure, room: "realtime-lab-v3", expectedProtocol: 3, capabilities: [FILE_REFS_CAPABILITY, GENERAL_FILES_CAPABILITY], optionalCapabilities: [PROTECTED_REVIEW_CAPABILITY, METADATA_CAPACITY_CAPABILITY, LARGE_PDF_CAPABILITY, DELTA_HANDSHAKE_CAPABILITY], beforeUpload: async (context) => {
       if (context.isCurrent()) this.connectionProgressAt = Date.now();
       await options.beforeUpload?.(context);
       if (!context.isCurrent()) return;
@@ -11950,7 +12027,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     if (this.pendingRows().length) return "\u5DF2\u8FDE\u63A5\uFF0C\u4ECD\u6709\u5185\u5BB9\u5F85\u4E0A\u4F20\u6216\u786E\u8BA4";
     if (this.receiveAcks.size || this.receiptFlush) return "\u6B63\u5728\u4FDD\u5B58\u63A5\u6536\u8FDB\u5EA6";
     if (!c.lastConfirmedAt) return "\u5DF2\u8FDE\u63A5\uFF0C\u7B49\u5F85\u670D\u52A1\u5668\u786E\u8BA4";
-    if (this.settings.consistencyHolds?.length) return "\u4E00\u81F4\u6027\u4FDD\u62A4\u6682\u505C" + this.settings.consistencyHolds.length + "\u6761\u8DEF\u5F84\uFF0C\u8BF7\u6838\u5BF9\u53CC\u65B9\u6B63\u6587";
+    if (this.settings.consistencyHolds?.length) return "\u5DF2\u540C\u6B65\uFF1B" + this.settings.consistencyHolds.length + "\u6761\u672C\u673A\u5185\u5BB9\u5F85\u6838\u5BF9\uFF0C\u539F\u6587\u4FDD\u7559";
     if (this.consistencyIssues()) return "\u4E0A\u6B21\u4E00\u81F4\u6027\u6838\u5BF9\u6709" + this.consistencyIssues() + "\u9879\u9700\u590D\u6838\uFF0C\u672A\u81EA\u52A8\u8986\u76D6";
     return "\u5DF2\u63D0\u4EA4\u670D\u52A1\u5668";
   }
@@ -11985,6 +12062,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     e.createEl("p", { text: "\u81EA\u52A8\u8FDE\u63A5\uFF1A" + (this.settings.enabled ? "\u5DF2\u5F00\u542F" : "\u5DF2\u5173\u95ED\uFF0C\u91CD\u542F\u6216\u66F4\u65B0\u540E\u9700\u624B\u52A8\u8FDE\u63A5") });
     e.createEl("p", { text: "\u670D\u52A1\u5668\u6700\u8FD1\u786E\u8BA4\uFF1A" + (c?.lastConfirmedAt ? new Date(c.lastConfirmedAt).toLocaleTimeString() : "\u672C\u6B21\u8FDE\u63A5\u5C1A\u65E0\u786E\u8BA4") + "\uFF1B\u786E\u8BA4\u4EC5\u4EE3\u8868\u670D\u52A1\u5668\u5DF2\u63A5\u6536\uFF0C\u4E0D\u4EE3\u8868\u5176\u4ED6\u8BBE\u5907\u5DF2\u6536\u5230\u3002" });
     e.createEl("p", { text: "\u4E00\u81F4\u6027\u4FDD\u62A4\u8DEF\u5F84\uFF1A" + (this.settings.consistencyHolds?.length || 0) + "\uFF1B\u9047\u5230\u7ADE\u4E89\u65F6\u4FDD\u7559\u672C\u673A\u6B63\u6587\uFF0C\u91CD\u542F\u540E\u7EE7\u7EED\u4FDD\u62A4\u3002\u8BF7\u901A\u8FC7\u9010\u6587\u4EF6\u6838\u9A8C\u9884\u89C8\uFF0C\u518D\u660E\u786E\u9009\u62E9\u4FDD\u7559\u526F\u672C\u5E76\u4FEE\u590D\u3002" });
+    new import_obsidian.Setting(e).setName("\u672C\u673A\u5F85\u6838\u5BF9\u5185\u5BB9").setDesc("\u4EC5\u5728\u4F60\u70B9\u51FB\u540E\u8BFB\u53D6\u53D7\u4FDD\u62A4\u6587\u4EF6\uFF1BNAS \u6821\u9A8C\u5B8C\u6210\u524D\u4E0D\u6E05\u7406\uFF0C\u72EC\u6709\u6B63\u6587\u4FDD\u7559\u3002").addButton((b) => b.setButtonText("\u5907\u4EFD\u4E0E\u6838\u5BF9").onClick(() => void this.openProtectedReview()));
     e.createEl("p", { text: "\u4E00\u81F4\u6027\u6838\u5BF9\uFF1A" + this.consistencyStatus + "\uFF1B\u81EA\u52A8\u6838\u5BF9\u4E0E\u5B89\u5168\u8865\u4F20\uFF1A" + (this.settings.autoConsistency ? "\u5DF2\u5F00\u542F" : "\u672A\u5F00\u542F") });
     e.createEl("p", { text: "\u4FDD\u7559\u5F85\u4F20\u6587\u4EF6\u7248\u672C\uFF08\u542B\u5F85\u786E\u8BA4\u4E0E\u4FDD\u62A4\u6682\u7F13\uFF09\uFF1A" + (c?.pending || this.settings.pending?.items || []).length + "\uFF1B\u540C\u4E00\u8DEF\u5F84\u53EF\u4EE5\u6709\u591A\u4E2A\u7248\u672C\uFF0C\u66F4\u65B0\u4E0E\u91CD\u8FDE\u4E0D\u4F1A\u81EA\u52A8\u6E05\u7A7A\u3002" });
     e.createEl("p", { text: "\u5F85\u5904\u7406\u51B2\u7A81\uFF1A" + this.conflicts.length });
@@ -12177,7 +12255,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.consistencyDigest = verified.stable ? this.currentDigest() : "";
       this.consistencyAuditEpoch = this.consistencyEpoch;
       this.consistencyReport = { ...verified, downloaded, uploaded, refused, limited: plan.length > 50 };
-      this.consistencyStatus = (verified.stable ? "\u6838\u5BF9\u5B8C\u6210" : "\u672C\u8F6E\u6709\u65B0\u53D8\u5316\uFF0C\u5F85\u4E0B\u8F6E\u6838\u5BF9") + "\uFF1A\u4E00\u81F4" + verified.counts.equal + "\uFF0C\u8865\u6536" + downloaded + "\uFF0C\u8865\u4F20" + uploaded + "\uFF0C\u6B63\u6587\u5DEE\u5F02" + verified.counts.different + "\uFF0C\u672A\u8865\u9F50" + (verified.counts.missing + verified.counts["local-only"]) + "\uFF0C\u6682\u7F13" + refused.length + (plan.length > 50 ? "\uFF08\u5176\u4F59\u4E0B\u8F6E\u7EE7\u7EED\uFF09" : "");
+      this.consistencyStatus = (verified.stable ? "\u6838\u5BF9\u5B8C\u6210" : "\u672C\u8F6E\u6709\u65B0\u53D8\u5316\uFF0C\u5F85\u4E0B\u8F6E\u6838\u5BF9") + "\uFF1A\u4E00\u81F4" + verified.counts.equal + "\uFF0C\u8865\u6536" + downloaded + "\uFF0C\u8865\u4F20" + uploaded + "\uFF0C\u6B63\u6587\u5DEE\u5F02" + verified.counts.different + "\uFF0C\u672C\u673A\u7F3A\u5931" + verified.counts.missing + "\uFF0C\u672C\u673A\u5F85\u6838\u5BF9" + verified.counts["local-only"] + "\uFF0C\u6682\u7F13" + refused.length + (plan.length > 50 ? "\uFF08\u5176\u4F59\u4E0B\u8F6E\u7EE7\u7EED\uFF09" : "");
     } catch (e) {
       const failure = auditFailure(e, this.consistencyStage);
       this.consistencyPhase = "deferred";
@@ -12311,6 +12389,130 @@ var RealtimeLab = class extends import_obsidian.Plugin {
       this.recoveryBusy = false;
     }
   }
+  protectedReviewBusy = false;
+  reviewPathBusy(path) {
+    const c = this.client;
+    return !c || this.dirtyFiles.has(path) || this.writing.has(path) || c.pending.some((x) => x.path === path) || c.pendingPaths.includes("*") || c.pendingPaths.includes(path) || this.pathSafetyBlocked(path) || this.downloadPaths.has(path) || this.settings.receivePending?.paths.includes(path) || this.conflicts.some((x) => x.path === path);
+  }
+  reviewClient() {
+    const c = this.client;
+    if (this.uiUnloaded || this.stopping || !c?.ready || !c.metadataVerified || !this.syncedOnce || this.initializing) throw Error("\u8BF7\u7B49\u5F85\u5F53\u524D\u540C\u6B65\u5C31\u7EEA\uFF1B\u539F\u6587\u4EF6\u4FDD\u7559");
+    if (!c.serverCapabilities.includes(PROTECTED_REVIEW_CAPABILITY)) throw Error("\u670D\u52A1\u5668\u5C1A\u672A\u542F\u7528 NAS \u6838\u5BF9\u5907\u4EFD\uFF0C\u8BF7\u5148\u5347\u7EA7\u5E76\u914D\u7F6E\u670D\u52A1\uFF1B\u539F\u6587\u4EF6\u4FDD\u7559");
+    return c;
+  }
+  async exportLocalProtectedReview() {
+    if (this.protectedReviewBusy) throw Error("\u6838\u5BF9\u5907\u4EFD\u6B63\u5728\u5904\u7406\uFF0C\u539F\u6587\u4EF6\u4FDD\u7559");
+    const c = this.reviewClient();
+    this.protectedReviewBusy = true;
+    try {
+      await c.confirmUploads();
+      await this.reportDiagnostic();
+      const valid = () => this.client === c && c.ready && !this.stopping && !this.uiUnloaded;
+      const read = async (path) => {
+        const f = this.app.vault.getAbstractFileByPath(path);
+        if (!(f instanceof import_obsidian.TFile) || !supportedFile(path) || f.stat.size > maxFileSize(path)) throw Error("\u5F85\u6838\u5BF9\u6587\u4EF6\u4E0D\u53EF\u8BFB\u53D6\uFF0C\u539F\u6587\u4EF6\u4FDD\u7559\uFF1A" + path);
+        return this.app.vault.readBinary(f);
+      };
+      let manifest = this.settings.protectedReview?.manifest;
+      if (manifest && (manifest.serverId !== c.serverId || manifest.deviceId !== this.settings.deviceId)) throw Error("\u6838\u5BF9\u5907\u4EFD\u7ED1\u5B9A\u5176\u4ED6\u7A7A\u95F4\u6216\u8BBE\u5907\uFF0C\u672A\u53D1\u9001");
+      if (!manifest) {
+        manifest = await collectProtectedReview({ paths: this.settings.consistencyHolds || [], identity: { serverId: c.serverId, deviceId: this.settings.deviceId, jobId: crypto.randomUUID() }, read, blocked: (p) => this.reviewPathBusy(p), shouldContinue: valid });
+        this.settings.protectedReview = { manifest, phase: "prepared" };
+        await this.persistConfig();
+      }
+      const result = await exportProtectedReview({ manifest, request: (type, args2) => c.request(type, args2), upload: (source) => c.blobs.upload(source, { signal: c.binaryAbort.signal }), read, shouldContinue: valid });
+      this.settings.protectedReview = { manifest, phase: "exported", digest: result.digest };
+      await this.persistConfig();
+      return { count: manifest.files.length, jobId: manifest.jobId, digest: result.digest };
+    } finally {
+      this.protectedReviewBusy = false;
+    }
+  }
+  async protectedCleanupPlan() {
+    const c = this.reviewClient(), manifest = this.settings.protectedReview?.manifest;
+    if (!manifest || this.settings.protectedReview.phase !== "exported") throw Error("\u8BF7\u5148\u5B8C\u6210\u672C\u673A\u5F85\u6838\u5BF9\u5185\u5BB9\u5907\u4EFD\u4F20\u8F93");
+    return c.request("protected-review-plan", { deviceId: manifest.deviceId, jobId: manifest.jobId });
+  }
+  async applyLocalProtectedCleanup(plan) {
+    const c = this.reviewClient(), manifest = this.settings.protectedReview?.manifest;
+    if (!manifest) throw Error("\u7F3A\u5C11\u672C\u673A\u6838\u5BF9\u5907\u4EFD");
+    if (this.protectedReviewBusy) throw Error("\u6838\u5BF9\u5907\u4EFD\u6B63\u5728\u5904\u7406");
+    this.protectedReviewBusy = true;
+    try {
+      await this.reportDiagnostic();
+      const result = await cleanProtectedReview({
+        manifest,
+        plan,
+        blocked: (path) => this.client !== c || !c.ready || this.stopping || this.uiUnloaded || !(this.settings.consistencyHolds || []).includes(path) || this.reviewPathBusy(path),
+        read: async (path) => {
+          const f = this.app.vault.getAbstractFileByPath(path);
+          if (!(f instanceof import_obsidian.TFile)) throw Error("\u6587\u4EF6\u5DF2\u53D8\u5316");
+          return this.app.vault.readBinary(f);
+        },
+        check: (row) => c.request("protected-review-check", { deviceId: manifest.deviceId, jobId: manifest.jobId, row }),
+        trash: async (path, hash) => {
+          const f = this.app.vault.getAbstractFileByPath(path);
+          if (!(f instanceof import_obsidian.TFile) || this.reviewPathBusy(path) || byteDigest(new Uint8Array(await this.app.vault.readBinary(f))) !== hash || this.reviewPathBusy(path)) throw Error("\u6B63\u6587\u5DF2\u53D8\u5316\uFF0C\u4FDD\u7559\u539F\u6587\u4EF6");
+          this.writing.add(path);
+          try {
+            await this.app.vault.trash(f, false);
+          } finally {
+            this.writing.delete(path);
+          }
+          if (this.app.vault.getAbstractFileByPath(path)) throw Error("\u56DE\u6536\u672A\u5B8C\u6210\uFF0C\u4FDD\u7559\u4FDD\u62A4\u72B6\u6001");
+        },
+        release: async (path) => {
+          this.settings.consistencyHolds = (this.settings.consistencyHolds || []).filter((p) => p !== path);
+          await this.persistConfig();
+        }
+      });
+      this.settings.protectedReview = { ...this.settings.protectedReview, result };
+      await this.persistConfig();
+      this.consistencyNextAt = 0;
+      this.updateProgress();
+      return result;
+    } finally {
+      this.protectedReviewBusy = false;
+    }
+  }
+  async openProtectedReview() {
+    const m = this.ownPathModal(new import_obsidian.Modal(this.app));
+    m.titleEl.setText("\u672C\u673A\u5F85\u6838\u5BF9\u5185\u5BB9 \xB7 NAS \u5907\u4EFD");
+    m.contentEl.createEl("p", { text: "\u53EA\u6709\u70B9\u51FB\u5907\u4EFD\u540E\uFF0C\u624D\u4F1A\u8BFB\u53D6\u5F53\u524D\u4E00\u81F4\u6027\u4FDD\u62A4\u4E2D\u7684\u8DEF\u5F84\u548C\u6B63\u6587\uFF0C\u5E76\u4F20\u5230\u5F53\u524D\u540C\u6B65\u7A7A\u95F4\u4F9B NAS \u5907\u4EFD\u3002\u539F\u7B14\u8BB0\u3001\u5386\u53F2\u3001\u7F13\u5B58\u548C\u540C\u6B65\u961F\u5217\u4E0D\u6E05\u7A7A\u3002NAS \u6821\u9A8C\u5B8C\u6210\u540E\u4ECD\u9700\u4F60\u786E\u8BA4\u6E05\u7406\uFF1B\u53EA\u5904\u7406\u4E0E\u540C\u4E00\u8DEF\u5F84\u670D\u52A1\u5668\u5386\u53F2\u9010\u5B57\u8282\u4E00\u81F4\u3001\u4E14\u670D\u52A1\u5668\u5DF2\u5220\u9664\u7684\u65E7\u526F\u672C\u3002\u72EC\u6709\u6216\u53D1\u751F\u53D8\u5316\u7684\u5185\u5BB9\u4FDD\u7559\u3002" });
+    const status = m.contentEl.createEl("p", { text: "\u5F85\u6838\u5BF9 " + (this.settings.consistencyHolds?.length || 0) + " \u6761\uFF1B\u5907\u4EFD\u9636\u6BB5\uFF1A" + (this.settings.protectedReview?.phase || "\u5C1A\u672A\u5F00\u59CB") });
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5907\u4EFD\u672C\u673A\u5F85\u6838\u5BF9\u5185\u5BB9").onClick(async () => {
+      try {
+        status.setText("\u6B63\u5728\u6838\u9A8C\u5E76\u4F20\u8F93\u5907\u4EFD\uFF0C\u624B\u673A\u8BF7\u4FDD\u6301\u524D\u53F0\uFF1B\u5C1A\u672A\u6E05\u7406\u6587\u4EF6\u3002");
+        const r2 = await this.exportLocalProtectedReview();
+        status.setText("\u5DF2\u4F20\u8F93 " + r2.count + " \u6761\uFF0C\u7B49\u5F85 NAS \u5F52\u6863\u548C\u6821\u9A8C\uFF1B\u8FD9\u8FD8\u4E0D\u4EE3\u8868 NAS \u5907\u4EFD\u5DF2\u5B8C\u6210\u3002");
+      } catch (e) {
+        status.setText(this.safeError(e));
+      }
+    }));
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u67E5\u770B NAS \u6838\u9A8C\u4E0E\u5B89\u5168\u6E05\u7406").onClick(async () => {
+      try {
+        const plan = await this.protectedCleanupPlan();
+        const ask = this.ownPathModal(new import_obsidian.Modal(this.app));
+        ask.titleEl.setText("\u786E\u8BA4\u6E05\u7406\u5DF2\u5907\u4EFD\u7684\u91CD\u590D\u65E7\u526F\u672C");
+        ask.contentEl.createEl("p", { text: "NAS \u5907\u4EFD\u5DF2\u6821\u9A8C\u3002\u53EF\u5904\u7406\u91CD\u590D\u65E7\u526F\u672C " + plan.duplicates.length + " \u6761\uFF1B\u72EC\u6709\u6216\u65E0\u6CD5\u786E\u8BA4 " + plan.retained + " \u6761\u7EE7\u7EED\u4FDD\u7559\u3002\u786E\u8BA4\u540E\u518D\u6B21\u6821\u9A8C\u6B63\u6587\u3001\u670D\u52A1\u5668\u5386\u53F2\u548C\u5220\u9664\u4EE3\u6B21\uFF0C\u518D\u79FB\u5165\u53EF\u6062\u590D\u56DE\u6536\u7AD9\uFF1B\u4E0D\u6C38\u4E45\u5220\u9664\uFF0C\u4E0D\u8986\u76D6\u6B63\u6587\u3002" });
+        ask.contentEl.createEl("pre", { cls: "rl-review-paths", text: plan.duplicates.map((r2) => r2.path).join("\n") });
+        new import_obsidian.Setting(ask.contentEl).addButton((x) => x.setButtonText("\u786E\u8BA4\u5B89\u5168\u6E05\u7406\u8FD9\u4E9B\u91CD\u590D\u526F\u672C").onClick(async () => {
+          try {
+            const r2 = await this.applyLocalProtectedCleanup(plan);
+            status.setText("\u5DF2\u5F52\u6863 " + r2.removed.length + " \u6761\uFF1B\u8DF3\u8FC7\u6216\u4FDD\u7559 " + r2.retained.length + " \u6761\uFF1B\u72EC\u6709\u4FDD\u7559 " + r2.unique.length + " \u6761\u3002");
+            ask.close();
+          } catch (e) {
+            status.setText(this.safeError(e));
+          }
+        })).addButton((x) => x.setButtonText("\u53D6\u6D88").onClick(() => ask.close()));
+        ask.open();
+      } catch (e) {
+        status.setText("NAS \u5C1A\u672A\u5B8C\u6210\u6821\u9A8C\uFF0C\u672A\u6E05\u7406\u4EFB\u4F55\u6587\u4EF6\u3002" + this.safeError(e));
+      }
+    }));
+    new import_obsidian.Setting(m.contentEl).addButton((b) => b.setButtonText("\u5173\u95ED").onClick(() => m.close()));
+    m.open();
+  }
   async retryQueue(force = true) {
     if (force) {
       const ledger = this.ledger();
@@ -12363,7 +12565,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     for (const i of this.settings.pathSafety?.items || []) for (const p of operationPaths(i.op)) uploads.add(p);
     const unknown = uploads.delete("*");
     const recovery = this.recoveryStatus();
-    return badgeState({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, stalled: recovery.stalled, stallReason: recovery.reason, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.activeFailures().size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.activeFailures().values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.consistencyIssues() || this.conflictError || !needsPathReview(c?.lastError) && c?.lastError || this.activeFailures().size || !needsPathReview(this.operationError) && this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.consistencyHolds?.length || 0) + (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
+    return badgeState({ connectionPhase: c?.ws?.readyState === 1 ? c.connectionPhase : void 0, stalled: recovery.stalled, stallReason: recovery.reason, queueState: this.queueView(), progress, pendingVersions: (c?.pending || this.settings.pending?.items || []).length, reconnecting: !!c && !c.ready && !c.stopped && !c.transportBlocked && !c.terminalCloseCode, retrying: !!c?.ready && this.activeFailures().size > 0 && !this.operationError && !this.conflictError && !c.lastError && !c.transportBlocked && (this.recoveryBusy || this.downloadPaths.size > 0) && [...this.activeFailures().values()].every(recoverableSyncFailure), ready: !!c?.ready, connecting: this.connectionStatus.includes("\u8FDE\u63A5\u4E2D"), preparing: !!c?.ready && (!this.syncedOnce || this.initializing || this.receiveAcks.size > 0 || !!this.receiptFlush), receiving: this.reflection.queued || this.downloadPaths.size > 0, error: !!(this.conflictError || !needsPathReview(c?.lastError) && c?.lastError || this.activeFailures().size || !needsPathReview(this.operationError) && this.operationError || c?.transportBlocked || /错误|失败|拒绝|阻止/.test(this.connectionStatus)), confirmed: !!c?.lastConfirmedAt, uploads: uploads.size, downloads: this.downloadPaths.size + (this.settings.remoteDeleteReview?.paths.length || 0), unknown, conflicts: this.conflicts.length, protectedCount: (this.settings.pathSafety?.items.length || 0) + (this.settings.remoteDeleteReview?.paths.length || 0), localReviewCount: Math.max(this.settings.consistencyHolds?.length || 0, c?.ready && diagnosticDetails(this).audit.current ? this.consistencyIssues() : 0), known: c ? Object.keys(entries(c.doc)).length : 0 });
   }
   clearOrphanBadges() {
     const owned = new Set([...this.badges.values()].map((b) => b.el.parentElement));
@@ -12901,6 +13103,7 @@ var RealtimeLab = class extends import_obsidian.Plugin {
     this.addCommand({ id: "consistency", name: "\u9010\u6587\u4EF6\u4E00\u81F4\u6027\u6838\u9A8C", callback: () => void this.openConsistency() });
     this.addCommand({ id: "start", name: "\u8FDE\u63A5\u6574\u4E2A\u540C\u6B65\u5E93", callback: () => void this.start() });
     this.addCommand({ id: "path-safety", name: "\u67E5\u770B\u5220\u9664\u4E0E\u91CD\u547D\u540D\u4FDD\u62A4", callback: () => void this.openPathSafety() });
+    this.addCommand({ id: "protected-review", name: "\u5907\u4EFD\u4E0E\u6838\u5BF9\u672C\u673A\u5F85\u6838\u5BF9\u5185\u5BB9", callback: () => void this.openProtectedReview() });
     this.addCommand({ id: "device-diagnostics", name: "\u67E5\u770B\u8BBE\u5907\u8FDC\u7A0B\u540C\u6B65\u8BCA\u65AD", callback: () => void this.openDeviceDiagnostics() });
     this.addCommand({ id: "conflicts", name: "\u67E5\u770B\u4E0E\u5904\u7406\u540C\u6B65\u51B2\u7A81", callback: () => void this.openConflicts() });
     this.addCommand({ id: "history", name: "\u67E5\u770B\u4E0E\u6062\u590D\u5386\u53F2\u7248\u672C", callback: () => void this.history() });

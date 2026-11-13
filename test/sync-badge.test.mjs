@@ -20,3 +20,14 @@ test('recovering progress is visible instead of an ambiguous abnormal download o
 test('disconnected progress keeps last known counts with explicit stale label',()=>{const b=badgeState({ready:false,connecting:true,progress:{available:true,total:2944,completed:533,remaining:2411,retry:0,active:0}});assert.match(b.counts,/上次进度.*533\/2944.*2411/);assert.equal(b.tone,'busy');assert.notEqual(b.label,'已确认');});
 test('reconnecting shows pending versions and conflicts separately from stale file progress and retry count',()=>{const b=badgeState({ready:false,reconnecting:true,error:true,uploads:1,pendingVersions:5,conflicts:1,progress:{available:true,total:3035,completed:3034,remaining:1,retry:0,active:0}});assert.equal(b.label,'重连中');assert.match(b.display,/重连中.*冲突1/);assert.match(b.counts,/上次进度.*待重试 0.*待传\/确认 1路径（5版本）.*冲突 1.*当前未核对/);assert.notEqual(b.tone,'confirmed');});
 test('blocked identity errors remain errors and cannot masquerade as reconnection or completion',()=>{const b=badgeState({ready:false,error:true,reconnecting:false,progress:{available:false,total:0,completed:0,remaining:0,retry:0,active:0}});assert.equal(b.tone,'error');assert.match(b.counts,/进度待核对/);});
+
+test('local-only content review remains a separate waiting state with successful transfer',()=>{
+ const progress={available:true,total:4437,completed:4437,remaining:0,retry:0,active:0},q={counts:{active:0,review:0,held:0,failed:0}};
+ const m=badgeState({ready:true,confirmed:true,progress,queueState:q,localReviewCount:276});assert.equal(m.tone,'waiting');assert.match(m.display,/已同步.*待核对276/);assert.doesNotMatch(m.display,/异常|失败/);
+ const bad=badgeState({ready:true,confirmed:true,progress,queueState:q,localReviewCount:276,error:true});assert.equal(bad.tone,'error');assert.match(bad.display,/异常/);
+ const offline=badgeState({ready:false,reconnecting:true,progress,queueState:q,localReviewCount:276});assert.equal(offline.tone,'busy');assert.match(offline.display,/重连/);
+});
+
+test('content-review label cannot hide missing confirmation, unavailable progress or a path plan',()=>{
+ const p={available:true,total:1,completed:1,remaining:0,retry:0,active:0};assert.doesNotMatch(badgeState({ready:true,confirmed:false,progress:p,localReviewCount:1}).display,/已同步/);assert.doesNotMatch(badgeState({ready:true,confirmed:true,progress:{available:false},localReviewCount:1}).display,/已同步/);assert.match(badgeState({ready:true,confirmed:true,progress:p,protectedCount:2,localReviewCount:1}).display,/待确认2/);
+});

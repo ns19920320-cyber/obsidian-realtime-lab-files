@@ -76,3 +76,7 @@ Deletion-generation and stale-source safety failures are derived as manual-revie
 Connection timing diagnostics are memory-only and capability-gated (`connection-timings-v1`). They contain per-attempt stage durations, full/delta mode and bounded byte counts, with no vectors, paths, URLs, errors or content. Metadata time combines server processing and network reception; it does not separately claim DNS, TLS or authentication latency. First confirmation and local preparation are measured after protocol readiness, so they must not be added to the ready total. Offline devices cannot upload new diagnostics until they reconnect.
 
 Upgrade both server and client for incremental reconnect. Updating only the client remains compatible with an old server but continues to receive full metadata. Existing 180-second metadata and 30-second connect/preparation watchdog guards remain; focusing the app does not restart an unexpired open handshake.
+
+## 本机内容待核对（alpha.53）
+
+本机独有内容与连接失败分开显示。显式的 NAS 备份与历史比较流程见 [PROTECTED-REVIEW.md](PROTECTED-REVIEW.md)；完整权限与验证说明见 [documentation/architecture.md](documentation/architecture.md)。手机端需点击启动导出，备份完成前不会清理；独有正文保留。
